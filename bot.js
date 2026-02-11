@@ -190,11 +190,30 @@ async function sendDMOnce(page, u, msg) {
   });
   if (nextClicked) await delay(1000);
 
-  const textarea = await page.waitForSelector('textarea', { timeout: 5000 });
-  if (!textarea) {
+  const composeSelector = 'textarea, div[contenteditable="true"], [role="textbox"]';
+  try {
+    await page.waitForSelector(composeSelector, { timeout: 8000 });
+  } catch (e) {
     return { ok: false, reason: 'no_compose' };
   }
-  await page.type('textarea', msg, { delay: 60 + Math.floor(Math.random() * 40) });
+  const composeEl = await page.evaluateHandle(() => {
+    const textarea = document.querySelector('textarea');
+    if (textarea && textarea.offsetParent !== null) return textarea;
+    const editable = document.querySelector('div[contenteditable="true"]');
+    if (editable && editable.offsetParent !== null) return editable;
+    const roleBox = document.querySelector('[role="textbox"]');
+    if (roleBox && roleBox.offsetParent !== null) return roleBox;
+    return null;
+  });
+  const compose = composeEl.asElement();
+  if (!compose) {
+    await composeEl.dispose();
+    return { ok: false, reason: 'no_compose' };
+  }
+  await compose.click();
+  await compose.type(msg, { delay: 60 + Math.floor(Math.random() * 40) });
+  await compose.dispose();
+  await composeEl.dispose();
   await humanDelay();
   await page.keyboard.press('Enter');
   await delay(1500);
