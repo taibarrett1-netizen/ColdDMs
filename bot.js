@@ -299,8 +299,10 @@ async function runBot() {
     setImmediate(runOne);
   };
 
+  setControl('pause', '0');
+
   const scheduleNext = () => {
-    const initialDelay = randomDelay(60 * 1000, 3 * 60 * 1000);
+    const initialDelay = randomDelay(5 * 1000, 60 * 1000);
     logger.log(`First send in ${Math.round(initialDelay / 1000)} seconds.`);
     setTimeout(runOne, initialDelay);
   };
