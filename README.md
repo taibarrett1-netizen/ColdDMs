@@ -2,7 +2,7 @@
 
 Node.js bot that sends cold DMs from a CSV lead list using Puppeteer, with random delays, daily/hourly limits, and SQLite tracking.
 
-**Integrating this as a module into another app (e.g. Lovable)?** See **[INTEGRATION.md](./INTEGRATION.md)** for architecture, API reference, and how to connect a separate UI (e.g. AI setter) to the VPS securely.
+**Integrating as a Cold Outreach tab in your setter (Lovable)?** See **[INTEGRATION.md](./INTEGRATION.md)** for Supabase schema, session-only Instagram (no password stored), and how the Lovable UI and VPS stay in sync. Use **[PROMPT_LOVABLE.md](./PROMPT_LOVABLE.md)** as the prompt to paste in the setter Cursor project.
 
 ## Requirements
 

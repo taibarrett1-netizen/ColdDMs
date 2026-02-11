@@ -5,7 +5,19 @@ const fs = require('fs');
 const { exec } = require('child_process');
 const multer = require('multer');
 const { getDailyStats, getRecentSent, getControl, setControl, alreadySent, clearFailedAttempts } = require('./database/db');
-const { loadLeadsFromCSV } = require('./bot');
+const {
+  isSupabaseConfigured,
+  getClientId,
+  setClientId,
+  setControl: setControlSupabase,
+  getDailyStats: getDailyStatsSupabase,
+  getRecentSent: getRecentSentSupabase,
+  clearFailedAttempts: clearFailedAttemptsSupabase,
+  getLeads: getLeadsSupabase,
+  saveSession,
+  updateSettingsInstagramUsername,
+} = require('./database/supabase');
+const { loadLeadsFromCSV, connectInstagram } = require('./bot');
 const { MESSAGES } = require('./config/messages');
 
 const app = express();
@@ -49,29 +61,47 @@ function getBotProcessRunning(cb) {
 
 // --- API: status & stats ---
 app.get('/api/status', (req, res) => {
-  const stats = getDailyStats();
-  let leadsTotal = 0;
-  let leadsRemaining = 0;
-  getBotProcessRunning((processRunning) => {
-    loadLeadsFromCSV(leadsPath).then((leads) => {
-      leadsTotal = leads.length;
-      leadsRemaining = leads.filter((u) => !alreadySent(u)).length;
-      res.json({
-        processRunning,
-        todaySent: stats.total_sent,
-        todayFailed: stats.total_failed,
-        leadsTotal,
-        leadsRemaining,
+  const clientId = req.query.clientId;
+  const useSupabase = isSupabaseConfigured() && clientId;
+  getBotProcessRunning(async (processRunning) => {
+    try {
+      if (useSupabase) {
+        const stats = await getDailyStatsSupabase(clientId);
+        const leads = await getLeadsSupabase(clientId);
+        const { getSentUsernames } = require('./database/supabase');
+        const sentSet = await getSentUsernames(clientId);
+        const remaining = leads.filter((u) => !sentSet.has(u.replace(/^@/, ''))).length;
+        return res.json({
+          processRunning,
+          todaySent: stats.total_sent,
+          todayFailed: stats.total_failed,
+          leadsTotal: leads.length,
+          leadsRemaining: remaining,
+        });
+      }
+      const stats = getDailyStats();
+      loadLeadsFromCSV(leadsPath).then((leads) => {
+        const leadsRemaining = leads.filter((u) => !alreadySent(u)).length;
+        res.json({
+          processRunning,
+          todaySent: stats.total_sent,
+          todayFailed: stats.total_failed,
+          leadsTotal: leads.length,
+          leadsRemaining,
+        });
+      }).catch(() => {
+        res.json({
+          processRunning,
+          todaySent: stats.total_sent,
+          todayFailed: stats.total_failed,
+          leadsTotal: 0,
+          leadsRemaining: 0,
+        });
       });
-    }).catch(() => {
-      res.json({
-        processRunning,
-        todaySent: stats.total_sent,
-        todayFailed: stats.total_failed,
-        leadsTotal: 0,
-        leadsRemaining: 0,
-      });
-    });
+    } catch (e) {
+      console.error('[API] Status error', e);
+      res.status(500).json({ error: e.message });
+    }
   });
 });
 
@@ -190,10 +220,36 @@ app.post('/api/leads/upload', upload.single('file'), (req, res) => {
   res.json({ ok: true, count: usernames.length });
 });
 
+// --- API: Instagram connect (one-time; password never stored) ---
+app.post('/api/instagram/connect', async (req, res) => {
+  const { username, password, clientId } = req.body || {};
+  if (!username || !password || !clientId) {
+    return res.status(400).json({ ok: false, error: 'username, password, and clientId are required' });
+  }
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
+  }
+  try {
+    const result = await connectInstagram(username, password);
+    await saveSession(clientId, { cookies: result.cookies }, result.username);
+    await updateSettingsInstagramUsername(clientId, result.username);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[API] Instagram connect failed', e);
+    res.status(500).json({ ok: false, error: e.message || 'Login failed' });
+  }
+});
+
 // --- API: bot control (PM2 start/stop) ---
 app.post('/api/control/start', (req, res) => {
-  console.log('[API] Start bot requested');
-  setControl('pause', '0');
+  const clientId = req.body?.clientId;
+  if (isSupabaseConfigured() && clientId) {
+    setClientId(clientId);
+    setControlSupabase(clientId, 0).catch((e) => console.error('[API] setControlSupabase', e));
+  } else {
+    setControl('pause', '0');
+  }
+  console.log('[API] Start bot requested', clientId ? `clientId=${clientId}` : '');
   exec(`pm2 start cli.js --name ${BOT_PM2_NAME} -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
     const out = (stdout || '') + (stderr || '');
     const alreadyRunning = /already (running|launched)|online/i.test(out);
@@ -206,8 +262,13 @@ app.post('/api/control/start', (req, res) => {
   });
 });
 
-app.post('/api/reset-failed', (req, res) => {
+app.post('/api/reset-failed', async (req, res) => {
+  const clientId = req.body?.clientId;
   try {
+    if (isSupabaseConfigured() && clientId) {
+      const cleared = await clearFailedAttemptsSupabase(clientId);
+      return res.json({ ok: true, cleared });
+    }
     const cleared = clearFailedAttempts();
     res.json({ ok: true, cleared });
   } catch (e) {
@@ -216,8 +277,13 @@ app.post('/api/reset-failed', (req, res) => {
 });
 
 app.post('/api/control/stop', (req, res) => {
-  console.log('[API] Stop bot requested');
-  setControl('pause', '1');
+  const clientId = req.body?.clientId;
+  if (isSupabaseConfigured() && clientId) {
+    setControlSupabase(clientId, 1).catch((e) => console.error('[API] setControlSupabase', e));
+  } else {
+    setControl('pause', '1');
+  }
+  console.log('[API] Stop bot requested', clientId ? `clientId=${clientId}` : '');
   exec(`pm2 stop ${BOT_PM2_NAME}`, (err, stdout, stderr) => {
     if (err) {
       console.error('[API] Stop failed', err, stderr);

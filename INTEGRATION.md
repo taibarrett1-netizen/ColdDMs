@@ -1,100 +1,87 @@
-# Cold DM Module – Integration Guide for Lovable / AI Setter
+# Cold DM Module – Integration Guide (Setter + Lovable + Supabase)
 
-This document is for **another app** (e.g. a Lovable-built AI appointment setter) that wants to add **Cold DMs** as a module. The Cold DM **logic and execution** stay on a **VPS**; your app provides the **UI** and talks to the VPS over HTTP.
+This document is for integrating **Cold DM / Cold Outreach** into your **AI setter app** (Lovable). The Cold Outreach UI lives as a **tab** in the same webpage as the rest of your setter. All Cold DM data lives in your **existing Supabase project** (same as setter settings and conversations). The **VPS** only runs the bot process and stays **in sync** with Lovable via Supabase. **We do not store Instagram passwords**—only a session (cookies) after a one-time connect.
 
-**Audience:** Developers or an AI model integrating this module into a parent application (e.g. Lovable).
+**Audience:** Developers or an AI model integrating this module into the setter (Lovable).
 
 ---
 
 ## 1. What This Module Does
 
-- **Instagram cold DMs:** Logs into Instagram (username/password or persisted session), reads a list of leads (usernames), and sends them DMs with configurable message templates.
-- **Runs 24/7 on a VPS** via PM2 (Node + Puppeteer/Chromium). No browser extension; the bot runs headless on the server.
-- **API server** (same process or same box) exposes REST endpoints for status, settings, leads, messages, start/stop, and reset-failed. Your Lovable app calls these endpoints to drive the UI; it does **not** run the bot or store Instagram credentials.
+- **Instagram cold DMs:** Sends DMs to a list of leads using configurable message templates, with random delays and daily/hourly limits.
+- **Runs 24/7 on a VPS** (Puppeteer/Chromium). Your setter app does **not** run the browser; it only shows the UI and stores data in Supabase.
+- **Single source of truth:** Your **Supabase project** (the same one used for setter settings and conversations) stores all Cold DM data: message templates, leads, settings (limits, delays), Instagram **session only** (no password), sent log, and stats. Lovable and the VPS both read/write this same database so they stay in sync.
 
 ---
 
 ## 2. Architecture: What Runs Where
 
-| Component | Where it runs | Notes |
-|-----------|----------------|--------|
-| **Bot process** | VPS only | `cli.js` → `bot.js`, PM2, Chromium. Reads `.env`, `leads.csv`, SQLite. |
-| **API server** | VPS only | `server.js` (Express). Serves the API used by the dashboard (or by your Lovable app). |
-| **Database** | VPS only | SQLite `database/bot.db` (sent_messages, daily_stats, control). |
-| **Credentials & leads** | VPS only | `.env` (Instagram user/pass, limits), `leads.csv`, `config/messages.js`. |
-| **Cold DM UI** | Your app (Lovable) | Screens you build: status, settings, leads, sent list, start/stop, reset failed. All data comes from the VPS API. |
+| Component | Where | Notes |
+|-----------|--------|--------|
+| **Cold Outreach UI** | Lovable (same app as setter) | A **tab** (e.g. "Cold Outreach") in your setter UI. Same webpage, same domain. No separate Cold DM app. |
+| **Cold DM data** | **Supabase** (same project as setter) | Message templates, leads, settings, Instagram session (cookies only), sent_messages, daily_stats, control (pause). |
+| **Bot process** | VPS only | Puppeteer/Chromium, PM2. Reads config and leads from **Supabase**, writes sent log and stats to **Supabase**. Does **not** use SQLite or CSV in production. |
+| **VPS API** | VPS only | Minimal: **start**, **stop**, **status** (is bot process running?), and **connect** (one-time: receive password, log in, save session to Supabase, discard password). |
+| **Instagram password** | **Never stored** | User enters it once in the Cold Outreach tab → sent to your backend → backend calls VPS `/api/instagram/connect` → VPS logs in, saves **session (cookies)** to Supabase, returns. Password is never written to Supabase or to disk. You can truthfully say: **"We do not store your Instagram password."** |
 
-**Important:** Your Lovable app must **never** run Puppeteer or store Instagram passwords. It only stores the **VPS API base URL** and (recommended) an **API key**, and proxies or forwards requests to the VPS.
-
----
-
-## 3. How the Bot Works (High-Level)
-
-1. **Start** – PM2 starts `cli.js --start`. Bot loads leads from CSV, filters out usernames already in `sent_messages`, then opens a browser (Chromium) with optional persistent profile (`.browser-profile`).
-2. **Login** – Goes to Instagram login; if session exists (cookies in profile), skips login (“Already logged in”). Otherwise types username/password from `.env`, submits, dismisses “Save login” / “Not now” modals.
-3. **Send loop** – For each remaining lead: navigates to `direct/new/`, finds search input (by placeholder/visibility), types username, selects the **matching** user (by username text), clicks “Message”/“Next” to open thread, finds compose area (textarea or contenteditable/role=textbox), types a random message from `config/messages.js`, sends. Logs success/failure to SQLite and updates daily_stats. Waits a random delay (MIN_DELAY–MAX_DELAY minutes) between sends; first send after a short (5–60s) delay.
-4. **Control** – A `control` table has a `pause` flag. Start clears it; Stop sets it. The bot checks this before each send and exits the loop if paused.
-5. **Persistence** – Browser profile dir (`.browser-profile`) keeps cookies so the bot doesn’t log in every run; “Reset failed” clears failed rows from `sent_messages` so those leads can be retried.
-
-Your UI only needs to call the API; the VPS handles all of the above.
+**No local/standalone mode:** There is no separate “Cold DM dashboard” to host; everything is under your setter UI in a Cold Outreach tab.
 
 ---
 
-## 4. Connecting the VPS to Your Lovable UI (Securely)
+## 3. Keeping Lovable and VPS in Sync
 
-### 4.1 Expose the VPS API
-
-- The API runs on the VPS (e.g. `http://localhost:3000`). To be called by Lovable (or your backend), it must be reachable over the internet.
-- **Recommended:** Put **nginx** (or Caddy) in front of the Node app, bind to a subdomain (e.g. `colddm-api.yourdomain.com`), and use **HTTPS** (e.g. Let’s Encrypt). Example nginx concept:
-
-```nginx
-server {
-  listen 443 ssl;
-  server_name colddm-api.yourdomain.com;
-  ssl_certificate /path/to/fullchain.pem;
-  ssl_certificate_key /path/to/privkey.pem;
-  location / {
-    proxy_pass http://127.0.0.1:3000;
-    proxy_http_version 1.1;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-  }
-}
-```
-
-- Open firewall for 443 (and 80 if you use HTTP→HTTPS redirect). Do **not** expose the bot’s port to the whole internet without auth (next section).
-
-### 4.2 Add API Key Auth (Recommended)
-
-The VPS API **currently has no authentication**. For Lovable (or any external client), you should add a simple API key check so only your app can call it.
-
-- **On the VPS:** Set an env var, e.g. `COLD_DM_API_KEY=your-long-random-secret`. The server expects the client to send this on every request (e.g. header `Authorization: Bearer <key>` or `X-API-Key: <key>`). If `COLD_DM_API_KEY` is set, requests without a valid key get 401.
-- **In Lovable:** Store the VPS base URL and the same API key in your backend env (e.g. `COLD_DM_VPS_URL`, `COLD_DM_API_KEY`). Have your **backend** call the VPS (server-to-server); do not put the API key in frontend code. Your backend then exposes its own endpoints or proxies to the VPS so the frontend only talks to your backend.
-
-### 4.3 CORS (If Lovable Frontend Calls VPS Directly)
-
-If the **browser** (Lovable frontend) calls the VPS API directly (not recommended if you can use a backend):
-
-- Enable CORS on the VPS API for your Lovable origin (e.g. `https://your-app.lovable.app`). In Express you’d use the `cors` package and restrict `origin` to that domain.
-- Prefer **backend-to-VPS** so the API key and VPS URL stay on the server.
+- **Lovable:** Users edit message templates, leads, and settings in the Cold Outreach tab. Your backend writes these to **Supabase** (same project as setter).
+- **VPS bot:** On start, it reads message templates, leads, settings, and Instagram session from **Supabase**. It writes each sent DM and daily stats to **Supabase**. It reads the “pause” control from **Supabase**.
+- **Result:** Both sides use the same Supabase project. No need to “sync” via the VPS API for data—only for **start/stop** and **status** (and one-time **connect**). The UI always shows up-to-date data by reading from Supabase (e.g. via your Lovable backend or direct Supabase client).
 
 ---
 
-## 5. API Reference (VPS)
+## 4. Instagram: Session Only, Password Never Stored
 
-Base URL: `https://colddm-api.yourdomain.com` (or whatever you use). All responses are JSON unless noted.
+**Goal:** You never store the user’s Instagram password, and you can say “We do not store your Instagram password.”
 
-**Authentication (when enabled):**  
-Send the API key in every request, e.g.  
-`Authorization: Bearer YOUR_API_KEY`  
-or  
-`X-API-Key: YOUR_API_KEY`
+**Flow:**
+
+1. In the Cold Outreach tab, user clicks **“Connect Instagram”** (or “Reconnect” if session expired).
+2. User enters **Instagram username** and **password** in a form (only when connecting).
+3. Your **Lovable backend** sends these to the VPS once: e.g. `POST /api/instagram/connect` with `{ "username": "...", "password": "..." }` over HTTPS (with API key).
+4. **VPS** receives the request, runs Puppeteer to log into Instagram, then:
+   - Saves the **session** (cookies, or serialized browser profile) to **Supabase** (e.g. table `cold_dm_instagram_sessions` or a row in settings), associated with the user/app.
+   - **Does not** store the password anywhere (not in Supabase, not in .env, not in a file). Returns success/failure.
+5. From then on, the **bot** loads the session from Supabase and uses it to send DMs. When the session expires (e.g. Instagram logs them out), the user clicks “Reconnect” and enters the password again (same one-time flow).
+
+**Implementation note:** The Cold DM repo (VPS) must be adapted to: (a) accept the one-time connect endpoint, (b) persist only session data to Supabase, and (c) read session from Supabase when running the bot. The current repo uses .env for credentials; for this integration that is replaced by “session in Supabase, password only in memory during connect.”
 
 ---
 
-### 5.1 Status (dashboard home)
+## 5. Supabase Schema (Same Project as Setter)
+
+Create these in your **existing** Supabase project. Use a prefix like `cold_dm_` if you want to keep Cold DM tables grouped.
+
+| Table | Purpose |
+|-------|--------|
+| **cold_dm_message_templates** | Outreach message templates (one per row or a single row with JSON array, depending on your preference). |
+| **cold_dm_leads** | Usernames to DM (e.g. `username` text, optional `added_at`, `source`). |
+| **cold_dm_settings** | One row: `daily_send_limit`, `min_delay_minutes`, `max_delay_minutes`, `max_sends_per_hour`, `instagram_username` (display only). No password column. |
+| **cold_dm_instagram_sessions** | Session data only: e.g. `id`, `session_data` (cookies or encrypted blob), `instagram_username`, `updated_at`. Bot reads this to stay logged in. |
+| **cold_dm_sent_messages** | Log of sent DMs: `username`, `message`, `sent_at`, `status` ('success' / 'failed'). |
+| **cold_dm_daily_stats** | `date`, `total_sent`, `total_failed` (for today’s stats). |
+| **cold_dm_control** | Key-value: e.g. `key = 'pause'`, `value = '0'` or `'1'`. Bot checks this before each send. |
+
+Your setter may already have a “user” or “tenant” concept; if so, add a `user_id` or `tenant_id` to these tables so multiple users/tenants can have separate Cold DM data. The VPS bot can be single-tenant (one Supabase project = one setter customer) or multi-tenant (bot reads which tenant is “active” from control or settings).
+
+---
+
+## 6. VPS API (Minimal – Start, Stop, Status, Connect)
+
+The VPS exposes a **small API** so Lovable can control the bot and perform the one-time connect. All other data lives in Supabase; Lovable reads/writes Supabase directly (or via your backend).
+
+**Base URL:** e.g. `https://colddm-api.yourdomain.com`  
+**Auth:** Every request must include `Authorization: Bearer YOUR_API_KEY` or `X-API-Key: YOUR_API_KEY` (set `COLD_DM_API_KEY` on the VPS).
+
+---
+
+### 6.1 Status (is the bot process running?)
 
 **GET** `/api/status`
 
@@ -102,292 +89,152 @@ or
 
 ```json
 {
-  "processRunning": true,
-  "todaySent": 5,
-  "todayFailed": 1,
-  "leadsTotal": 100,
-  "leadsRemaining": 94
+  "processRunning": true
 }
 ```
 
-- `processRunning`: whether the PM2 bot process is online.
-- `todaySent` / `todayFailed`: from `daily_stats` for today.
-- `leadsTotal`: number of lines in leads CSV (after header).
-- `leadsRemaining`: leads not yet in `sent_messages`.
+Optional: you can also return `todaySent`, `todayFailed`, `leadsTotal`, `leadsRemaining` by reading from **Supabase** on the VPS and including them here, so the UI can show them without querying Supabase from Lovable. Or the UI can read those from Supabase itself.
 
 ---
 
-### 5.2 Stats
-
-**GET** `/api/stats`
-
-**Response:** Same shape as `getDailyStats()`:
-
-```json
-{
-  "date": "2026-02-11",
-  "total_sent": 5,
-  "total_failed": 1
-}
-```
-
----
-
-### 5.3 Sent messages (history)
-
-**GET** `/api/sent?limit=50`
-
-**Query:** `limit` (optional, default 50, max 200).
-
-**Response:** Array of:
-
-```json
-[
-  {
-    "username": "skedulemore",
-    "message": "Quick question...",
-    "sent_at": "2026-02-11T02:50:05.776Z",
-    "status": "success"
-  }
-]
-```
-
----
-
-### 5.4 Settings (read)
-
-**GET** `/api/settings`
-
-**Response:** Key-value of env vars. Password is masked:
-
-```json
-{
-  "INSTAGRAM_USERNAME": "myuser",
-  "INSTAGRAM_PASSWORD": "********",
-  "DAILY_SEND_LIMIT": "100",
-  "MIN_DELAY_MINUTES": "5",
-  "MAX_DELAY_MINUTES": "30",
-  "MAX_SENDS_PER_HOUR": "20",
-  "HEADLESS_MODE": "true",
-  "LEADS_CSV": "leads.csv"
-}
-```
-
----
-
-### 5.5 Settings (write)
-
-**POST** `/api/settings`  
-**Body:** JSON object with any of the keys below. Omit keys you don’t want to change. Send `********` for password to leave it unchanged.
-
-```json
-{
-  "INSTAGRAM_USERNAME": "myuser",
-  "INSTAGRAM_PASSWORD": "secret",
-  "DAILY_SEND_LIMIT": "50",
-  "MIN_DELAY_MINUTES": "5",
-  "MAX_DELAY_MINUTES": "30",
-  "MAX_SENDS_PER_HOUR": "20",
-  "HEADLESS_MODE": "true",
-  "LEADS_CSV": "leads.csv"
-}
-```
-
-**Response:** `{ "ok": true }`
-
----
-
-### 5.6 Message templates (read)
-
-**GET** `/api/messages`
-
-**Response:**
-
-```json
-{
-  "messages": [
-    "Hey, saw your post—cool stuff!",
-    "Quick question about your content..."
-  ]
-}
-```
-
----
-
-### 5.7 Message templates (write)
-
-**POST** `/api/messages`  
-**Body:**
-
-```json
-{
-  "messages": ["Message one", "Message two"]
-}
-```
-
-`messages` must be a non-empty array. Overwrites `config/messages.js` on the VPS.
-
-**Response:** `{ "ok": true }`  
-**Error (400):** `{ "error": "messages must be a non-empty array" }`
-
----
-
-### 5.8 Leads (read)
-
-**GET** `/api/leads`
-
-**Response:**
-
-```json
-{
-  "usernames": ["user1", "user2"],
-  "raw": "username\nuser1\nuser2"
-}
-```
-
-`raw` is the full CSV content (header + usernames).
-
----
-
-### 5.9 Leads (write from text)
-
-**POST** `/api/leads`  
-**Body:**
-
-```json
-{
-  "raw": "user1\nuser2\n@user3"
-}
-```
-
-Replaces `leads.csv` with a header `username` and one username per line. Leading `@` is stripped.
-
-**Response:** `{ "ok": true, "count": 3 }`
-
----
-
-### 5.10 Leads (upload CSV file)
-
-**POST** `/api/leads/upload`  
-**Content-Type:** `multipart/form-data`  
-**Body:** One file field (e.g. `file`). File can be CSV with optional header line `username` or `user`; other lines are usernames (with or without `@`).
-
-**Response:** `{ "ok": true, "count": 42 }`  
-**Error (400):** `{ "error": "No file uploaded" }`
-
----
-
-### 5.11 Start bot
+### 6.2 Start bot
 
 **POST** `/api/control/start`
 
-Sets pause flag to 0 and runs `pm2 start cli.js --name ig-dm-bot -- --start` (or equivalent). Idempotent if already running.
+Sets `cold_dm_control.pause` to `0` in Supabase (if using Supabase for control) and runs `pm2 start cli.js --name ig-dm-bot -- --start` (or equivalent).
 
-**Response:** `{ "ok": true, "processRunning": true }`  
-**Error (500):** `{ "ok": false, "error": "..." }`
+**Response:** `{ "ok": true, "processRunning": true }`
 
 ---
 
-### 5.12 Stop bot
+### 6.3 Stop bot
 
 **POST** `/api/control/stop`
 
-Sets pause flag to 1 and runs `pm2 stop ig-dm-bot`.
+Sets `cold_dm_control.pause` to `1` in Supabase and runs `pm2 stop ig-dm-bot`.
 
-**Response:** `{ "ok": true, "processRunning": false }`  
-**Error (500):** `{ "ok": false, "error": "..." }`
-
----
-
-### 5.13 Reset failed (retry failed leads)
-
-**POST** `/api/reset-failed`
-
-Deletes all rows in `sent_messages` with `status = 'failed'` and sets today’s `total_failed` to 0. Those leads then count as “remaining” again.
-
-**Response:** `{ "ok": true, "cleared": 2 }`  
-**Error (500):** `{ "ok": false, "error": "..." }`
+**Response:** `{ "ok": true, "processRunning": false }`
 
 ---
 
-## 6. VPS Environment and Files
+### 6.4 Connect Instagram (one-time; password never stored)
 
-**Env vars** (in `.env` on the VPS):
+**POST** `/api/instagram/connect`  
+**Body:**
 
-| Variable | Purpose |
-|----------|--------|
-| `INSTAGRAM_USERNAME` | Instagram login |
-| `INSTAGRAM_PASSWORD` | Instagram password |
-| `DAILY_SEND_LIMIT` | Max sends per day (e.g. 100) |
-| `MIN_DELAY_MINUTES` | Min minutes between sends |
-| `MAX_DELAY_MINUTES` | Max minutes between sends |
-| `MAX_SENDS_PER_HOUR` | Hourly cap |
-| `HEADLESS_MODE` | `true` for headless Chromium |
-| `LEADS_CSV` | Path to CSV file (default `leads.csv`) |
-| `DASHBOARD_PORT` | Port for Express (default 3000) |
-| `COLD_DM_API_KEY` | Optional; if set, API requires this key (see Security) |
+```json
+{
+  "username": "instagram_username",
+  "password": "instagram_password"
+}
+```
 
-**Important paths on VPS (relative to project root):**
+**Behavior:** VPS runs Puppeteer, logs into Instagram with the provided credentials, then saves **only the session** (cookies or profile) to Supabase (e.g. `cold_dm_instagram_sessions`). Does **not** persist the password. Returns success or error.
 
-- `leads.csv` – lead usernames (first line can be `username`, then one per line).
-- `config/messages.js` – message templates (array `MESSAGES`); written by POST `/api/messages`.
-- `database/bot.db` – SQLite DB (sent_messages, daily_stats, control).
-- `.browser-profile/` – Chromium profile (cookies/session); do not commit.
+**Response:** `{ "ok": true }` or `{ "ok": false, "error": "..." }`
 
-**Deployment:** See `DEPLOYMENT.md` in this repo (Node, Chromium deps, PM2, firewall). For external access, add HTTPS and API key as in section 4.
+**Security:** This endpoint must be called over HTTPS and protected by the same API key. Only your Lovable backend should call it, and only when the user explicitly clicks “Connect” or “Reconnect.”
 
 ---
 
 ## 7. Lovable Integration Checklist
 
-Use this when building the Cold DM section in your AI setter / Lovable app:
+1. **Cold Outreach tab**
+   - Add a tab (e.g. “Cold Outreach”) in the same setter app UI. All Cold DM UI lives here; no separate site or “local mode.”
 
-1. **Backend**
-   - Add env: `COLD_DM_VPS_URL` (e.g. `https://colddm-api.yourdomain.com`), `COLD_DM_API_KEY` (same as on VPS).
-   - Implement server-side calls to the VPS for every action (status, settings, leads, messages, start, stop, reset-failed, sent). Forward or proxy requests; add the API key header. Do not expose the API key to the frontend.
+2. **Supabase**
+   - In your **existing** setter Supabase project, create the Cold DM tables (message templates, leads, settings, instagram_sessions, sent_messages, daily_stats, control). Use RLS so only the right user/tenant can read/write.
 
-2. **Frontend (Cold DM “module” screens)**
-   - **Dashboard:** Show status (running/stopped), today sent/failed, leads total/remaining; Start and Stop buttons; Reset failed button. Poll or refresh status periodically (e.g. GET `/api/status` via your backend).
-   - **Settings:** Form for Instagram username, password (optional change), daily limit, min/max delay, max per hour, headless. Save via POST `/api/settings` (via your backend).
-   - **Messages:** List/edit message templates; load GET `/api/messages`, save POST `/api/messages`.
-   - **Leads:** Text area or file upload; load GET `/api/leads`, save POST `/api/leads` or POST `/api/leads/upload`.
-   - **Sent:** Table or list from GET `/api/sent?limit=...`.
+3. **Backend (Lovable)**
+   - Store **VPS base URL** and **API key** in env (e.g. `COLD_DM_VPS_URL`, `COLD_DM_API_KEY`).
+   - Implement server-side calls to the VPS **only** for: **status** (GET), **start** (POST), **stop** (POST), **connect** (POST with username + password in body). Do not put the API key or VPS URL in the frontend.
+   - All other Cold DM data (templates, leads, settings, sent list, stats): read/write **Supabase** from your backend (or from the frontend via Supabase client with RLS). No need to proxy these through the VPS.
 
-3. **Security**
-   - All calls from Lovable to the VPS go through **your backend** with the API key. HTTPS on the VPS. No Instagram credentials stored in Lovable; they stay in the VPS `.env`.
+4. **Frontend (Cold Outreach tab)**
+   - **Connect Instagram:** Form (username + password) → backend → VPS `POST /api/instagram/connect`. Show “Connected as @username” when session exists; “Reconnect” when session is missing or expired. Never show or store the password after connect.
+   - **Settings:** Form for daily limit, min/max delay, max per hour. Save to **Supabase** (`cold_dm_settings`).
+   - **Message templates:** List/edit templates. Save to **Supabase** (`cold_dm_message_templates`).
+   - **Leads:** List/edit/paste/upload usernames. Save to **Supabase** (`cold_dm_leads`).
+   - **Sent:** Table/list from **Supabase** (`cold_dm_sent_messages`).
+   - **Dashboard:** Today sent/failed, leads total/remaining (from Supabase), Start / Stop buttons (via backend → VPS), Reset failed (e.g. delete failed rows in `cold_dm_sent_messages` and update `cold_dm_daily_stats` in Supabase).
 
-4. **No bot code in Lovable**
-   - Lovable does not run Puppeteer, Chromium, or the bot. It only consumes the VPS API and renders the UI.
+5. **Security**
+   - HTTPS for VPS and Lovable. API key for all VPS calls. Instagram password only sent once to VPS for connect; never stored. You can say: **“We do not store your Instagram password.”**
+
+6. **No bot code in Lovable**
+   - Lovable never runs Puppeteer or Chromium. It only talks to Supabase and to the VPS for start/stop/status/connect.
 
 ---
 
-## 8. Repo Structure (This Module)
+## 8. Current Cold DM Repo vs This Integration
+
+The **current** Cold DM repo (this codebase) uses:
+
+- **SQLite** for sent_messages, daily_stats, control  
+- **.env** and **leads.csv** for credentials and leads  
+- **config/messages.js** for templates  
+
+For this integration, the **VPS side** must be **adapted** to:
+
+- Read/write **Supabase** instead of SQLite and CSV (same project as setter).
+- Implement **session-only** Instagram: add `POST /api/instagram/connect`, persist only session to Supabase, and have the bot load session from Supabase (no password in .env for production).
+- Keep the **minimal VPS API**: status, start, stop, connect. All other data is in Supabase so Lovable and VPS stay in sync.
+
+That adaptation can be done in this repo (Cold DMs V1) and then deployed to the same VPS. INTEGRATION.md describes the **target** architecture; the code changes to use Supabase and the connect endpoint are a separate step (migration in this repo).
+
+---
+
+## 9. Repo Structure (This Module)
 
 ```
 Cold DMs V1/
-├── INTEGRATION.md     ← This file (give to the other Cursor/Lovable project)
-├── DEPLOYMENT.md      ← VPS setup (Node, Chromium, PM2, env)
-├── README.md          ← General project readme
-├── server.js          ← Express API + optional API key middleware
-├── bot.js             ← Puppeteer login + send flow (VPS only)
-├── cli.js             ← PM2 entry (--start, --status, etc.)
+├── INTEGRATION.md     ← This file (give to the setter/Lovable project)
+├── DEPLOYMENT.md      ← VPS setup (Node, Chromium, PM2)
+├── README.md
+├── server.js          ← Add /api/instagram/connect; optional: read/write Supabase
+├── bot.js             ← Puppeteer send flow; adapt to read session + config from Supabase
+├── cli.js             ← PM2 entry
+├── database/          ← Current: SQLite. Target: Supabase client + same schema in Supabase
 ├── config/
-│   └── messages.js   ← Message templates (written by API)
-├── database/
-│   └── db.js          ← SQLite (sent_messages, daily_stats, control)
 ├── public/
-│   └── index.html    ← Standalone dashboard (replace by Lovable UI)
-├── utils/
-│   └── logger.js
-├── leads.csv.example
-├── .env.example
-└── package.json
+└── ...
 ```
 
-The other project needs **INTEGRATION.md** (this file) and, if it will deploy the VPS side, the rest of the repo (or a clone). The Lovable app only needs to implement the API client and UI described above.
+The setter/Lovable project needs this **INTEGRATION.md** and the **Supabase schema** (section 5). The VPS repo (this one) needs to be updated to use Supabase and session-only login as described in sections 4 and 8.
 
 ---
 
-## 9. API Key Auth (Implemented)
+## 10. Summary
 
-This repo already includes optional API key auth in `server.js`. If you set **`COLD_DM_API_KEY`** in the VPS `.env`, all `/api/*` requests must include that value in the **`Authorization: Bearer <key>`** or **`X-API-Key: <key>`** header; otherwise the server responds with **401 Unauthorized**. If `COLD_DM_API_KEY` is unset, the API is open (e.g. for the built-in dashboard on the same machine). Your Lovable backend should send the same key on every request to the VPS.
+- **UI:** Cold Outreach is a **tab** in your setter app (same webpage). No local/standalone mode.
+- **Data:** All Cold DM data (messages, leads, settings, session only, sent log, stats, control) lives in your **existing Supabase project** so you can share data with the setter (e.g. leads, conversations) and stay in sync.
+- **Password:** **Never stored.** One-time connect sends password to VPS; VPS saves only session to Supabase. You can say: **“We do not store your Instagram password.”**
+- **Lovable ↔ VPS in sync:** Both use Supabase. Lovable calls the VPS only for **start**, **stop**, **status**, and **connect**.
+
+---
+
+## 11. Handoff for the Cold DM Repo (Setter Cursor → Cold DM Cursor)
+
+**If you are the setter/Lovable Cursor:** After you have created the Supabase schema and integrated the Cold Outreach tab, you **must** produce a **handoff document** that the product owner can copy and paste into the **Cold DM Cursor project** (the VPS repo). That document tells the Cold DM repo exactly how to adapt its code to use Supabase and the connect flow.
+
+**The handoff document should include:**
+
+1. **Supabase connection**
+   - Which env vars the VPS should use (e.g. `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` or `SUPABASE_ANON_KEY`), and whether the Cold DM bot should use the service role (to bypass RLS) or a dedicated key.
+
+2. **Exact table names and column names**
+   - For every Cold DM table you created (e.g. `cold_dm_message_templates`, `cold_dm_leads`, `cold_dm_settings`, `cold_dm_instagram_sessions`, `cold_dm_sent_messages`, `cold_dm_daily_stats`, `cold_dm_control`), list the **exact** table name and each column (name, type, nullable). If you use a `user_id` or `tenant_id` for multi-tenancy, say so and how the VPS should know which row to use (e.g. single row per app, or env var `COLD_DM_USER_ID`).
+
+3. **Session storage**
+   - Which table and columns store the Instagram session (e.g. `cold_dm_instagram_sessions.session_data`, `instagram_username`, `updated_at`). In what format should the VPS persist the session? (e.g. JSON-serialized cookies array, or base64 blob of Puppeteer profile.) How does the bot read it back (e.g. single row, or by `user_id`)?
+
+4. **Connect endpoint**
+   - Confirm: `POST /api/instagram/connect` body is `{ "username", "password" }`. After Puppeteer logs in, the VPS must write the session to the table/columns you specified above and must **not** store the password anywhere. Any extra steps (e.g. set `instagram_username` in `cold_dm_settings`)?
+
+5. **Control and status**
+   - Where is the “pause” flag stored (table + key/column)? How should the VPS return `todaySent`, `todayFailed`, `leadsTotal`, `leadsRemaining` for `GET /api/status`—by reading from Supabase, or leave that to Lovable?
+
+6. **Migrations or SQL**
+   - If you have run any migrations or SQL to create the Cold DM tables, paste the relevant SQL (or a link to it) so the Cold DM Cursor can align with your schema if needed.
+
+**Output the handoff as a single markdown or text block** that the product owner can paste into the Cold DM Cursor and say: “Use this to implement the Supabase changes and the connect endpoint in the Cold DM repo.”

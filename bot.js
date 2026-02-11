@@ -6,6 +6,7 @@ const path = require('path');
 const csv = require('csv-parser');
 const { getRandomMessage } = require('./config/messages');
 const { alreadySent, logSentMessage, getDailyStats, normalizeUsername, getControl, setControl } = require('./database/db');
+const sb = require('./database/supabase');
 const logger = require('./utils/logger');
 
 puppeteer.use(StealthPlugin());
@@ -48,10 +49,9 @@ function readEnvFromFile() {
   return out;
 }
 
-async function login(page) {
-  const env = readEnvFromFile();
-  const username = env.INSTAGRAM_USERNAME || process.env.INSTAGRAM_USERNAME;
-  const password = env.INSTAGRAM_PASSWORD || process.env.INSTAGRAM_PASSWORD;
+async function login(page, credentials) {
+  const username = credentials?.username ?? readEnvFromFile().INSTAGRAM_USERNAME ?? process.env.INSTAGRAM_USERNAME;
+  const password = credentials?.password ?? readEnvFromFile().INSTAGRAM_PASSWORD ?? process.env.INSTAGRAM_PASSWORD;
   if (!username || !password) {
     throw new Error('Missing INSTAGRAM_USERNAME or INSTAGRAM_PASSWORD. Add them in the dashboard Settings and save.');
   }
@@ -298,36 +298,40 @@ async function sendDMOnce(page, u, msg) {
   return { ok: false, reason: 'no_compose' };
 }
 
-async function sendDM(page, username) {
+async function sendDM(page, username, adapter) {
   const u = normalizeUsername(username);
-  if (alreadySent(u)) {
+  const sent = await Promise.resolve(adapter.alreadySent(u));
+  if (sent) {
     logger.warn(`Already sent to @${u}, skipping.`);
     return { ok: false, reason: 'already_sent' };
   }
 
-  const stats = getDailyStats();
-  if (stats.total_sent >= DAILY_LIMIT) {
-    logger.warn(`Daily limit reached (${DAILY_LIMIT}). Skipping.`);
+  const stats = await Promise.resolve(adapter.getDailyStats());
+  const dailyLimit = adapter.dailyLimit ?? DAILY_LIMIT;
+  if (stats.total_sent >= dailyLimit) {
+    logger.warn(`Daily limit reached (${dailyLimit}). Skipping.`);
     return { ok: false, reason: 'daily_limit' };
   }
 
-  if (getHourlySent() >= MAX_PER_HOUR) {
-    logger.warn(`Hourly limit reached (${MAX_PER_HOUR}). Skipping.`);
+  const hourlySent = await Promise.resolve(adapter.getHourlySent());
+  const maxPerHour = adapter.maxPerHour ?? MAX_PER_HOUR;
+  if (hourlySent >= maxPerHour) {
+    logger.warn(`Hourly limit reached (${maxPerHour}). Skipping.`);
     return { ok: false, reason: 'hourly_limit' };
   }
 
-  const msg = getRandomMessage();
+  const msg = adapter.getRandomMessage();
   let lastError;
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
       const result = await sendDMOnce(page, u, msg);
       if (result.ok) {
-        logSentMessage(u, msg, 'success');
+        await Promise.resolve(adapter.logSentMessage(u, msg, 'success'));
         logger.log(`Sent to @${u}: ${msg.slice(0, 30)}...`);
         return { ok: true };
       }
       if (result.reason === 'user_not_found' || result.reason === 'no_compose') {
-        logSentMessage(u, msg, 'failed');
+        await Promise.resolve(adapter.logSentMessage(u, msg, 'failed'));
         logger.warn(`Send failed for @${u}: ${result.reason}`);
         return result;
       }
@@ -339,7 +343,7 @@ async function sendDM(page, username) {
     }
   }
   logger.error(`Error sending to @${u} after ${MAX_SEND_RETRIES} retries`, lastError);
-  logSentMessage(u, msg, 'failed');
+  await Promise.resolve(adapter.logSentMessage(u, msg, 'failed'));
   return { ok: false, reason: lastError.message };
 }
 
@@ -362,18 +366,72 @@ function loadLeadsFromCSV(csvPath) {
 }
 
 async function runBot() {
-  const csvPath = process.env.LEADS_CSV || 'leads.csv';
-  let leads;
-  try {
-    leads = await loadLeadsFromCSV(csvPath);
-  } catch (e) {
-    logger.error('Failed to load leads', e);
-    throw e;
+  const useSupabase = sb.isSupabaseConfigured();
+  const clientId = useSupabase ? sb.getClientId() : null;
+  if (useSupabase && !clientId) {
+    logger.error('Supabase configured but no clientId (set COLD_DM_CLIENT_ID or start via dashboard with clientId).');
+    throw new Error('No clientId for Cold DM bot.');
   }
 
-  const filtered = leads.filter((u) => !alreadySent(u));
-  logger.log(`Loaded ${leads.length} leads, ${filtered.length} remaining after filtering already-sent.`);
-  if (filtered.length === 0) {
+  let leads;
+  let adapter;
+  let minDelayMs = MIN_DELAY_MS;
+  let maxDelayMs = MAX_DELAY_MS;
+
+  if (useSupabase && clientId) {
+    const settings = await sb.getSettings(clientId);
+    const messages = await sb.getMessageTemplates(clientId);
+    leads = await sb.getLeads(clientId);
+    const session = await sb.getSession(clientId);
+    if (!session || !session.session_data || !session.session_data.cookies) {
+      throw new Error('No Instagram session. Connect Instagram from the Cold Outreach tab first.');
+    }
+    if (!messages || messages.length === 0) {
+      throw new Error('No message templates. Add at least one in Cold Outreach.');
+    }
+    minDelayMs = (settings?.min_delay_minutes ?? 5) * 60 * 1000;
+    maxDelayMs = (settings?.max_delay_minutes ?? 30) * 60 * 1000;
+    adapter = {
+      dailyLimit: Math.min(settings?.daily_send_limit ?? 100, 200),
+      maxPerHour: settings?.max_sends_per_hour ?? 20,
+      alreadySent: (u) => sb.alreadySent(clientId, u),
+      logSentMessage: (u, msg, status) => sb.logSentMessage(clientId, u, msg, status),
+      getDailyStats: () => sb.getDailyStats(clientId),
+      getHourlySent: () => sb.getHourlySent(clientId),
+      getControl: () => sb.getControl(clientId),
+      setControl: (v) => sb.setControl(clientId, v),
+      getRandomMessage: () => messages[Math.floor(Math.random() * messages.length)],
+    };
+    const filtered = [];
+    for (const u of leads) {
+      const sent = await sb.alreadySent(clientId, u);
+      if (!sent) filtered.push(u);
+    }
+    leads = filtered;
+  } else {
+    const csvPath = process.env.LEADS_CSV || 'leads.csv';
+    try {
+      leads = await loadLeadsFromCSV(csvPath);
+    } catch (e) {
+      logger.error('Failed to load leads', e);
+      throw e;
+    }
+    leads = leads.filter((u) => !alreadySent(u));
+    adapter = {
+      dailyLimit: DAILY_LIMIT,
+      maxPerHour: MAX_PER_HOUR,
+      alreadySent: (u) => alreadySent(u),
+      logSentMessage: (u, msg, status) => logSentMessage(u, msg, status),
+      getDailyStats: () => getDailyStats(),
+      getHourlySent: () => getHourlySent(),
+      getControl: () => getControl('pause'),
+      setControl: (v) => setControl('pause', v),
+      getRandomMessage: () => getRandomMessage(),
+    };
+  }
+
+  logger.log(`Loaded ${leads.length} leads to process.`);
+  if (leads.length === 0) {
     logger.log('No leads to send. Done.');
     return;
   }
@@ -382,11 +440,14 @@ async function runBot() {
     headless: HEADLESS,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
   };
-  try {
-    if (!fs.existsSync(BROWSER_PROFILE_DIR)) fs.mkdirSync(BROWSER_PROFILE_DIR, { recursive: true });
-    launchOpts.userDataDir = BROWSER_PROFILE_DIR;
-  } catch (e) {
-    logger.log('Browser profile dir not used', e.message);
+  const useSessionCookies = useSupabase && clientId;
+  if (!useSessionCookies) {
+    try {
+      if (!fs.existsSync(BROWSER_PROFILE_DIR)) fs.mkdirSync(BROWSER_PROFILE_DIR, { recursive: true });
+      launchOpts.userDataDir = BROWSER_PROFILE_DIR;
+    } catch (e) {
+      logger.log('Browser profile dir not used', e.message);
+    }
   }
   let browser;
   try {
@@ -403,7 +464,22 @@ async function runBot() {
   try {
     page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
-    await login(page);
+    if (useSessionCookies) {
+      const session = await sb.getSession(clientId);
+      const cookies = session?.session_data?.cookies;
+      if (cookies && cookies.length) {
+        await page.setCookie(...cookies);
+      }
+      await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+      await delay(2000);
+      const url = page.url();
+      if (url.includes('/accounts/login')) {
+        throw new Error('Instagram session expired. Reconnect from Cold Outreach.');
+      }
+      logger.log('Using session from Supabase.');
+    } else {
+      await login(page);
+    }
   } catch (err) {
     logger.error('Setup failed', err);
     if (browser) await browser.close().catch(() => {});
@@ -411,29 +487,29 @@ async function runBot() {
   }
 
   let index = 0;
-
   const runOne = async () => {
-    if (getControl('pause') === '1') {
+    const pause = await Promise.resolve(adapter.getControl());
+    if (pause === '1' || pause === 1) {
       logger.log('Bot paused via control flag.');
       return;
     }
-    if (index >= filtered.length) {
+    if (index >= leads.length) {
       logger.log('All leads processed.');
       await browser.close();
       process.exit(0);
     }
 
-    const username = filtered[index];
-    const result = await sendDM(page, username);
+    const username = leads[index];
+    const result = await sendDM(page, username, adapter);
     if (result.ok) index += 1;
 
-    const nextDelay = randomDelay(MIN_DELAY_MS, MAX_DELAY_MS);
+    const nextDelay = randomDelay(minDelayMs, maxDelayMs);
     logger.log(`Next send in ${Math.round(nextDelay / 60000)} minutes.`);
     await delay(nextDelay);
     setImmediate(runOne);
   };
 
-  setControl('pause', '0');
+  await Promise.resolve(adapter.setControl(0));
 
   const scheduleNext = () => {
     const initialDelay = randomDelay(5 * 1000, 60 * 1000);
@@ -444,4 +520,24 @@ async function runBot() {
   scheduleNext();
 }
 
-module.exports = { runBot, getDailyStats, loadLeadsFromCSV, sendDM, login };
+/**
+ * One-time connect: log in with given credentials and return session (cookies).
+ * Used by POST /api/instagram/connect. Password is never stored.
+ */
+async function connectInstagram(instagramUsername, instagramPassword) {
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+    await login(page, { username: instagramUsername, password: instagramPassword });
+    const cookies = await page.cookies();
+    return { cookies, username: instagramUsername };
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+module.exports = { runBot, getDailyStats, loadLeadsFromCSV, sendDM, login, connectInstagram };

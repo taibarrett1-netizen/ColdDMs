@@ -12,6 +12,7 @@ database/*.db-journal
 
 # Persistent browser session (cookies; don't commit)
 .browser-profile/
+.cold_dm_client_id
 
 # Logs
 logs/*.log
