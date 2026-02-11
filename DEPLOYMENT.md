@@ -177,7 +177,8 @@ pm2 restart ig-dm-dashboard   # if you use it
 **One-liner (no sqlite3 required):**
 
 ```bash
-cd ~/ColdDMs && git pull origin main && npm install && pm2 restart ig-dm-bot && (pm2 restart ig-dm-dashboard 2>/dev/null); pm2 status
+cd ~/ColdDMs && git pull origin main && npm install && pm2 restart ig-dm-bot ig-dm-dashboard && pm2 status
 ```
+(If you only run the bot, PM2 will report “not found” for the other name; that’s fine.)
 
 If `ig-dm-bot` shows **errored**, see why: `pm2 logs ig-dm-bot --lines 80`
