@@ -10,6 +10,9 @@ node_modules/
 database/*.db
 database/*.db-journal
 
+# Persistent browser session (cookies; don't commit)
+.browser-profile/
+
 # Logs
 logs/*.log
 

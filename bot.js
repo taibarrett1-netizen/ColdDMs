@@ -15,6 +15,7 @@ const MIN_DELAY_MS = (parseInt(process.env.MIN_DELAY_MINUTES, 10) || 5) * 60 * 1
 const MAX_DELAY_MS = (parseInt(process.env.MAX_DELAY_MINUTES, 10) || 30) * 60 * 1000;
 const MAX_PER_HOUR = parseInt(process.env.MAX_SENDS_PER_HOUR, 10) || 20;
 const HEADLESS = process.env.HEADLESS_MODE !== 'false';
+const BROWSER_PROFILE_DIR = path.join(process.cwd(), '.browser-profile');
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -61,6 +62,11 @@ async function login(page) {
   const afterGotoTitle = await page.title().catch(() => '');
   logger.log(`After load: URL=${afterGotoUrl} title=${afterGotoTitle}`);
   await delay(3000);
+  const currentUrl = page.url();
+  if (!currentUrl.includes('/accounts/login')) {
+    logger.log('Already logged in (session restored).');
+    return;
+  }
 
   // Instagram changes input attributes; find by type and order: first visible text input = username, first password = password
   const inputs = await page.$$('input');
@@ -145,9 +151,25 @@ async function sendDMOnce(page, u, msg) {
   await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
   await humanDelay();
 
-  const querySel = 'input[name="queryBox"]';
-  await page.waitForSelector(querySel, { timeout: 8000 });
-  await page.type(querySel, u, { delay: 100 });
+  const searchInput = await page.evaluateHandle(() => {
+    const inputs = Array.from(document.querySelectorAll('input'));
+    const visible = inputs.filter((el) => el.offsetParent !== null && el.type !== 'hidden');
+    const search = visible.find(
+      (el) =>
+        el.placeholder && (el.placeholder.toLowerCase().includes('search') || el.placeholder.toLowerCase().includes('to:'))
+    );
+    if (search) return search;
+    const firstText = visible.find((el) => el.type === 'text' || el.type === '' || !el.type);
+    return firstText || null;
+  });
+  const searchEl = searchInput.asElement();
+  if (!searchEl) {
+    await searchInput.dispose();
+    throw new Error('Search input not found on direct/new page');
+  }
+  await searchEl.type(u, { delay: 100 });
+  await searchEl.dispose();
+  await searchInput.dispose();
   await delay(1500);
 
   const firstUser = await page.$('div[role="button"]');
@@ -260,8 +282,10 @@ async function runBot() {
     return;
   }
 
+  if (!fs.existsSync(BROWSER_PROFILE_DIR)) fs.mkdirSync(BROWSER_PROFILE_DIR, { recursive: true });
   const browser = await puppeteer.launch({
     headless: HEADLESS,
+    userDataDir: BROWSER_PROFILE_DIR,
     args: ['--no-sandbox', '--disable-setuid-sandbox'],
   });
 
