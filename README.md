@@ -2,6 +2,8 @@
 
 Node.js bot that sends cold DMs from a CSV lead list using Puppeteer, with random delays, daily/hourly limits, and SQLite tracking.
 
+**Integrating this as a module into another app (e.g. Lovable)?** See **[INTEGRATION.md](./INTEGRATION.md)** for architecture, API reference, and how to connect a separate UI (e.g. AI setter) to the VPS securely.
+
 ## Requirements
 
 - Node.js v18+ (v20 recommended)

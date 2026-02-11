@@ -18,6 +18,18 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Optional API key for external clients (e.g. Lovable). Set COLD_DM_API_KEY in .env to enable.
+const API_KEY = process.env.COLD_DM_API_KEY;
+if (API_KEY) {
+  app.use('/api', (req, res, next) => {
+    const key = req.headers.authorization?.replace(/^Bearer\s+/i, '') || req.headers['x-api-key'];
+    if (key !== API_KEY) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+  });
+}
+
 const upload = multer({ dest: projectRoot, limits: { fileSize: 1024 * 1024 } });
 
 const BOT_PM2_NAME = 'ig-dm-bot';
