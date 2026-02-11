@@ -55,18 +55,18 @@ async function login(page) {
     throw new Error('Missing INSTAGRAM_USERNAME or INSTAGRAM_PASSWORD. Add them in the dashboard Settings and save.');
   }
 
-  await page.goto('https://www.instagram.com/accounts/login/', { waitUntil: 'networkidle2', timeout: 30000 });
-  await humanDelay();
+  await page.goto('https://www.instagram.com/accounts/login/', { waitUntil: 'networkidle2', timeout: 45000 });
+  await delay(3000);
 
   const userSel = 'input[name="username"]';
   const passSel = 'input[name="password"]';
-  await page.waitForSelector(userSel, { timeout: 10000 });
+  await page.waitForSelector(userSel, { timeout: 25000 });
   await page.type(userSel, username, { delay: 80 + Math.floor(Math.random() * 60) });
   await humanDelay();
   await page.type(passSel, password, { delay: 80 + Math.floor(Math.random() * 60) });
   await humanDelay();
   await page.click('button[type="submit"]');
-  await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
+  await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
 
   // "Save login" / "Not Now"
   try {
