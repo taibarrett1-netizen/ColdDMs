@@ -172,27 +172,43 @@ async function sendDMOnce(page, u, msg) {
   await searchInput.dispose();
   await delay(1500);
 
-  const firstUser = await page.$('div[role="button"]');
-  if (!firstUser) {
+  const userClicked = await page.evaluate((username) => {
+    const needle = username.toLowerCase().replace(/^@/, '');
+    const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
+    const userBtn = buttons.find((b) => {
+      const t = (b.textContent || '').toLowerCase();
+      return t.includes(needle) && !t.includes('more accounts');
+    });
+    if (userBtn) {
+      userBtn.click();
+      return true;
+    }
+    if (buttons.length) buttons[0].click();
+    return false;
+  }, u);
+  if (!userClicked) {
     return { ok: false, reason: 'user_not_found' };
   }
-  await firstUser.click();
-  await delay(800);
+  await delay(1500);
 
-  const nextClicked = await page.evaluate(() => {
-    const buttons = Array.from(document.querySelectorAll('button'));
-    const nextBtn = buttons.find((b) => b.textContent.trim() === 'Next' || b.textContent.trim() === 'next');
-    if (nextBtn) {
-      nextBtn.click();
-      return true;
+  const openedThread = await page.evaluate(() => {
+    const labels = ['Message', 'Send message', 'Next', 'Chat', 'next', 'message'];
+    for (const label of labels) {
+      const btn = Array.from(document.querySelectorAll('button, div[role="button"], a')).find(
+        (el) => el.textContent.trim() === label && el.offsetParent !== null
+      );
+      if (btn) {
+        btn.click();
+        return true;
+      }
     }
     return false;
   });
-  if (nextClicked) await delay(1000);
-  await delay(3000);
+  if (openedThread) await delay(2000);
+  await delay(2000);
 
   try {
-    await page.waitForFunction(() => window.location.href.includes('/direct/'), { timeout: 5000 });
+    await page.waitForFunction(() => window.location.href.includes('/direct/'), { timeout: 3000 });
   } catch (e) {}
   await delay(1500);
 
