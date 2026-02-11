@@ -62,8 +62,8 @@ async function login(page) {
   logger.log(`After load: URL=${afterGotoUrl} title=${afterGotoTitle}`);
   await delay(3000);
 
-  const userSel = 'input[name="username"]';
-  const passSel = 'input[name="password"]';
+  const userSel = 'input[autocomplete="username"]';
+  const passSel = 'input[autocomplete="current-password"]';
   try {
     await page.waitForSelector(userSel, { timeout: 25000 });
   } catch (e) {
