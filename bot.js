@@ -189,7 +189,12 @@ async function sendDMOnce(page, u, msg) {
     return false;
   });
   if (nextClicked) await delay(1000);
-  await delay(2000);
+  await delay(3000);
+
+  try {
+    await page.waitForFunction(() => window.location.href.includes('/direct/'), { timeout: 5000 });
+  } catch (e) {}
+  await delay(1500);
 
   const composeDiagnostic = () =>
     page.evaluate(() => {
@@ -211,50 +216,70 @@ async function sendDMOnce(page, u, msg) {
 
   const composeSelector = 'textarea, div[contenteditable="true"], [role="textbox"]';
   logger.log('Waiting for compose area...');
+  let composeFound = false;
   try {
     await page.waitForSelector(composeSelector, { timeout: 15000 });
+    composeFound = true;
   } catch (e) {
     const diag = await composeDiagnostic().catch(() => ({}));
-    logger.warn('Compose wait failed', e.message);
-    logger.log('Compose diagnostic:', JSON.stringify(diag));
-    return { ok: false, reason: 'no_compose' };
+    logger.warn('Compose wait failed ' + e.message);
+    logger.log('Compose diagnostic: ' + JSON.stringify(diag));
   }
-  const diag = await composeDiagnostic().catch(() => ({}));
-  logger.log('Compose diagnostic:', JSON.stringify(diag));
 
-  const composeEl = await page.evaluateHandle(() => {
-    const byPlaceholder = (el) => {
-      const p = (el.getAttribute && el.getAttribute('placeholder')) || '';
-      const a = (el.getAttribute && el.getAttribute('aria-label')) || '';
-      const t = (p + ' ' + a).toLowerCase();
-      return t.includes('message') || t.includes('add a message') || t.includes('write a message');
-    };
-    const all = document.querySelectorAll('textarea, div[contenteditable="true"], [role="textbox"]');
-    for (const el of all) {
-      if (el.offsetParent === null) continue;
-      if (byPlaceholder(el)) return el;
+  if (composeFound) {
+    const diag = await composeDiagnostic().catch(() => ({}));
+    logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+
+    const composeEl = await page.evaluateHandle(() => {
+      const byPlaceholder = (el) => {
+        const p = (el.getAttribute && el.getAttribute('placeholder')) || '';
+        const a = (el.getAttribute && el.getAttribute('aria-label')) || '';
+        const t = (p + ' ' + a).toLowerCase();
+        return t.includes('message') || t.includes('add a message') || t.includes('write a message');
+      };
+      const all = document.querySelectorAll('textarea, div[contenteditable="true"], [role="textbox"]');
+      for (const el of all) {
+        if (el.offsetParent === null) continue;
+        if (byPlaceholder(el)) return el;
+      }
+      for (const el of all) {
+        if (el.offsetParent !== null) return el;
+      }
+      return null;
+    });
+    const compose = composeEl.asElement();
+    if (compose) {
+      await delay(500);
+      await compose.click();
+      await compose.type(msg, { delay: 60 + Math.floor(Math.random() * 40) });
+      await compose.dispose();
+      await composeEl.dispose();
+      await humanDelay();
+      await page.keyboard.press('Enter');
+      await delay(1500);
+      return { ok: true };
     }
-    for (const el of all) {
-      if (el.offsetParent !== null) return el;
-    }
-    return null;
-  });
-  const compose = composeEl.asElement();
-  if (!compose) {
     await composeEl.dispose();
     logger.warn('Compose element not found after selector matched');
-    return { ok: false, reason: 'no_compose' };
   }
-  await delay(500);
-  await compose.click();
-  await compose.type(msg, { delay: 60 + Math.floor(Math.random() * 40) });
-  await compose.dispose();
-  await composeEl.dispose();
-  await humanDelay();
-  await page.keyboard.press('Enter');
-  await delay(1500);
 
-  return { ok: true };
+  const keyboardSent = await page.evaluate((text) => {
+    const focusable = document.querySelector('textarea, [contenteditable="true"], [role="textbox"]');
+    if (!focusable || focusable.offsetParent === null) return false;
+    focusable.focus();
+    focusable.click();
+    return true;
+  }, msg);
+  if (keyboardSent) {
+    await delay(300);
+    await page.keyboard.type(msg, { delay: 60 + Math.floor(Math.random() * 40) });
+    await humanDelay();
+    await page.keyboard.press('Enter');
+    await delay(1500);
+    return { ok: true };
+  }
+
+  return { ok: false, reason: 'no_compose' };
 }
 
 async function sendDM(page, username) {
