@@ -98,7 +98,22 @@ async function login(page) {
   await passEl.type(password, { delay: 80 + Math.floor(Math.random() * 60) });
   await passEl.dispose();
   await humanDelay();
-  await page.click('button[type="submit"]');
+  const clicked = await page.evaluate(() => {
+    const submit = document.querySelector('button[type="submit"]');
+    if (submit) {
+      submit.click();
+      return true;
+    }
+    const logIn = Array.from(document.querySelectorAll('button, [role="button"]')).find(
+      (el) => el.textContent.trim() === 'Log in' && el.offsetParent !== null
+    );
+    if (logIn) {
+      logIn.click();
+      return true;
+    }
+    return false;
+  });
+  if (!clicked) throw new Error('Log in button not found.');
   await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
 
   // "Save login" / "Not Now"

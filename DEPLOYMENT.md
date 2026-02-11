@@ -173,3 +173,11 @@ npm install   # if package.json changed
 pm2 restart ig-dm-bot
 pm2 restart ig-dm-dashboard   # if you use it
 ```
+
+
+On your Mac:
+git add bot.js && git commit -m "Use autocomplete selectors for Instagram login" && git push origin main
+cd "/Users/taibarrett/Documents/SkeduleMore/Dashboard/Cold DMs V1"git add bot.js && git commit -m "Use autocomplete selectors for Instagram login" && git push origin main
+On the Droplet:
+cd ~/ColdDMs && git pull origin main && pm2 restart ig-dm-bot
+cd ~/ColdDMs && git pull origin main && pm2 restart ig-dm-bot
