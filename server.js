@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const { exec } = require('child_process');
 const multer = require('multer');
-const { getDailyStats, getRecentSent, getControl, alreadySent } = require('./database/db');
+const { getDailyStats, getRecentSent, getControl, setControl, alreadySent } = require('./database/db');
 const { loadLeadsFromCSV } = require('./bot');
 const { MESSAGES } = require('./config/messages');
 
@@ -181,6 +181,7 @@ app.post('/api/leads/upload', upload.single('file'), (req, res) => {
 // --- API: bot control (PM2 start/stop) ---
 app.post('/api/control/start', (req, res) => {
   console.log('[API] Start bot requested');
+  setControl('pause', '0');
   exec(`pm2 start cli.js --name ${BOT_PM2_NAME} -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
     const out = (stdout || '') + (stderr || '');
     const alreadyRunning = /already (running|launched)|online/i.test(out);
@@ -195,6 +196,7 @@ app.post('/api/control/start', (req, res) => {
 
 app.post('/api/control/stop', (req, res) => {
   console.log('[API] Stop bot requested');
+  setControl('pause', '1');
   exec(`pm2 stop ${BOT_PM2_NAME}`, (err, stdout, stderr) => {
     if (err) {
       console.error('[API] Stop failed', err, stderr);
