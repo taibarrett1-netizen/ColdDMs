@@ -282,12 +282,25 @@ async function runBot() {
     return;
   }
 
-  if (!fs.existsSync(BROWSER_PROFILE_DIR)) fs.mkdirSync(BROWSER_PROFILE_DIR, { recursive: true });
-  const browser = await puppeteer.launch({
+  const launchOpts = {
     headless: HEADLESS,
-    userDataDir: BROWSER_PROFILE_DIR,
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-  });
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  };
+  try {
+    launchOpts.userDataDir = BROWSER_PROFILE_DIR;
+  } catch (e) {
+    logger.log('Browser profile dir not used', e.message);
+  }
+  let browser;
+  try {
+    browser = await puppeteer.launch(launchOpts);
+  } catch (e) {
+    if (launchOpts.userDataDir) {
+      logger.log('Launch with profile failed, retrying without', e.message);
+      delete launchOpts.userDataDir;
+      browser = await puppeteer.launch(launchOpts);
+    } else throw e;
+  }
 
   let page;
   try {

@@ -174,10 +174,10 @@ pm2 restart ig-dm-bot
 pm2 restart ig-dm-dashboard   # if you use it
 ```
 
+**One-liner (no sqlite3 required):**
 
-On your Mac:
-git add bot.js && git commit -m "Use autocomplete selectors for Instagram login" && git push origin main
-cd "/Users/taibarrett/Documents/SkeduleMore/Dashboard/Cold DMs V1"git add bot.js && git commit -m "Use autocomplete selectors for Instagram login" && git push origin main
-On the Droplet:
-cd ~/ColdDMs && git pull origin main && pm2 restart ig-dm-bot
-cd ~/ColdDMs && git pull origin main && pm2 restart ig-dm-bot
+```bash
+cd ~/ColdDMs && git pull origin main && npm install && pm2 restart ig-dm-bot && (pm2 restart ig-dm-dashboard 2>/dev/null); pm2 status
+```
+
+If `ig-dm-bot` shows **errored**, see why: `pm2 logs ig-dm-bot --lines 80`
