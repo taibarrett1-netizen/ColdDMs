@@ -58,7 +58,7 @@
     <div class="card">
       <button id="btn-control" class="success">Resume</button>
       <p id="control-msg" class="msg" style="display:none; margin-top:0.5rem;"></p>
-      <p style="margin-top:0.75rem; color:#888; font-size:0.9rem;">Start the bot from the terminal: <code>npm start</code> or <code>pm2 start cli.js --name ig-dm-bot -- --start</code>. Pause/Resume only works if the bot is already running.</p>
+      <p style="margin-top:0.75rem; color:#888; font-size:0.9rem;">Add Instagram username and password in <strong>Settings</strong>, add leads in <strong>Leads</strong>, then click <strong>Start</strong> above. No terminal needed.</p>
     </div>
   </div>
 
@@ -141,21 +141,21 @@
         document.getElementById('leads-remaining').textContent = d.leadsRemaining;
         const dot = document.getElementById('status-dot');
         const text = document.getElementById('status-text');
-        if (d.paused) { dot.className = 'status-dot paused'; text.textContent = 'Paused'; }
-        else { dot.className = 'status-dot running'; text.textContent = 'Running'; }
-        updateControlButton(d.paused);
+        if (d.processRunning) { dot.className = 'status-dot running'; text.textContent = 'Running'; }
+        else { dot.className = 'status-dot paused'; text.textContent = 'Stopped'; }
+        updateControlButton(d.processRunning);
       }).catch((e) => { console.error('[Dashboard] Status fetch failed', e); document.getElementById('status-text').textContent = 'Error loading status'; });
     }
 
-    function updateControlButton(paused) {
+    function updateControlButton(processRunning) {
       const btn = document.getElementById('btn-control');
       if (!btn) return;
-      if (paused) {
-        btn.textContent = 'Resume';
-        btn.className = 'success';
-      } else {
-        btn.textContent = 'Pause';
+      if (processRunning) {
+        btn.textContent = 'Stop';
         btn.className = 'danger';
+      } else {
+        btn.textContent = 'Start';
+        btn.className = 'success';
       }
     }
 
@@ -247,21 +247,24 @@
 
     document.getElementById('btn-control').addEventListener('click', () => {
       const btn = document.getElementById('btn-control');
-      const isPaused = btn.textContent === 'Resume';
-      const endpoint = isPaused ? '/api/control/resume' : '/api/control/pause';
-      const action = isPaused ? 'resume' : 'pause';
+      const isStart = btn.textContent === 'Start';
+      const endpoint = isStart ? '/api/control/start' : '/api/control/stop';
+      const action = isStart ? 'start' : 'stop';
       console.log('[Dashboard] Control click:', action, '->', endpoint);
+      btn.disabled = true;
       fetch(endpoint, { method: 'POST' })
         .then((r) => { console.log('[Dashboard] Control response', r.status, endpoint); return r.json(); })
         .then((data) => {
           console.log('[Dashboard] Control result', data);
-          showControlMsg(isPaused ? 'Bot resumed.' : 'Bot paused.', true);
+          if (data.ok) showControlMsg(isStart ? 'Bot started.' : 'Bot stopped.', true);
+          else showControlMsg(data.error || 'Failed', false);
           refreshStatus();
         })
         .catch((e) => {
           console.error('[Dashboard] Control request failed', e);
           showControlMsg('Request failed.', false);
-        });
+        })
+        .finally(() => { btn.disabled = false; });
     });
 
     loadSettings();

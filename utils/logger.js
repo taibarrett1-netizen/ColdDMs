@@ -28,7 +28,8 @@ function warn(msg) {
 }
 
 function error(msg, err) {
-  write('ERROR', msg);
+  const errMsg = err ? (err.message || String(err)) : '';
+  write('ERROR', errMsg ? `${msg}: ${errMsg}` : msg);
   const errLine = err && err.stack ? `${msg}\n${err.stack}\n` : `${msg}\n`;
   try {
     fs.appendFileSync(errorPath, `[${timestamp()}] ${errLine}`);

@@ -2,8 +2,9 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+const { exec } = require('child_process');
 const multer = require('multer');
-const { getDailyStats, getRecentSent, setControl, getControl, alreadySent } = require('./database/db');
+const { getDailyStats, getRecentSent, getControl, alreadySent } = require('./database/db');
 const { loadLeadsFromCSV } = require('./bot');
 const { MESSAGES } = require('./config/messages');
 
@@ -19,29 +20,45 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const upload = multer({ dest: projectRoot, limits: { fileSize: 1024 * 1024 } });
 
+const BOT_PM2_NAME = 'ig-dm-bot';
+
+function getBotProcessRunning(cb) {
+  exec('pm2 jlist', { maxBuffer: 1024 * 1024 }, (err, stdout) => {
+    if (err) return cb(false);
+    try {
+      const list = JSON.parse(stdout);
+      const proc = list.find((p) => p.name === BOT_PM2_NAME);
+      cb(proc && proc.pm2_env && proc.pm2_env.status === 'online');
+    } catch (e) {
+      cb(false);
+    }
+  });
+}
+
 // --- API: status & stats ---
 app.get('/api/status', (req, res) => {
   const stats = getDailyStats();
-  const paused = getControl('pause') === '1';
   let leadsTotal = 0;
   let leadsRemaining = 0;
-  loadLeadsFromCSV(leadsPath).then((leads) => {
-    leadsTotal = leads.length;
-    leadsRemaining = leads.filter((u) => !alreadySent(u)).length;
-    res.json({
-      paused,
-      todaySent: stats.total_sent,
-      todayFailed: stats.total_failed,
-      leadsTotal,
-      leadsRemaining,
-    });
-  }).catch(() => {
-    res.json({
-      paused,
-      todaySent: stats.total_sent,
-      todayFailed: stats.total_failed,
-      leadsTotal: 0,
-      leadsRemaining: 0,
+  getBotProcessRunning((processRunning) => {
+    loadLeadsFromCSV(leadsPath).then((leads) => {
+      leadsTotal = leads.length;
+      leadsRemaining = leads.filter((u) => !alreadySent(u)).length;
+      res.json({
+        processRunning,
+        todaySent: stats.total_sent,
+        todayFailed: stats.total_failed,
+        leadsTotal,
+        leadsRemaining,
+      });
+    }).catch(() => {
+      res.json({
+        processRunning,
+        todaySent: stats.total_sent,
+        todayFailed: stats.total_failed,
+        leadsTotal: 0,
+        leadsRemaining: 0,
+      });
     });
   });
 });
@@ -161,19 +178,31 @@ app.post('/api/leads/upload', upload.single('file'), (req, res) => {
   res.json({ ok: true, count: usernames.length });
 });
 
-// --- API: bot control ---
-app.post('/api/control/pause', (req, res) => {
-  console.log('[API] Pause requested');
-  setControl('pause', '1');
-  console.log('[API] Pause set in DB');
-  res.json({ ok: true, paused: true });
+// --- API: bot control (PM2 start/stop) ---
+app.post('/api/control/start', (req, res) => {
+  console.log('[API] Start bot requested');
+  exec(`pm2 start cli.js --name ${BOT_PM2_NAME} -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
+    const out = (stdout || '') + (stderr || '');
+    const alreadyRunning = /already (running|launched)|online/i.test(out);
+    if (err && !alreadyRunning) {
+      console.error('[API] Start failed', err, stderr);
+      return res.status(500).json({ ok: false, error: (stderr || err.message || '').toString().trim() });
+    }
+    console.log('[API] Bot start command executed');
+    res.json({ ok: true, processRunning: true });
+  });
 });
 
-app.post('/api/control/resume', (req, res) => {
-  console.log('[API] Resume requested');
-  setControl('pause', '0');
-  console.log('[API] Resume set in DB');
-  res.json({ ok: true, paused: false });
+app.post('/api/control/stop', (req, res) => {
+  console.log('[API] Stop bot requested');
+  exec(`pm2 stop ${BOT_PM2_NAME}`, (err, stdout, stderr) => {
+    if (err) {
+      console.error('[API] Stop failed', err, stderr);
+      return res.status(500).json({ ok: false, error: stderr || err.message });
+    }
+    console.log('[API] Bot stopped');
+    res.json({ ok: true, processRunning: false });
+  });
 });
 
 // --- serve dashboard ---

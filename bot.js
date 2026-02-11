@@ -35,11 +35,24 @@ function getHourlySent() {
   return row ? row.c : 0;
 }
 
+function readEnvFromFile() {
+  const envPath = path.join(process.cwd(), '.env');
+  const out = {};
+  if (!fs.existsSync(envPath)) return out;
+  const content = fs.readFileSync(envPath, 'utf8');
+  for (const line of content.split('\n')) {
+    const m = line.match(/^([^#=]+)=(.*)$/);
+    if (m) out[m[1].trim()] = m[2].trim();
+  }
+  return out;
+}
+
 async function login(page) {
-  const username = process.env.INSTAGRAM_USERNAME;
-  const password = process.env.INSTAGRAM_PASSWORD;
+  const env = readEnvFromFile();
+  const username = env.INSTAGRAM_USERNAME || process.env.INSTAGRAM_USERNAME;
+  const password = env.INSTAGRAM_PASSWORD || process.env.INSTAGRAM_PASSWORD;
   if (!username || !password) {
-    throw new Error('Missing INSTAGRAM_USERNAME or INSTAGRAM_PASSWORD in .env');
+    throw new Error('Missing INSTAGRAM_USERNAME or INSTAGRAM_PASSWORD. Add them in the dashboard Settings and save.');
   }
 
   await page.goto('https://www.instagram.com/accounts/login/', { waitUntil: 'networkidle2', timeout: 30000 });
@@ -211,7 +224,7 @@ async function runBot() {
     await login(page);
   } catch (err) {
     logger.error('Setup failed', err);
-    await browser.close();
+    if (browser) await browser.close().catch(() => {});
     throw err;
   }
 
