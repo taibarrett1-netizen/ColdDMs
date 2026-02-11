@@ -33,6 +33,8 @@ sudo apt install -y libgbm1 libasound2 libnss3 libatk1.0-0 libatk-bridge2.0-0 li
 
 ## 5. Get the project onto the server
 
+Repo name is **ColdDMs**; on your Mac the folder may be **Cold DMs V1**. On the server, `cd` into whatever the folder is actually called there.
+
 **Option A – Git**
 
 ```bash
@@ -45,8 +47,8 @@ npm install
 **Option B – SCP from your Mac**
 
 ```bash
-# On your Mac:
-scp -r "/path/to/Cold DMs V1" user@SERVER_IP:~/cold-dm-bot
+# On your Mac (use your real path to the project):
+scp -r "/Users/taibarrett/Documents/SkeduleMore/Dashboard/Cold DMs V1" user@SERVER_IP:~/cold-dm-bot
 
 # On server:
 cd ~/cold-dm-bot
@@ -88,6 +90,8 @@ npm run dashboard
 ```
 
 Then open **http://YOUR_DROPLET_IP:3000**. To expose it on port 80 (optional), use Nginx as a reverse proxy to `http://127.0.0.1:3000`.
+
+**Setter dashboard Connect:** The setter UI calls `POST /api/instagram/connect` on this server. You must be running `server.js` (dashboard) on the droplet and have the latest code that includes this route. In Supabase secrets, set `COLD_DM_VPS_URL` to `http://YOUR_DROPLET_IP:3000` (no path, no trailing slash).
 
 ## 9. Run entirely on the Droplet (reset and go)
 
