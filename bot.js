@@ -138,8 +138,8 @@ async function login(page) {
   } catch (e) {}
 
   await delay(2000);
-  const currentUrl = page.url();
-  if (currentUrl.includes('/accounts/login')) {
+  const urlAfterLogin = page.url();
+  if (urlAfterLogin.includes('/accounts/login')) {
     throw new Error('Login may have failed; still on login page. Check credentials.');
   }
   logger.log('Logged in to Instagram.');
@@ -287,6 +287,7 @@ async function runBot() {
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
   };
   try {
+    if (!fs.existsSync(BROWSER_PROFILE_DIR)) fs.mkdirSync(BROWSER_PROFILE_DIR, { recursive: true });
     launchOpts.userDataDir = BROWSER_PROFILE_DIR;
   } catch (e) {
     logger.log('Browser profile dir not used', e.message);
