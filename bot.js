@@ -62,23 +62,41 @@ async function login(page) {
   logger.log(`After load: URL=${afterGotoUrl} title=${afterGotoTitle}`);
   await delay(3000);
 
-  const userSel = 'input[autocomplete="username"]';
-  const passSel = 'input[autocomplete="current-password"]';
-  try {
-    await page.waitForSelector(userSel, { timeout: 25000 });
-  } catch (e) {
+  // Instagram changes input attributes; find by type and order: first visible text input = username, first password = password
+  const inputs = await page.$$('input');
+  let userEl = null;
+  let passEl = null;
+  for (const el of inputs) {
+    const props = await el.evaluate((node) => ({
+      type: node.type,
+      visible: node.offsetParent !== null,
+    }));
+    if (props.visible && (props.type === 'text' || props.type === 'email' || props.type === '')) {
+      if (!userEl) userEl = el;
+    } else if (props.visible && props.type === 'password') {
+      passEl = el;
+      break;
+    }
+  }
+  if (!userEl || !passEl) {
+    inputs.forEach((el) => el.dispose());
     const failUrl = page.url();
     const failTitle = await page.title().catch(() => '');
     const bodyText = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 500) : '').catch(() => '');
-    logger.error('Username field not found', e);
+    logger.error('Login form fields not found');
     logger.log(`Page at failure: URL=${failUrl} title=${failTitle}`);
     logger.log(`Page body snippet: ${bodyText.replace(/\n/g, ' ').slice(0, 300)}`);
-    throw e;
+    throw new Error('Login form fields not found. Instagram may have changed the page.');
+  }
+  for (const el of inputs) {
+    if (el !== userEl && el !== passEl) el.dispose();
   }
   logger.log('Login form found, entering credentials...');
-  await page.type(userSel, username, { delay: 80 + Math.floor(Math.random() * 60) });
+  await userEl.type(username, { delay: 80 + Math.floor(Math.random() * 60) });
+  await userEl.dispose();
   await humanDelay();
-  await page.type(passSel, password, { delay: 80 + Math.floor(Math.random() * 60) });
+  await passEl.type(password, { delay: 80 + Math.floor(Math.random() * 60) });
+  await passEl.dispose();
   await humanDelay();
   await page.click('button[type="submit"]');
   await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
