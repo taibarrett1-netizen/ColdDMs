@@ -1,0 +1,29 @@
+{
+  "name": "cold-dm-bot",
+  "version": "1.0.0",
+  "description": "Instagram cold DM automation with CSV leads, scheduling, and SQLite tracking",
+  "main": "cli.js",
+  "scripts": {
+    "start": "node cli.js --start",
+    "status": "node cli.js --status",
+    "reset-daily": "node cli.js --reset-daily"
+  },
+  "keywords": [
+    "instagram",
+    "dm",
+    "automation",
+    "puppeteer"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^12.6.2",
+    "puppeteer": "^24.0.0",
+    "csv-parser": "^3.2.0",
+    "dotenv": "^17.2.4",
+    "node-cron": "^4.2.1",
+    "puppeteer": "^24.37.2",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}
