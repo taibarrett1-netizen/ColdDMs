@@ -55,12 +55,27 @@ async function login(page) {
     throw new Error('Missing INSTAGRAM_USERNAME or INSTAGRAM_PASSWORD. Add them in the dashboard Settings and save.');
   }
 
+  logger.log('Loading Instagram login page...');
   await page.goto('https://www.instagram.com/accounts/login/', { waitUntil: 'networkidle2', timeout: 45000 });
+  const afterGotoUrl = page.url();
+  const afterGotoTitle = await page.title().catch(() => '');
+  logger.log(`After load: URL=${afterGotoUrl} title=${afterGotoTitle}`);
   await delay(3000);
 
   const userSel = 'input[name="username"]';
   const passSel = 'input[name="password"]';
-  await page.waitForSelector(userSel, { timeout: 25000 });
+  try {
+    await page.waitForSelector(userSel, { timeout: 25000 });
+  } catch (e) {
+    const failUrl = page.url();
+    const failTitle = await page.title().catch(() => '');
+    const bodyText = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 500) : '').catch(() => '');
+    logger.error('Username field not found', e);
+    logger.log(`Page at failure: URL=${failUrl} title=${failTitle}`);
+    logger.log(`Page body snippet: ${bodyText.replace(/\n/g, ' ').slice(0, 300)}`);
+    throw e;
+  }
+  logger.log('Login form found, entering credentials...');
   await page.type(userSel, username, { delay: 80 + Math.floor(Math.random() * 60) });
   await humanDelay();
   await page.type(passSel, password, { delay: 80 + Math.floor(Math.random() * 60) });
