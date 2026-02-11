@@ -58,6 +58,16 @@ Node.js bot that sends cold DMs from a CSV lead list using Puppeteer, with rando
    node cli.js --reset-daily
    ```
 
+5. **Web dashboard (optional)**
+
+   Add Instagram credentials and leads from the browser:
+
+   ```bash
+   npm run dashboard
+   ```
+
+   Open **http://localhost:3000**. Use **Settings** for Instagram username/password and limits; **Leads** to paste or upload usernames. Start the bot with `npm start` when ready.
+
 ## Project layout
 
 - `bot.js` – Login, send DM, load CSV, scheduling and safety logic
@@ -66,6 +76,8 @@ Node.js bot that sends cold DMs from a CSV lead list using Puppeteer, with rando
 - `database/db.js` – SQLite helpers and schema
 - `utils/logger.js` – Logging to console and `logs/bot.log`
 - `leads.csv` – Your lead list (create from `leads.csv.example`)
+- `server.js` – Web dashboard (Express); run with `npm run dashboard`
+- `public/index.html` – Dashboard UI
 
 ## Safety
 

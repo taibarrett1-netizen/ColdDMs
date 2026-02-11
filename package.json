@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node cli.js --start",
     "status": "node cli.js --status",
-    "reset-daily": "node cli.js --reset-daily"
+    "reset-daily": "node cli.js --reset-daily",
+    "dashboard": "node server.js"
   },
   "keywords": [
     "instagram",
@@ -18,9 +19,10 @@
   "license": "ISC",
   "dependencies": {
     "better-sqlite3": "^12.6.2",
-    "puppeteer": "^24.0.0",
     "csv-parser": "^3.2.0",
     "dotenv": "^17.2.4",
+    "express": "^5.2.1",
+    "multer": "^2.0.2",
     "node-cron": "^4.2.1",
     "puppeteer": "^24.37.2",
     "puppeteer-extra": "^3.3.6",

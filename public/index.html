@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cold DM Bot</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 1rem; background: #1a1a1a; color: #e0e0e0; }
+    h1 { margin-top: 0; }
+    nav { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; border-bottom: 1px solid #333; padding-bottom: 0.5rem; }
+    nav a { color: #7eb8da; text-decoration: none; padding: 0.25rem 0.5rem; border-radius: 4px; }
+    nav a:hover { background: #333; }
+    nav a.active { background: #333; color: #fff; }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .card { background: #252525; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    .stat { display: inline-block; margin-right: 1.5rem; }
+    .stat strong { display: block; font-size: 1.5rem; color: #7eb8da; }
+    label { display: block; margin-top: 0.75rem; margin-bottom: 0.25rem; color: #aaa; }
+    input[type="text"], input[type="password"], input[type="number"], textarea { width: 100%; padding: 0.5rem; background: #1a1a1a; border: 1px solid #444; color: #e0e0e0; border-radius: 4px; }
+    textarea { min-height: 120px; font-family: inherit; }
+    button { padding: 0.5rem 1rem; background: #0d6efd; color: #fff; border: none; border-radius: 4px; cursor: pointer; margin-top: 0.5rem; margin-right: 0.5rem; }
+    button:hover { background: #0b5ed7; }
+    button.danger { background: #dc3545; }
+    button.danger:hover { background: #bb2d3b; }
+    button.success { background: #198754; }
+    button.success:hover { background: #157347; }
+    .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 0.5rem; }
+    .status-dot.paused { background: #ffc107; }
+    .status-dot.running { background: #198754; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #333; }
+    th { color: #888; }
+    .msg { padding: 0.5rem; margin-top: 0.5rem; border-radius: 4px; }
+    .msg.success { background: #1e4620; color: #a3cfbb; }
+    .msg.error { background: #4a1c1c; color: #f1aeb5; }
+    input[type="file"] { margin-top: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Cold DM Bot</h1>
+  <nav>
+    <a href="#" class="nav-link active" data-panel="dashboard">Dashboard</a>
+    <a href="#" class="nav-link" data-panel="settings">Settings</a>
+    <a href="#" class="nav-link" data-panel="leads">Leads</a>
+    <a href="#" class="nav-link" data-panel="sent">Sent</a>
+  </nav>
+
+  <div id="panel-dashboard" class="panel active">
+    <div class="card">
+      <p><span class="status-dot paused" id="status-dot"></span> <span id="status-text">Loading…</span></p>
+      <div class="stat"><strong id="today-sent">0</strong> Sent today</div>
+      <div class="stat"><strong id="today-failed">0</strong> Failed today</div>
+      <div class="stat"><strong id="leads-total">0</strong> Leads in list</div>
+      <div class="stat"><strong id="leads-remaining">0</strong> Remaining</div>
+    </div>
+    <div class="card">
+      <button id="btn-pause" class="danger">Pause bot</button>
+      <button id="btn-resume" class="success">Resume bot</button>
+      <p style="margin-top:0.75rem; color:#888; font-size:0.9rem;">Start the bot from the terminal: <code>npm start</code> or <code>pm2 start cli.js --name ig-dm-bot -- --start</code>. Pause/Resume only works if the bot is already running.</p>
+    </div>
+  </div>
+
+  <div id="panel-settings" class="panel">
+    <div class="card">
+      <h2>Instagram & limits</h2>
+      <p class="msg" id="settings-msg" style="display:none;"></p>
+      <label>Instagram username</label>
+      <input type="text" id="env-username" placeholder="your_username">
+      <label>Instagram password</label>
+      <input type="password" id="env-password" placeholder="••••••••">
+      <label>Daily send limit</label>
+      <input type="number" id="env-daily-limit" value="100" min="1" max="200">
+      <label>Min delay (minutes)</label>
+      <input type="number" id="env-min-delay" value="5" min="1">
+      <label>Max delay (minutes)</label>
+      <input type="number" id="env-max-delay" value="30" min="1">
+      <label>Headless (browser hidden)</label>
+      <select id="env-headless">
+        <option value="true">Yes</option>
+        <option value="false">No</option>
+      </select>
+      <button id="btn-save-settings">Save settings</button>
+    </div>
+    <div class="card">
+      <h2>Message templates</h2>
+      <p class="msg" id="messages-msg" style="display:none;"></p>
+      <label>One message per line (randomly picked when sending)</label>
+      <textarea id="messages-list" placeholder="Hey, saw your post..."></textarea>
+      <button id="btn-save-messages">Save messages</button>
+    </div>
+  </div>
+
+  <div id="panel-leads" class="panel">
+    <div class="card">
+      <h2>Leads (usernames to DM)</h2>
+      <p class="msg" id="leads-msg" style="display:none;"></p>
+      <label>Paste usernames (one per line, with or without @)</label>
+      <textarea id="leads-raw" placeholder="user1\nuser2\n@user3"></textarea>
+      <button id="btn-save-leads">Save leads</button>
+      <hr style="margin:1rem 0; border-color:#333;">
+      <label>Or upload CSV (column: username)</label>
+      <input type="file" id="leads-file" accept=".csv,.txt">
+      <button id="btn-upload-leads">Upload CSV</button>
+      <p id="leads-count" style="margin-top:0.5rem; color:#888;"></p>
+    </div>
+  </div>
+
+  <div id="panel-sent" class="panel">
+    <div class="card">
+      <h2>Recent sent</h2>
+      <table>
+        <thead><tr><th>Username</th><th>Message</th><th>Time</th><th>Status</th></tr></thead>
+        <tbody id="sent-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    function showPanel(id) {
+      document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+      document.querySelectorAll('.nav-link').forEach(a => a.classList.remove('active'));
+      document.getElementById('panel-' + id).classList.add('active');
+      document.querySelector('[data-panel="' + id + '"]').classList.add('active');
+      if (id === 'dashboard') refreshStatus();
+      if (id === 'sent') loadSent();
+      if (id === 'leads') loadLeads();
+    }
+    document.querySelectorAll('.nav-link').forEach(a => {
+      a.addEventListener('click', (e) => { e.preventDefault(); showPanel(a.dataset.panel); });
+    });
+
+    function refreshStatus() {
+      fetch('/api/status').then(r => r.json()).then(d => {
+        document.getElementById('today-sent').textContent = d.todaySent;
+        document.getElementById('today-failed').textContent = d.todayFailed;
+        document.getElementById('leads-total').textContent = d.leadsTotal;
+        document.getElementById('leads-remaining').textContent = d.leadsRemaining;
+        const dot = document.getElementById('status-dot');
+        const text = document.getElementById('status-text');
+        if (d.paused) { dot.className = 'status-dot paused'; text.textContent = 'Paused'; }
+        else { dot.className = 'status-dot running'; text.textContent = 'Running'; }
+      }).catch(() => { document.getElementById('status-text').textContent = 'Error loading status'; });
+    }
+
+    function loadSettings() {
+      fetch('/api/settings').then(r => r.json()).then(d => {
+        document.getElementById('env-username').value = d.INSTAGRAM_USERNAME || '';
+        document.getElementById('env-password').value = d.INSTAGRAM_PASSWORD || ''; // will show ******** if set
+        document.getElementById('env-daily-limit').value = d.DAILY_SEND_LIMIT || 100;
+        document.getElementById('env-min-delay').value = d.MIN_DELAY_MINUTES || 5;
+        document.getElementById('env-max-delay').value = d.MAX_DELAY_MINUTES || 30;
+        document.getElementById('env-headless').value = (d.HEADLESS_MODE || 'true') === 'true' ? 'true' : 'false';
+      });
+      fetch('/api/messages').then(r => r.json()).then(d => {
+        document.getElementById('messages-list').value = (d.messages || []).join('\n');
+      });
+    }
+
+    document.getElementById('btn-save-settings').addEventListener('click', () => {
+      const payload = {
+        INSTAGRAM_USERNAME: document.getElementById('env-username').value,
+        INSTAGRAM_PASSWORD: document.getElementById('env-password').value,
+        DAILY_SEND_LIMIT: document.getElementById('env-daily-limit').value,
+        MIN_DELAY_MINUTES: document.getElementById('env-min-delay').value,
+        MAX_DELAY_MINUTES: document.getElementById('env-max-delay').value,
+        HEADLESS_MODE: document.getElementById('env-headless').value
+      };
+      if (payload.INSTAGRAM_PASSWORD === '********') delete payload.INSTAGRAM_PASSWORD;
+      fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+        .then(r => r.json()).then(() => { showMsg('settings-msg', 'Settings saved.', true); })
+        .catch(() => { showMsg('settings-msg', 'Failed to save.', false); });
+    });
+
+    document.getElementById('btn-save-messages').addEventListener('click', () => {
+      const text = document.getElementById('messages-list').value;
+      const messages = text.split('\n').map(l => l.trim()).filter(Boolean);
+      if (!messages.length) { showMsg('messages-msg', 'Add at least one message.', false); return; }
+      fetch('/api/messages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages }) })
+        .then(r => r.json()).then(() => { showMsg('messages-msg', 'Messages saved.', true); })
+        .catch(() => { showMsg('messages-msg', 'Failed to save.', false); });
+    });
+
+    function showMsg(id, text, success) {
+      const el = document.getElementById(id);
+      el.textContent = text;
+      el.className = 'msg ' + (success ? 'success' : 'error');
+      el.style.display = 'block';
+      setTimeout(() => { el.style.display = 'none'; }, 3000);
+    }
+
+    function loadLeads() {
+      fetch('/api/leads').then(r => r.json()).then(d => {
+        document.getElementById('leads-raw').value = d.raw && d.raw.trim() ? d.raw : '';
+        document.getElementById('leads-count').textContent = d.usernames ? d.usernames.length + ' leads' : 'No leads file yet.';
+      });
+    }
+
+    document.getElementById('btn-save-leads').addEventListener('click', () => {
+      const raw = document.getElementById('leads-raw').value;
+      fetch('/api/leads', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ raw }) })
+        .then(r => r.json()).then(d => { showMsg('leads-msg', 'Saved ' + d.count + ' leads.', true); loadLeads(); })
+        .catch(() => { showMsg('leads-msg', 'Failed to save.', false); });
+    });
+
+    document.getElementById('btn-upload-leads').addEventListener('click', () => {
+      const input = document.getElementById('leads-file');
+      if (!input.files || !input.files[0]) { showMsg('leads-msg', 'Choose a file first.', false); return; }
+      const fd = new FormData();
+      fd.append('file', input.files[0]);
+      fetch('/api/leads/upload', { method: 'POST', body: fd })
+        .then(r => r.json()).then(d => { showMsg('leads-msg', 'Uploaded ' + d.count + ' leads.', true); loadLeads(); document.getElementById('leads-raw').value = ''; input.value = ''; })
+        .catch(() => { showMsg('leads-msg', 'Upload failed.', false); });
+    });
+
+    function loadSent() {
+      fetch('/api/sent').then(r => r.json()).then(rows => {
+        const tbody = document.getElementById('sent-tbody');
+        tbody.innerHTML = rows.length ? rows.map(r => '<tr><td>@' + r.username + '</td><td>' + escapeHtml(r.message) + '</td><td>' + r.sent_at + '</td><td>' + r.status + '</td></tr>').join('') : '<tr><td colspan="4">No sent messages yet.</td></tr>';
+      });
+    }
+    function escapeHtml(s) { const div = document.createElement('div'); div.textContent = s; return div.innerHTML; }
+
+    document.getElementById('btn-pause').addEventListener('click', () => {
+      fetch('/api/control/pause', { method: 'POST' }).then(() => refreshStatus());
+    });
+    document.getElementById('btn-resume').addEventListener('click', () => {
+      fetch('/api/control/resume', { method: 'POST' }).then(() => refreshStatus());
+    });
+
+    loadSettings();
+    refreshStatus();
+    setInterval(refreshStatus, 10000);
+  </script>
+</body>
+</html>

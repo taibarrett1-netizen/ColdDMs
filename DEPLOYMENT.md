@@ -77,7 +77,19 @@ pm2 startup
 - `pm2 logs ig-dm-bot` – view logs
 - `pm2 restart ig-dm-bot` – restart after code/config changes
 
-## 8. Updating after you push to GitHub
+## 8. Web dashboard (optional)
+
+Run the dashboard on the same server so you can add leads and edit settings in the browser:
+
+```bash
+cd ~/ColdDMs
+npm run dashboard
+# Or with PM2: pm2 start server.js --name ig-dm-dashboard
+```
+
+Then open **http://YOUR_DROPLET_IP:3000**. To expose it on port 80 (optional), use Nginx as a reverse proxy to `http://127.0.0.1:3000`.
+
+## 9. Updating after you push to GitHub
 
 On the VPS:
 
