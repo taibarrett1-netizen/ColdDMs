@@ -189,20 +189,29 @@ async function sendDMOnce(page, u, msg) {
     return false;
   });
   if (nextClicked) await delay(1000);
+  await delay(2000);
 
   const composeSelector = 'textarea, div[contenteditable="true"], [role="textbox"]';
   try {
-    await page.waitForSelector(composeSelector, { timeout: 8000 });
+    await page.waitForSelector(composeSelector, { timeout: 15000 });
   } catch (e) {
     return { ok: false, reason: 'no_compose' };
   }
   const composeEl = await page.evaluateHandle(() => {
-    const textarea = document.querySelector('textarea');
-    if (textarea && textarea.offsetParent !== null) return textarea;
-    const editable = document.querySelector('div[contenteditable="true"]');
-    if (editable && editable.offsetParent !== null) return editable;
-    const roleBox = document.querySelector('[role="textbox"]');
-    if (roleBox && roleBox.offsetParent !== null) return roleBox;
+    const byPlaceholder = (el) => {
+      const p = (el.getAttribute && el.getAttribute('placeholder')) || '';
+      const a = (el.getAttribute && el.getAttribute('aria-label')) || '';
+      const t = (p + ' ' + a).toLowerCase();
+      return t.includes('message') || t.includes('add a message') || t.includes('write a message');
+    };
+    const all = document.querySelectorAll('textarea, div[contenteditable="true"], [role="textbox"]');
+    for (const el of all) {
+      if (el.offsetParent === null) continue;
+      if (byPlaceholder(el)) return el;
+    }
+    for (const el of all) {
+      if (el.offsetParent !== null) return el;
+    }
     return null;
   });
   const compose = composeEl.asElement();
@@ -210,6 +219,7 @@ async function sendDMOnce(page, u, msg) {
     await composeEl.dispose();
     return { ok: false, reason: 'no_compose' };
   }
+  await delay(500);
   await compose.click();
   await compose.type(msg, { delay: 60 + Math.floor(Math.random() * 40) });
   await compose.dispose();
