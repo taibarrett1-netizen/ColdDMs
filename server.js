@@ -163,12 +163,16 @@ app.post('/api/leads/upload', upload.single('file'), (req, res) => {
 
 // --- API: bot control ---
 app.post('/api/control/pause', (req, res) => {
+  console.log('[API] Pause requested');
   setControl('pause', '1');
+  console.log('[API] Pause set in DB');
   res.json({ ok: true, paused: true });
 });
 
 app.post('/api/control/resume', (req, res) => {
+  console.log('[API] Resume requested');
   setControl('pause', '0');
+  console.log('[API] Resume set in DB');
   res.json({ ok: true, paused: false });
 });
 

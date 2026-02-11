@@ -56,8 +56,8 @@
       <div class="stat"><strong id="leads-remaining">0</strong> Remaining</div>
     </div>
     <div class="card">
-      <button id="btn-pause" class="danger">Pause bot</button>
-      <button id="btn-resume" class="success">Resume bot</button>
+      <button id="btn-control" class="success">Resume</button>
+      <p id="control-msg" class="msg" style="display:none; margin-top:0.5rem;"></p>
       <p style="margin-top:0.75rem; color:#888; font-size:0.9rem;">Start the bot from the terminal: <code>npm start</code> or <code>pm2 start cli.js --name ig-dm-bot -- --start</code>. Pause/Resume only works if the bot is already running.</p>
     </div>
   </div>
@@ -132,7 +132,9 @@
     });
 
     function refreshStatus() {
+      console.log('[Dashboard] Fetching status...');
       fetch('/api/status').then(r => r.json()).then(d => {
+        console.log('[Dashboard] Status:', d);
         document.getElementById('today-sent').textContent = d.todaySent;
         document.getElementById('today-failed').textContent = d.todayFailed;
         document.getElementById('leads-total').textContent = d.leadsTotal;
@@ -141,7 +143,28 @@
         const text = document.getElementById('status-text');
         if (d.paused) { dot.className = 'status-dot paused'; text.textContent = 'Paused'; }
         else { dot.className = 'status-dot running'; text.textContent = 'Running'; }
-      }).catch(() => { document.getElementById('status-text').textContent = 'Error loading status'; });
+        updateControlButton(d.paused);
+      }).catch((e) => { console.error('[Dashboard] Status fetch failed', e); document.getElementById('status-text').textContent = 'Error loading status'; });
+    }
+
+    function updateControlButton(paused) {
+      const btn = document.getElementById('btn-control');
+      if (!btn) return;
+      if (paused) {
+        btn.textContent = 'Resume';
+        btn.className = 'success';
+      } else {
+        btn.textContent = 'Pause';
+        btn.className = 'danger';
+      }
+    }
+
+    function showControlMsg(text, success) {
+      const el = document.getElementById('control-msg');
+      el.textContent = text;
+      el.className = 'msg ' + (success ? 'success' : 'error');
+      el.style.display = 'block';
+      setTimeout(() => { el.style.display = 'none'; }, 3000);
     }
 
     function loadSettings() {
@@ -222,11 +245,23 @@
     }
     function escapeHtml(s) { const div = document.createElement('div'); div.textContent = s; return div.innerHTML; }
 
-    document.getElementById('btn-pause').addEventListener('click', () => {
-      fetch('/api/control/pause', { method: 'POST' }).then(() => refreshStatus());
-    });
-    document.getElementById('btn-resume').addEventListener('click', () => {
-      fetch('/api/control/resume', { method: 'POST' }).then(() => refreshStatus());
+    document.getElementById('btn-control').addEventListener('click', () => {
+      const btn = document.getElementById('btn-control');
+      const isPaused = btn.textContent === 'Resume';
+      const endpoint = isPaused ? '/api/control/resume' : '/api/control/pause';
+      const action = isPaused ? 'resume' : 'pause';
+      console.log('[Dashboard] Control click:', action, '->', endpoint);
+      fetch(endpoint, { method: 'POST' })
+        .then((r) => { console.log('[Dashboard] Control response', r.status, endpoint); return r.json(); })
+        .then((data) => {
+          console.log('[Dashboard] Control result', data);
+          showControlMsg(isPaused ? 'Bot resumed.' : 'Bot paused.', true);
+          refreshStatus();
+        })
+        .catch((e) => {
+          console.error('[Dashboard] Control request failed', e);
+          showControlMsg('Request failed.', false);
+        });
     });
 
     loadSettings();
