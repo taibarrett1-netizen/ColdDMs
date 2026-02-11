@@ -191,12 +191,37 @@ async function sendDMOnce(page, u, msg) {
   if (nextClicked) await delay(1000);
   await delay(2000);
 
+  const composeDiagnostic = () =>
+    page.evaluate(() => {
+      const textareas = document.querySelectorAll('textarea');
+      const editables = document.querySelectorAll('div[contenteditable="true"]');
+      const roleBoxes = document.querySelectorAll('[role="textbox"]');
+      const visible = (el) => el.offsetParent !== null;
+      return {
+        url: window.location.href,
+        textarea: textareas.length,
+        textareaVisible: Array.from(textareas).filter(visible).length,
+        contenteditable: editables.length,
+        contenteditableVisible: Array.from(editables).filter(visible).length,
+        roleTextbox: roleBoxes.length,
+        roleTextboxVisible: Array.from(roleBoxes).filter(visible).length,
+        bodySnippet: document.body ? document.body.innerText.slice(0, 400).replace(/\n/g, ' ') : '',
+      };
+    });
+
   const composeSelector = 'textarea, div[contenteditable="true"], [role="textbox"]';
+  logger.log('Waiting for compose area...');
   try {
     await page.waitForSelector(composeSelector, { timeout: 15000 });
   } catch (e) {
+    const diag = await composeDiagnostic().catch(() => ({}));
+    logger.warn('Compose wait failed', e.message);
+    logger.log('Compose diagnostic:', JSON.stringify(diag));
     return { ok: false, reason: 'no_compose' };
   }
+  const diag = await composeDiagnostic().catch(() => ({}));
+  logger.log('Compose diagnostic:', JSON.stringify(diag));
+
   const composeEl = await page.evaluateHandle(() => {
     const byPlaceholder = (el) => {
       const p = (el.getAttribute && el.getAttribute('placeholder')) || '';
@@ -217,6 +242,7 @@ async function sendDMOnce(page, u, msg) {
   const compose = composeEl.asElement();
   if (!compose) {
     await composeEl.dispose();
+    logger.warn('Compose element not found after selector matched');
     return { ok: false, reason: 'no_compose' };
   }
   await delay(500);
