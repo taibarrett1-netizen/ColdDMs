@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const { exec } = require('child_process');
 const multer = require('multer');
-const { getDailyStats, getRecentSent, getControl, setControl, alreadySent } = require('./database/db');
+const { getDailyStats, getRecentSent, getControl, setControl, alreadySent, clearFailedAttempts } = require('./database/db');
 const { loadLeadsFromCSV } = require('./bot');
 const { MESSAGES } = require('./config/messages');
 
@@ -192,6 +192,15 @@ app.post('/api/control/start', (req, res) => {
     console.log('[API] Bot start command executed');
     res.json({ ok: true, processRunning: true });
   });
+});
+
+app.post('/api/reset-failed', (req, res) => {
+  try {
+    const cleared = clearFailedAttempts();
+    res.json({ ok: true, cleared });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 app.post('/api/control/stop', (req, res) => {

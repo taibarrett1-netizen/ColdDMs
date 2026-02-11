@@ -57,8 +57,9 @@
     </div>
     <div class="card">
       <button id="btn-control" class="success">Resume</button>
+      <button id="btn-reset-failed" class="danger" style="margin-left:0.25rem;">Reset failed</button>
       <p id="control-msg" class="msg" style="display:none; margin-top:0.5rem;"></p>
-      <p style="margin-top:0.75rem; color:#888; font-size:0.9rem;">Add Instagram username and password in <strong>Settings</strong>, add leads in <strong>Leads</strong>, then click <strong>Start</strong> above. No terminal needed.</p>
+      <p style="margin-top:0.75rem; color:#888; font-size:0.9rem;">Add Instagram username and password in <strong>Settings</strong>, add leads in <strong>Leads</strong>, then click <strong>Start</strong> above. <strong>Reset failed</strong> clears failed attempts so those leads can be tried again. No terminal needed.</p>
     </div>
   </div>
 
@@ -264,6 +265,21 @@
           console.error('[Dashboard] Control request failed', e);
           showControlMsg('Request failed.', false);
         })
+        .finally(() => { btn.disabled = false; });
+    });
+
+    document.getElementById('btn-reset-failed').addEventListener('click', () => {
+      const btn = document.getElementById('btn-reset-failed');
+      btn.disabled = true;
+      fetch('/api/reset-failed', { method: 'POST' })
+        .then((r) => r.json())
+        .then((data) => {
+          if (data.ok) {
+            showControlMsg('Failed attempts cleared. ' + (data.cleared || 0) + ' lead(s) can be tried again.', true);
+            refreshStatus();
+          } else showControlMsg(data.error || 'Failed', false);
+        })
+        .catch(() => showControlMsg('Request failed.', false))
         .finally(() => { btn.disabled = false; });
     });
 

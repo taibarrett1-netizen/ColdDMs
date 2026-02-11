@@ -86,6 +86,16 @@ function resetDailyStats() {
   return date;
 }
 
+function clearFailedAttempts() {
+  const result = db.prepare("DELETE FROM sent_messages WHERE status = 'failed'").run();
+  const date = getToday();
+  const row = db.prepare('SELECT total_sent FROM daily_stats WHERE date = ?').get(date);
+  if (row) {
+    db.prepare('UPDATE daily_stats SET total_failed = 0 WHERE date = ?').run(date);
+  }
+  return result.changes;
+}
+
 module.exports = {
   db,
   getToday,
@@ -97,4 +107,5 @@ module.exports = {
   setControl,
   getControl,
   resetDailyStats,
+  clearFailedAttempts,
 };
