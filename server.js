@@ -23,7 +23,7 @@ const {
   cancelScrapeJob,
 } = require('./database/supabase');
 const { loadLeadsFromCSV, connectInstagram } = require('./bot');
-const { connectScraper, runFollowerScrape } = require('./scraper');
+const { connectScraper, runFollowerScrape, runCommentScrape } = require('./scraper');
 const { MESSAGES } = require('./config/messages');
 
 const app = express();
@@ -365,9 +365,17 @@ app.post('/api/scraper/status', async (req, res) => {
 });
 
 app.post('/api/scraper/start', async (req, res) => {
-  const { clientId, target_username, max_leads, lead_group_id } = req.body || {};
-  if (!clientId || !target_username) {
-    return res.status(400).json({ ok: false, error: 'clientId and target_username are required' });
+  const { clientId, target_username, max_leads, lead_group_id, scrape_type, post_urls } = req.body || {};
+  const scrapeType = scrape_type === 'comments' ? 'comments' : 'followers';
+
+  if (!clientId) {
+    return res.status(400).json({ ok: false, error: 'clientId is required' });
+  }
+  if (scrapeType === 'followers' && !target_username) {
+    return res.status(400).json({ ok: false, error: 'target_username is required for follower scrape' });
+  }
+  if (scrapeType === 'comments' && (!post_urls || !Array.isArray(post_urls) || post_urls.length === 0)) {
+    return res.status(400).json({ ok: false, error: 'post_urls (array of Instagram post URLs) is required for comment scrape' });
   }
   if (!isSupabaseConfigured()) {
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
@@ -377,13 +385,29 @@ app.post('/api/scraper/start', async (req, res) => {
     if (!session?.session_data?.cookies?.length) {
       return res.status(400).json({ ok: false, error: 'Scraper not connected' });
     }
-    const jobId = await createScrapeJob(clientId, target_username.trim().replace(/^@/, ''), lead_group_id || null);
+
+    const targetForJob = scrapeType === 'followers' ? target_username.trim().replace(/^@/, '') : 'comments';
+    const jobId = await createScrapeJob(
+      clientId,
+      targetForJob,
+      lead_group_id || null,
+      scrapeType,
+      scrapeType === 'comments' ? post_urls : null
+    );
+
     const scrapeOptions = {};
     if (max_leads != null && max_leads > 0) scrapeOptions.maxLeads = max_leads;
     if (lead_group_id) scrapeOptions.leadGroupId = lead_group_id;
-    runFollowerScrape(clientId, jobId, target_username, scrapeOptions).catch((err) => {
-      console.error('[API] Scraper background job error', err);
-    });
+
+    if (scrapeType === 'comments') {
+      runCommentScrape(clientId, jobId, post_urls, scrapeOptions).catch((err) => {
+        console.error('[API] Comment scrape error', err);
+      });
+    } else {
+      runFollowerScrape(clientId, jobId, target_username, scrapeOptions).catch((err) => {
+        console.error('[API] Follower scrape error', err);
+      });
+    }
     res.json({ ok: true, jobId });
   } catch (e) {
     console.error('[API] Scraper start error', e);

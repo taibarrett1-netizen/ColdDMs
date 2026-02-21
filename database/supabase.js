@@ -357,7 +357,7 @@ async function saveScraperSession(clientId, sessionData, instagramUsername) {
 }
 
 // --- Scrape jobs ---
-async function createScrapeJob(clientId, targetUsername, leadGroupId = null) {
+async function createScrapeJob(clientId, targetUsername, leadGroupId = null, scrapeType = 'followers', postUrls = null) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
   const payload = {
@@ -368,6 +368,8 @@ async function createScrapeJob(clientId, targetUsername, leadGroupId = null) {
     started_at: new Date().toISOString(),
   };
   if (leadGroupId) payload.lead_group_id = leadGroupId;
+  if (scrapeType) payload.scrape_type = scrapeType;
+  if (postUrls && Array.isArray(postUrls) && postUrls.length) payload.post_urls = postUrls;
   const { data, error } = await sb
     .from('cold_dm_scrape_jobs')
     .insert(payload)
@@ -435,6 +437,27 @@ async function cancelScrapeJob(clientId, jobId) {
     return true;
   }
   return false;
+}
+
+/** Returns Set of normalised usernames that have active conversations (do not scrape as leads). */
+async function getConversationParticipantUsernames(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return new Set();
+  try {
+    const { data, error } = await sb
+      .from('conversations')
+      .select('participant_username')
+      .eq('client_id', clientId);
+    if (error) return new Set();
+    const set = new Set();
+    for (const row of data || []) {
+      const u = normalizeUsername(row.participant_username || '');
+      if (u) set.add(u);
+    }
+    return set;
+  } catch (e) {
+    return new Set();
+  }
 }
 
 // --- Leads upsert (for scraper) ---
@@ -657,6 +680,7 @@ module.exports = {
   updateSettingsInstagramUsername,
   getScraperSession,
   saveScraperSession,
+  getConversationParticipantUsernames,
   createScrapeJob,
   updateScrapeJob,
   getScrapeJob,

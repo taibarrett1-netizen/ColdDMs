@@ -14,6 +14,7 @@ const {
   updateScrapeJob,
   getScrapeJob,
   upsertLeadsBatch,
+  getConversationParticipantUsernames,
 } = require('./database/supabase');
 const logger = require('./utils/logger');
 
@@ -301,6 +302,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       let newUsernames = batch.filter(
         (u) => !seenUsernames.has(u) && !BLACKLIST.has(u) && u !== cleanTarget
       );
+      const inConvos = await getConversationParticipantUsernames(clientId);
+      newUsernames = newUsernames.filter((u) => !inConvos.has(u));
       newUsernames = [...new Set(newUsernames)];
       if (effectiveMax && totalScraped + newUsernames.length > effectiveMax) {
         newUsernames = newUsernames.slice(0, effectiveMax - totalScraped);
@@ -403,4 +406,167 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
   }
 }
 
-module.exports = { connectScraper, runFollowerScrape };
+/**
+ * Extract shortcode from Instagram post URL.
+ * e.g. https://www.instagram.com/p/ABC123/ -> ABC123
+ */
+function getShortcodeFromPostUrl(url) {
+  const m = String(url || '').match(/instagram\.com\/p\/([A-Za-z0-9_-]+)/);
+  return m ? m[1] : null;
+}
+
+/**
+ * Run comment scrape: navigate to post URLs, extract commenter usernames.
+ * @param {string} clientId
+ * @param {string} jobId
+ * @param {string[]} postUrls - Instagram post URLs (e.g. https://www.instagram.com/p/ABC123/)
+ * @param {object} options - { maxLeads, leadGroupId }
+ */
+async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
+  const maxLeads = options.maxLeads != null ? Math.max(1, parseInt(options.maxLeads, 10) || 0) : null;
+  const leadGroupId = options.leadGroupId || null;
+  const sb = require('./database/supabase').getSupabase();
+  if (!sb || !clientId || !jobId || !postUrls || !Array.isArray(postUrls) || postUrls.length === 0) {
+    logger.error('[Scraper] Comment scrape: missing clientId, jobId, or postUrls');
+    return;
+  }
+
+  const BLACKLIST = new Set([
+    'explore', 'direct', 'accounts', 'reels', 'stories', 'p', 'tv', 'tags',
+    'developer', 'about', 'blog', 'jobs', 'help', 'api', 'privacy', 'terms',
+  ]);
+
+  let browser;
+  try {
+    const session = await getScraperSession(clientId);
+    if (!session?.session_data?.cookies?.length) {
+      await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session not found or expired' });
+      return;
+    }
+
+    browser = await puppeteer.launch({
+      headless: HEADLESS,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+    });
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+    await page.setCookie(...session.session_data.cookies);
+    await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+    await delay(2000);
+
+    if (page.url().includes('/accounts/login')) {
+      await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session expired. Reconnect scraper.' });
+      return;
+    }
+
+    logger.log('[Scraper] Comment scrape: ' + postUrls.length + ' post(s)');
+    let totalScraped = 0;
+    const seenUsernames = new Set();
+    const inConvos = await getConversationParticipantUsernames(clientId);
+
+    for (const postUrl of postUrls) {
+      const jobCheck = await getScrapeJob(jobId);
+      if (jobCheck && jobCheck.status === 'cancelled') {
+        logger.log('[Scraper] Job cancelled');
+        break;
+      }
+
+      const shortcode = getShortcodeFromPostUrl(postUrl);
+      const source = shortcode ? 'comments:' + shortcode : 'comments:' + postUrl;
+
+      const normalizedUrl = postUrl.includes('instagram.com') ? postUrl : 'https://www.instagram.com/p/' + postUrl + '/';
+      await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
+
+      let noNewCount = 0;
+      let scrollCount = 0;
+
+      while (true) {
+        const usernames = await page.evaluate(function () {
+          const out = [];
+          const anchors = document.querySelectorAll('a[href^="/"]');
+          for (let i = 0; i < anchors.length; i++) {
+            const href = (anchors[i].getAttribute('href') || '').trim();
+            const m = href.match(/^\/([^/?#]+)\/?$/);
+            if (!m) continue;
+            const u = m[1].toLowerCase();
+            if (u && u.length >= 2 && u.length <= 30 && /^[a-z0-9._]+$/.test(u)) out.push(u);
+          }
+          return [...new Set(out)];
+        });
+
+        let newUsernames = usernames.filter(
+          (u) => !seenUsernames.has(u) && !BLACKLIST.has(u) && !inConvos.has(u)
+        );
+        newUsernames = [...new Set(newUsernames)];
+        if (maxLeads && totalScraped + newUsernames.length > maxLeads) {
+          newUsernames = newUsernames.slice(0, maxLeads - totalScraped);
+        }
+        for (const u of newUsernames) seenUsernames.add(u);
+
+        if (newUsernames.length > 0) {
+          await upsertLeadsBatch(clientId, newUsernames, source, leadGroupId);
+          totalScraped = seenUsernames.size;
+          await updateScrapeJob(jobId, { scraped_count: totalScraped });
+          noNewCount = 0;
+          logger.log('[Scraper] Comments: +' + newUsernames.length + ' new, total ' + totalScraped);
+          if (maxLeads && totalScraped >= maxLeads) break;
+        } else {
+          noNewCount++;
+          if (noNewCount >= 3) break;
+        }
+
+        const commentsOpened = await page.evaluate(function () {
+          const btns = Array.from(document.querySelectorAll('span, a, [role="button"]'));
+          const commentBtn = btns.find(function (b) {
+            const t = (b.textContent || '').toLowerCase();
+            return t.includes('comment') || t === 'view all' || /^\d+\s*comment/.test(t);
+          });
+          if (commentBtn) {
+            commentBtn.click();
+            return true;
+          }
+          return false;
+        });
+        if (commentsOpened) await delay(2000);
+
+        const scrolled = await page.evaluate(function () {
+          const scrollables = document.querySelectorAll('div[style*="overflow"], [role="dialog"]');
+          for (let i = 0; i < scrollables.length; i++) {
+            const s = scrollables[i];
+            if (s.scrollHeight > s.clientHeight) {
+              s.scrollTop = s.scrollHeight;
+              return true;
+            }
+          }
+          window.scrollTo(0, document.body.scrollHeight);
+          return true;
+        });
+        if (!scrolled) break;
+        await delay(randomDelay(1500, 3000));
+        scrollCount++;
+        if (scrollCount > 10) break;
+      }
+
+      await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
+    }
+
+    await updateScrapeJob(jobId, { status: 'completed', scraped_count: totalScraped });
+    logger.log('[Scraper] Comment job ' + jobId + ' completed. Scraped ' + totalScraped + ' leads.');
+  } catch (err) {
+    logger.error('[Scraper] Comment scrape failed', err);
+    try {
+      const { updateScrapeJob: updateJob } = require('./database/supabase');
+      await updateJob(jobId, {
+        status: 'failed',
+        error_message: (err && err.message) || String(err),
+      });
+    } catch (e) {
+      logger.error('[Scraper] Failed to update job status', e);
+    }
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+module.exports = { connectScraper, runFollowerScrape, runCommentScrape };
