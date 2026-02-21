@@ -93,6 +93,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     const source = `followers:${targetUsername}`;
     const cleanTarget = targetUsername.replace(/^@/, '').trim().toLowerCase();
+    logger.log(`[Scraper] Starting follower scrape for @${cleanTarget}${maxLeads ? ` (max ${maxLeads})` : ''}`);
+
     await page.goto(`https://www.instagram.com/${encodeURIComponent(cleanTarget)}/`, {
       waitUntil: 'networkidle2',
       timeout: 30000,
@@ -139,6 +141,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     }, cleanTarget);
 
     if (!followersLinkClicked) {
+      logger.error('[Scraper] Could not open followers modal');
       await updateScrapeJob(jobId, {
         status: 'failed',
         error_message: 'Could not open followers list. Profile may be private or link not found.',
@@ -146,26 +149,37 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       return;
     }
 
+    logger.log('[Scraper] Followers modal opened, extracting...');
     await delay(3000);
 
     let totalScraped = 0;
     const seenUsernames = new Set();
     let noNewCount = 0;
-    const MAX_NO_NEW = 3;
+    const MAX_NO_NEW = 6;
+    const BLACKLIST = new Set([
+      'explore', 'direct', 'accounts', 'reels', 'stories', 'p', 'tv', 'tags',
+      'developer', 'about', 'blog', 'jobs', 'help', 'api', 'privacy', 'terms',
+    });
+    let scrollCount = 0;
 
     while (true) {
       const jobCheck = await getScrapeJob(jobId);
-      if (jobCheck?.status === 'cancelled') break;
+      if (jobCheck?.status === 'cancelled') {
+        logger.log('[Scraper] Job cancelled');
+        break;
+      }
 
       const batch = await page.evaluate(() => {
         const usernames = [];
-        const anchors = document.querySelectorAll('a[href^="/"]');
+        const dialog = document.querySelector('[role="dialog"]');
+        const root = dialog || document.body;
+        const anchors = root.querySelectorAll('a[href^="/"]');
         for (const a of anchors) {
           const href = (a.getAttribute('href') || '').trim();
-          const m = href.match(/^\/([^/?#]+)\/?/);
+          const m = href.match(/^\/([^/?#]+)\/?$/);
           if (m) {
             const u = m[1].toLowerCase();
-            if (u && u !== 'explore' && u !== 'direct' && u !== 'accounts' && u !== 'reels' && u !== 'stories') {
+            if (u && u.length >= 2 && u.length <= 30 && /^[a-z0-9._]+$/.test(u)) {
               usernames.push(u);
             }
           }
@@ -173,7 +187,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         return [...new Set(usernames)];
       });
 
-      const newUsernames = batch.filter((u) => !seenUsernames.has(u));
+      const newUsernames = batch.filter((u) => !seenUsernames.has(u) && !BLACKLIST.has(u));
       for (const u of newUsernames) seenUsernames.add(u);
 
       if (newUsernames.length > 0) {
@@ -181,38 +195,67 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         totalScraped = seenUsernames.size;
         await updateScrapeJob(jobId, { scraped_count: totalScraped });
         noNewCount = 0;
+        logger.log(`[Scraper] Batch: +${newUsernames.length} new, total ${totalScraped}`);
         if (maxLeads && totalScraped >= maxLeads) {
           logger.log(`[Scraper] Reached max_leads (${maxLeads}). Stopping.`);
           break;
         }
       } else {
         noNewCount++;
-        if (noNewCount >= MAX_NO_NEW) break;
+        if (scrollCount < 3) {
+          noNewCount = 0;
+        }
+        if (noNewCount >= MAX_NO_NEW) {
+          logger.log(`[Scraper] No new usernames for ${MAX_NO_NEW} iterations. Stopping.`);
+          break;
+        }
       }
 
+      scrollCount++;
       const scrolled = await page.evaluate(() => {
-        const dialogs = document.querySelectorAll('[role="dialog"]');
-        for (const d of dialogs) {
-          const scrollables = d.querySelectorAll('div[style*="overflow"], div[class*="scroll"]');
-          for (const s of scrollables) {
+        const dialog = document.querySelector('[role="dialog"]');
+        if (!dialog) return false;
+        const scrollables = dialog.querySelectorAll('div');
+        for (const s of scrollables) {
+          const style = window.getComputedStyle(s);
+          const overflow = style.overflowY || style.overflow || '';
+          const canScroll = s.scrollHeight > s.clientHeight;
+          if ((overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay') && canScroll) {
             const prev = s.scrollTop;
             s.scrollTop = s.scrollHeight;
-            if (s.scrollTop !== prev || s.scrollHeight > s.clientHeight) return true;
+            return s.scrollTop !== prev || s.scrollHeight > s.clientHeight;
           }
-          const prev = d.scrollTop;
-          d.scrollTop = d.scrollHeight;
-          if (d.scrollTop !== prev || d.scrollHeight > d.clientHeight) return true;
         }
-        const scrollables = document.querySelectorAll('div[style*="overflow: auto"], div[style*="overflow: scroll"]');
         for (const s of scrollables) {
-          s.scrollTop = s.scrollHeight;
-          return true;
+          if (s.scrollHeight > s.clientHeight && s.clientHeight > 100) {
+            s.scrollTop = s.scrollHeight;
+            return true;
+          }
         }
-        return false;
+        const prev = dialog.scrollTop;
+        dialog.scrollTop = dialog.scrollHeight;
+        return dialog.scrollTop !== prev;
       });
 
-      if (!scrolled) break;
+      if (!scrolled) {
+        logger.log('[Scraper] No more scrollable content');
+        break;
+      }
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
+
+      await page.evaluate(() => {
+        const dialog = document.querySelector('[role="dialog"]');
+        if (dialog) {
+          const scrollables = dialog.querySelectorAll('div');
+          for (const s of scrollables) {
+            if (s.scrollHeight > s.clientHeight) {
+              s.scrollTop = s.scrollHeight;
+              break;
+            }
+          }
+        }
+      });
+      await delay(800 + Math.floor(Math.random() * 1200));
     }
 
     await updateScrapeJob(jobId, { status: 'completed', scraped_count: totalScraped });
