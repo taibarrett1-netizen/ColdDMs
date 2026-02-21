@@ -26,33 +26,6 @@ function randomDelay(minMs, maxMs) {
   return minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
 }
 
-/** Optional warm behaviour: scroll feed, like 1–2 posts. Called between DM batches. */
-async function warmBehaviour(page) {
-  try {
-    await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 15000 });
-    await delay(2000 + Math.floor(Math.random() * 3000));
-    await page.evaluate(() => {
-      window.scrollTo(0, 300 + Math.random() * 400);
-    });
-    await delay(10000 + Math.floor(Math.random() * 20000));
-    const liked = await page.evaluate(() => {
-      const likeBtns = Array.from(document.querySelectorAll('[aria-label="Like"], svg[aria-label="Like"]')).slice(0, 2);
-      for (const btn of likeBtns) {
-        const el = btn.closest('button') || btn.closest('[role="button"]') || btn;
-        if (el && el.offsetParent) {
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    });
-    if (liked) await delay(5000);
-    logger.log('[Warm] Light activity completed.');
-  } catch (e) {
-    logger.warn('[Warm] Warm behaviour skipped: ' + e.message);
-  }
-}
-
 async function humanDelay() {
   await delay(500 + Math.floor(Math.random() * 1500));
 }
@@ -576,7 +549,6 @@ async function runBot() {
   }
 
   let index = 0;
-  let sendsSinceWarm = 0;
   const runOne = async () => {
     const pause = await Promise.resolve(adapter.getControl());
     if (pause === '1' || pause === 1) {
@@ -609,14 +581,6 @@ async function runBot() {
         : {};
     const result = await sendDM(page, work.username, adapter, options);
     if (result.ok && !getNextWork) index += 1;
-
-    if (result.ok && useSessionCookies) {
-      sendsSinceWarm += 1;
-      if (sendsSinceWarm >= 3 + Math.floor(Math.random() * 3)) {
-        sendsSinceWarm = 0;
-        await warmBehaviour(page);
-      }
-    }
 
     const nextDelay = randomDelay(minDelayMs, maxDelayMs);
     logger.log(`Next send in ${Math.round(nextDelay / 60000)} minutes.`);

@@ -88,8 +88,25 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session expired. Reconnect scraper.' });
       return;
     }
-    await page.evaluate(() => window.scrollTo(0, 200));
-    await delay(2000 + Math.floor(Math.random() * 3000));
+    logger.log('[Scraper] Warming session before scrape...');
+    await delay(3000 + Math.floor(Math.random() * 5000));
+    for (let i = 0; i < 2 + Math.floor(Math.random() * 2); i++) {
+      await page.evaluate(() => window.scrollTo(0, 200 + Math.random() * 500));
+      await delay(8000 + Math.floor(Math.random() * 15000));
+    }
+    const liked = await page.evaluate(() => {
+      const likeBtns = Array.from(document.querySelectorAll('[aria-label="Like"], svg[aria-label="Like"]')).slice(0, 2);
+      for (const btn of likeBtns) {
+        const el = btn.closest('button') || btn.closest('[role="button"]') || btn;
+        if (el && el.offsetParent) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    if (liked) await delay(5000 + Math.floor(Math.random() * 10000));
+    logger.log('[Scraper] Warm behaviour done.');
 
     const source = `followers:${targetUsername}`;
     const cleanTarget = targetUsername.replace(/^@/, '').trim().toLowerCase();
@@ -187,7 +204,12 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         return [...new Set(usernames)];
       });
 
-      const newUsernames = batch.filter((u) => !seenUsernames.has(u) && !BLACKLIST.has(u));
+      let newUsernames = batch.filter(
+        (u) => !seenUsernames.has(u) && !BLACKLIST.has(u) && u !== cleanTarget
+      );
+      if (maxLeads && totalScraped + newUsernames.length > maxLeads) {
+        newUsernames = newUsernames.slice(0, maxLeads - totalScraped);
+      }
       for (const u of newUsernames) seenUsernames.add(u);
 
       if (newUsernames.length > 0) {
@@ -260,6 +282,16 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     await updateScrapeJob(jobId, { status: 'completed', scraped_count: totalScraped });
     logger.log(`[Scraper] Job ${jobId} completed. Scraped ${totalScraped} followers from @${cleanTarget}`);
+
+    try {
+      await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 10000 });
+      await delay(3000 + Math.floor(Math.random() * 5000));
+      await page.evaluate(() => window.scrollTo(0, 200));
+      await delay(5000 + Math.floor(Math.random() * 8000));
+      logger.log('[Scraper] Post-scrape warm done.');
+    } catch (e) {
+      logger.warn('[Scraper] Post-scrape warm skipped: ' + e.message);
+    }
   } catch (err) {
     logger.error('[Scraper] Follower scrape failed', err);
     try {
