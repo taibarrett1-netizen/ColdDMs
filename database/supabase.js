@@ -609,10 +609,26 @@ async function getNextPendingCampaignLead(clientId) {
 async function updateCampaignLeadStatus(campaignLeadId, status) {
   const sb = getSupabase();
   if (!sb || !campaignLeadId) throw new Error('Supabase or campaignLeadId missing');
+  const { data: row } = await sb
+    .from('cold_dm_campaign_leads')
+    .select('campaign_id')
+    .eq('id', campaignLeadId)
+    .maybeSingle();
   const payload = { status };
   if (status === 'sent' || status === 'failed') payload.sent_at = new Date().toISOString();
   const { error } = await sb.from('cold_dm_campaign_leads').update(payload).eq('id', campaignLeadId);
   if (error) throw error;
+
+  if (row && row.campaign_id && (status === 'sent' || status === 'failed')) {
+    const { count } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', row.campaign_id)
+      .eq('status', 'pending');
+    if (count === 0) {
+      await sb.from('cold_dm_campaigns').update({ status: 'completed', updated_at: new Date().toISOString() }).eq('id', row.campaign_id);
+    }
+  }
 }
 
 module.exports = {
