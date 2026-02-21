@@ -529,6 +529,31 @@ async function runBot() {
   }
 
   let page;
+  let currentSessionId = null;
+  const campaignRoundRobin = new Map();
+
+  async function ensurePageSession(page, session) {
+    const cookies = session?.session_data?.cookies;
+    if (!cookies?.length) return false;
+    if (currentSessionId === session.id) return true;
+    try {
+      const existing = await page.cookies();
+      if (existing.length) await page.deleteCookie(...existing);
+      await page.setCookie(...cookies);
+      await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+      await delay(2000);
+      if (page.url().includes('/accounts/login')) {
+        logger.error('Instagram session expired for account ' + (session.instagram_username || session.id));
+        return false;
+      }
+      currentSessionId = session.id;
+      return true;
+    } catch (e) {
+      logger.error('Failed to switch session: ' + e.message);
+      return false;
+    }
+  }
+
   try {
     page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
@@ -537,6 +562,7 @@ async function runBot() {
       const cookies = session?.session_data?.cookies;
       if (cookies && cookies.length) {
         await page.setCookie(...cookies);
+        if (session.id) currentSessionId = session.id;
       }
       await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
       await delay(2000);
@@ -590,6 +616,31 @@ async function runBot() {
             maxDelaySec: work.maxDelaySec,
           }
         : {};
+
+    if (work.type === 'campaign' && useSessionCookies && clientId) {
+      const sessions = await sb.getSessionsForCampaign(clientId, work.campaignId);
+      if (sessions.length === 0) {
+        logger.warn('No sessions for campaign ' + work.campaignId + ', skipping lead.');
+        await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed').catch(() => {});
+        setImmediate(runOne);
+        return;
+      }
+      let state = campaignRoundRobin.get(work.campaignId);
+      if (!state) {
+        state = { lastIndex: -1 };
+        campaignRoundRobin.set(work.campaignId, state);
+      }
+      state.lastIndex = (state.lastIndex + 1) % sessions.length;
+      const session = sessions[state.lastIndex];
+      const ok = await ensurePageSession(page, session);
+      if (!ok) {
+        logger.warn('Could not load session for campaign, failing lead.');
+        await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed').catch(() => {});
+        setImmediate(runOne);
+        return;
+      }
+    }
+
     const result = await sendDM(page, work.username, adapter, options);
     if (result.ok && !getNextWork) index += 1;
 

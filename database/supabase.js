@@ -89,11 +89,54 @@ async function getSession(clientId) {
   if (!sb || !clientId) return null;
   const { data, error } = await sb
     .from('cold_dm_instagram_sessions')
-    .select('session_data, instagram_username')
+    .select('id, session_data, instagram_username')
     .eq('client_id', clientId)
     .maybeSingle();
   if (error) throw error;
   return data;
+}
+
+/** All sessions for a client. Used when campaign has no assigned sessions. */
+async function getSessions(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return [];
+  const { data, error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .select('id, session_data, instagram_username')
+    .eq('client_id', clientId)
+    .order('id', { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
+/**
+ * Sessions to use for a campaign. If campaign has rows in cold_dm_campaign_instagram_sessions,
+ * returns only those sessions; otherwise returns all client sessions.
+ */
+async function getSessionsForCampaign(clientId, campaignId) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !campaignId) return [];
+  try {
+    const { data: assigned, error } = await sb
+      .from('cold_dm_campaign_instagram_sessions')
+      .select('instagram_session_id')
+      .eq('campaign_id', campaignId);
+    if (error || !assigned || assigned.length === 0) {
+      return getSessions(clientId);
+    }
+    const ids = assigned.map((r) => r.instagram_session_id).filter(Boolean);
+    if (ids.length === 0) return getSessions(clientId);
+    const { data: sessions, error: sessErr } = await sb
+      .from('cold_dm_instagram_sessions')
+      .select('id, session_data, instagram_username')
+      .eq('client_id', clientId)
+      .in('id', ids)
+      .order('id', { ascending: true });
+    if (sessErr || !sessions?.length) return getSessions(clientId);
+    return sessions;
+  } catch (e) {
+    return getSessions(clientId);
+  }
 }
 
 async function saveSession(clientId, sessionData, instagramUsername) {
@@ -583,6 +626,8 @@ module.exports = {
   getMessageTemplates,
   getLeads,
   getSession,
+  getSessions,
+  getSessionsForCampaign,
   saveSession,
   alreadySent,
   logSentMessage,
