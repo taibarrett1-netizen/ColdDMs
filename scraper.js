@@ -159,7 +159,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     const BLACKLIST = new Set([
       'explore', 'direct', 'accounts', 'reels', 'stories', 'p', 'tv', 'tags',
       'developer', 'about', 'blog', 'jobs', 'help', 'api', 'privacy', 'terms',
-    });
+    ]);
     let scrollCount = 0;
 
     while (true) {
