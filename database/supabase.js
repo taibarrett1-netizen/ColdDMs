@@ -128,7 +128,7 @@ async function alreadySent(clientId, username) {
   return !!data;
 }
 
-async function logSentMessage(clientId, username, message, status = 'success', campaignId = null) {
+async function logSentMessage(clientId, username, message, status = 'success', campaignId = null, messageGroupId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
   const u = normalizeUsername(username);
@@ -140,6 +140,7 @@ async function logSentMessage(clientId, username, message, status = 'success', c
     status,
   };
   if (campaignId) insertPayload.campaign_id = campaignId;
+  if (messageGroupId) insertPayload.message_group_id = messageGroupId;
   const { error: insertErr } = await sb.from('cold_dm_sent_messages').insert(insertPayload);
   if (insertErr) throw insertErr;
 
@@ -313,18 +314,20 @@ async function saveScraperSession(clientId, sessionData, instagramUsername) {
 }
 
 // --- Scrape jobs ---
-async function createScrapeJob(clientId, targetUsername) {
+async function createScrapeJob(clientId, targetUsername, leadGroupId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const payload = {
+    client_id: clientId,
+    target_username: targetUsername,
+    status: 'running',
+    scraped_count: 0,
+    started_at: new Date().toISOString(),
+  };
+  if (leadGroupId) payload.lead_group_id = leadGroupId;
   const { data, error } = await sb
     .from('cold_dm_scrape_jobs')
-    .insert({
-      client_id: clientId,
-      target_username: targetUsername,
-      status: 'running',
-      scraped_count: 0,
-      started_at: new Date().toISOString(),
-    })
+    .insert(payload)
     .select('id')
     .single();
   if (error) throw error;
@@ -410,19 +413,26 @@ async function upsertLead(clientId, username, source) {
   if (error) throw error;
 }
 
-async function upsertLeadsBatch(clientId, usernames, source) {
+async function upsertLeadsBatch(clientId, usernames, source, leadGroupId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
-  const rows = usernames.map((u) => ({
-    client_id: clientId,
-    username: normalizeUsername(u),
-    source: source || null,
-    added_at: new Date().toISOString(),
-  }));
+  const rows = usernames.map((u) => {
+    const row = {
+      client_id: clientId,
+      username: normalizeUsername(u),
+      source: source || null,
+      added_at: new Date().toISOString(),
+    };
+    if (leadGroupId) row.lead_group_id = leadGroupId;
+    return row;
+  });
   if (rows.length === 0) return 0;
   const { error } = await sb
     .from('cold_dm_leads')
-    .upsert(rows, { onConflict: 'client_id,username', ignoreDuplicates: true });
+    .upsert(rows, {
+      onConflict: 'client_id,username',
+      ignoreDuplicates: !leadGroupId,
+    });
   if (error) throw error;
   return rows.length;
 }
@@ -433,12 +443,36 @@ async function getActiveCampaigns(clientId) {
   if (!sb || !clientId) return [];
   const { data, error } = await sb
     .from('cold_dm_campaigns')
-    .select('id, name, message_template_id')
+    .select(
+      'id, name, message_template_id, message_group_id, schedule_start_time, schedule_end_time, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec'
+    )
     .eq('client_id', clientId)
     .eq('status', 'active')
     .order('created_at', { ascending: true });
   if (error) throw error;
   return data || [];
+}
+
+function isWithinSchedule(scheduleStart, scheduleEnd) {
+  if (!scheduleStart && !scheduleEnd) return true;
+  const now = new Date();
+  const current = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
+  const start = scheduleStart ? String(scheduleStart).slice(0, 8) : '00:00:00';
+  const end = scheduleEnd ? String(scheduleEnd).slice(0, 8) : '23:59:59';
+  if (start <= end) return current >= start && current <= end;
+  return current >= start || current <= end;
+}
+
+async function getRandomMessageFromGroup(messageGroupId) {
+  const sb = getSupabase();
+  if (!sb || !messageGroupId) return null;
+  const { data, error } = await sb
+    .from('cold_dm_message_group_messages')
+    .select('message_text')
+    .eq('message_group_id', messageGroupId)
+    .order('sort_order', { ascending: true });
+  if (error || !data || data.length === 0) return null;
+  return data[Math.floor(Math.random() * data.length)].message_text;
 }
 
 async function getMessageTemplateById(templateId) {
@@ -458,10 +492,45 @@ async function getNextPendingCampaignLead(clientId) {
   if (!sb || !clientId) return null;
   const campaigns = await getActiveCampaigns(clientId);
   for (const camp of campaigns) {
-    const templateText = camp.message_template_id
-      ? await getMessageTemplateById(camp.message_template_id)
-      : null;
-    if (!templateText) continue;
+    if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time)) continue;
+    let messageText = null;
+    if (camp.message_group_id) {
+      messageText = await getRandomMessageFromGroup(camp.message_group_id);
+    }
+    if (!messageText && camp.message_template_id) {
+      messageText = await getMessageTemplateById(camp.message_template_id);
+    }
+    if (!messageText) continue;
+
+    const { data: leadGroupRows } = await sb
+      .from('cold_dm_campaign_lead_groups')
+      .select('lead_group_id')
+      .eq('campaign_id', camp.id);
+    const leadGroupIds = (leadGroupRows || []).map((r) => r.lead_group_id).filter(Boolean);
+    if (leadGroupIds.length === 0) continue;
+
+    const { data: leadRows } = await sb
+      .from('cold_dm_leads')
+      .select('id, username')
+      .eq('client_id', clientId)
+      .in('lead_group_id', leadGroupIds);
+    if (!leadRows || leadRows.length === 0) continue;
+
+    for (const lead of leadRows) {
+      const { data: existing } = await sb
+        .from('cold_dm_campaign_leads')
+        .select('id')
+        .eq('campaign_id', camp.id)
+        .eq('lead_id', lead.id)
+        .maybeSingle();
+      if (!existing) {
+        await sb.from('cold_dm_campaign_leads').upsert(
+          { campaign_id: camp.id, lead_id: lead.id, status: 'pending' },
+          { onConflict: 'campaign_id,lead_id', ignoreDuplicates: true }
+        );
+      }
+    }
+
     const { data: clRow, error } = await sb
       .from('cold_dm_campaign_leads')
       .select('id, lead_id')
@@ -470,21 +539,25 @@ async function getNextPendingCampaignLead(clientId) {
       .order('id', { ascending: true })
       .limit(1)
       .maybeSingle();
-    if (error) throw error;
-    if (!clRow?.lead_id) continue;
-    const { data: leadRow, error: leadErr } = await sb
+    if (error || !clRow?.lead_id) continue;
+    const { data: leadRow } = await sb
       .from('cold_dm_leads')
       .select('username')
       .eq('id', clRow.lead_id)
       .eq('client_id', clientId)
       .maybeSingle();
-    if (leadErr || !leadRow?.username) continue;
+    if (!leadRow?.username) continue;
     return {
       campaignLeadId: clRow.id,
       campaignId: camp.id,
       leadId: clRow.lead_id,
       username: normalizeUsername(leadRow.username),
-      messageText: templateText,
+      messageText,
+      messageGroupId: camp.message_group_id || null,
+      dailySendLimit: camp.daily_send_limit,
+      hourlySendLimit: camp.hourly_send_limit,
+      minDelaySec: camp.min_delay_sec,
+      maxDelaySec: camp.max_delay_sec,
     };
   }
   return null;

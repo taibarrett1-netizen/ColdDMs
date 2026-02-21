@@ -330,7 +330,7 @@ async function sendDMOnce(page, u, msg) {
 }
 
 async function sendDM(page, username, adapter, options = {}) {
-  const { messageOverride, campaignId, campaignLeadId } = options;
+  const { messageOverride, campaignId, campaignLeadId, messageGroupId, dailySendLimit, hourlySendLimit } = options;
   const u = normalizeUsername(username);
   const sent = await Promise.resolve(adapter.alreadySent(u));
   if (sent) {
@@ -340,21 +340,21 @@ async function sendDM(page, username, adapter, options = {}) {
   }
 
   const stats = await Promise.resolve(adapter.getDailyStats());
-  const dailyLimit = adapter.dailyLimit ?? DAILY_LIMIT;
+  const dailyLimit = dailySendLimit ?? adapter.dailyLimit ?? DAILY_LIMIT;
   if (stats.total_sent >= dailyLimit) {
     logger.warn(`Daily limit reached (${dailyLimit}). Skipping.`);
     return { ok: false, reason: 'daily_limit' };
   }
 
   const hourlySent = await Promise.resolve(adapter.getHourlySent());
-  const maxPerHour = adapter.maxPerHour ?? MAX_PER_HOUR;
+  const maxPerHour = hourlySendLimit ?? adapter.maxPerHour ?? MAX_PER_HOUR;
   if (hourlySent >= maxPerHour) {
     logger.warn(`Hourly limit reached (${maxPerHour}). Skipping.`);
     return { ok: false, reason: 'hourly_limit' };
   }
 
   const msg = messageOverride || adapter.getRandomMessage();
-  const logSent = (status) => adapter.logSentMessage(u, msg, status, campaignId);
+  const logSent = (status) => adapter.logSentMessage(u, msg, status, campaignId, messageGroupId);
 
   let lastError;
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
@@ -434,7 +434,8 @@ async function runBot() {
       dailyLimit: Math.min(settings?.daily_send_limit ?? 100, 200),
       maxPerHour: settings?.max_sends_per_hour ?? 20,
       alreadySent: (u) => sb.alreadySent(clientId, u),
-      logSentMessage: (u, msg, status, campaignId) => sb.logSentMessage(clientId, u, msg, status, campaignId),
+      logSentMessage: (u, msg, status, campaignId, messageGroupId) =>
+        sb.logSentMessage(clientId, u, msg, status, campaignId, messageGroupId),
       getDailyStats: () => sb.getDailyStats(clientId),
       getHourlySent: () => sb.getHourlySent(clientId),
       getControl: () => sb.getControl(clientId),
@@ -450,6 +451,11 @@ async function runBot() {
           messageOverride: campaign.messageText,
           campaignId: campaign.campaignId,
           campaignLeadId: campaign.campaignLeadId,
+          messageGroupId: campaign.messageGroupId,
+          dailySendLimit: campaign.dailySendLimit,
+          hourlySendLimit: campaign.hourlySendLimit,
+          minDelaySec: campaign.minDelaySec,
+          maxDelaySec: campaign.maxDelaySec,
         };
       }
       const sentSet = await sb.getSentUsernames(clientId);
@@ -577,14 +583,22 @@ async function runBot() {
             messageOverride: work.messageOverride,
             campaignId: work.campaignId,
             campaignLeadId: work.campaignLeadId,
+            messageGroupId: work.messageGroupId,
+            dailySendLimit: work.dailySendLimit,
+            hourlySendLimit: work.hourlySendLimit,
+            minDelaySec: work.minDelaySec,
+            maxDelaySec: work.maxDelaySec,
           }
         : {};
     const result = await sendDM(page, work.username, adapter, options);
     if (result.ok && !getNextWork) index += 1;
 
-    const nextDelay = randomDelay(minDelayMs, maxDelayMs);
-    logger.log(`Next send in ${Math.round(nextDelay / 60000)} minutes.`);
-    await delay(nextDelay);
+    const delayMs =
+      work.type === 'campaign' && work.minDelaySec != null && work.maxDelaySec != null
+        ? randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000)
+        : randomDelay(minDelayMs, maxDelayMs);
+    logger.log(`Next send in ${Math.round(delayMs / 60000)} minutes.`);
+    await delay(delayMs);
     setImmediate(runOne);
   };
 

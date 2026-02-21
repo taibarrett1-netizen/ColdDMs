@@ -60,6 +60,7 @@ async function connectScraper(instagramUsername, instagramPassword) {
  */
 async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) {
   const maxLeads = options.maxLeads != null ? Math.max(1, parseInt(options.maxLeads, 10) || 0) : null;
+  const leadGroupId = options.leadGroupId || null;
   const sb = require('./database/supabase').getSupabase();
   if (!sb || !clientId || !jobId) {
     logger.error('[Scraper] Missing clientId or jobId');
@@ -213,7 +214,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       for (const u of newUsernames) seenUsernames.add(u);
 
       if (newUsernames.length > 0) {
-        await upsertLeadsBatch(clientId, newUsernames, source);
+        await upsertLeadsBatch(clientId, newUsernames, source, leadGroupId);
         totalScraped = seenUsernames.size;
         await updateScrapeJob(jobId, { scraped_count: totalScraped });
         noNewCount = 0;
