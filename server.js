@@ -249,7 +249,8 @@ app.post('/api/instagram/connect', async (req, res) => {
 // --- API: bot control (PM2 start/stop) ---
 app.post('/api/control/start', (req, res) => {
   const clientId = req.body?.clientId;
-  if (isSupabaseConfigured() && clientId) {
+  if (isSupabaseConfigured()) {
+    if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
     setClientId(clientId);
     setControlSupabase(clientId, 0).catch((e) => console.error('[API] setControlSupabase', e));
   } else {
@@ -409,7 +410,8 @@ app.post('/api/scraper/stop', async (req, res) => {
 
 app.post('/api/control/stop', (req, res) => {
   const clientId = req.body?.clientId;
-  if (isSupabaseConfigured() && clientId) {
+  if (isSupabaseConfigured()) {
+    if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
     setControlSupabase(clientId, 1).catch((e) => console.error('[API] setControlSupabase', e));
   } else {
     setControl('pause', '1');

@@ -584,7 +584,8 @@ async function runBot() {
   const runOne = async () => {
     const pause = await Promise.resolve(adapter.getControl());
     if (pause === '1' || pause === 1) {
-      logger.log('Bot paused via control flag.');
+      logger.log('Bot paused via control flag. Rechecking in 30s.');
+      setTimeout(runOne, 30000);
       return;
     }
     let work;
