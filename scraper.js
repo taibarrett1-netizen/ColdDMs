@@ -476,24 +476,30 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
 
-      const postAuthor = await page.evaluate(function () {
+      const scraperUsername = (session?.instagram_username || '').trim().replace(/^@/, '').toLowerCase();
+
+      const candidateAuthors = await page.evaluate(function () {
         const blacklist = ['explore', 'direct', 'accounts', 'reels', 'stories', 'p', 'tv', 'tags'];
+        const out = [];
         const anchors = document.querySelectorAll('a[href^="/"]');
-        for (let i = 0; i < Math.min(anchors.length, 15); i++) {
+        for (let i = 0; i < Math.min(anchors.length, 20); i++) {
           const href = (anchors[i].getAttribute('href') || '').trim();
           const m = href.match(/^\/([^/?#]+)\/?$/);
           if (!m) continue;
           const u = m[1].toLowerCase();
           if (u && u.length >= 2 && u.length <= 30 && /^[a-z0-9._]+$/.test(u) && blacklist.indexOf(u) === -1) {
-            return u;
+            out.push(u);
           }
         }
-        return null;
+        return out;
       });
+
+      const postAuthor = candidateAuthors.find((u) => u !== scraperUsername) || null;
 
       if (postAuthor) {
         await updateScrapeJob(jobId, { target_username: postAuthor });
         logger.log('[Scraper] Post author: @' + postAuthor);
+        seenUsernames.add(postAuthor);
       }
 
       const source = postAuthor ? 'comments:' + postAuthor : (shortcode ? 'comments:' + shortcode : 'comments:' + postUrl);
