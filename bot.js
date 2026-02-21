@@ -219,11 +219,27 @@ async function sendDMOnce(page, u, msg) {
   await delay(1500);
 
   const openedThread = await page.evaluate(() => {
-    const labels = ['Message', 'Send message', 'Next', 'Chat', 'next', 'message'];
+    const targets = ['button', 'div[role="button"]', 'a', 'span[role="button"]'];
+    const candidates = [];
+    for (const sel of targets) {
+      document.querySelectorAll(sel).forEach((el) => {
+        if (el.offsetParent !== null && el.offsetWidth > 0 && el.offsetHeight > 0) candidates.push(el);
+      });
+    }
+    const needle = (t) => t.toLowerCase().replace(/\s+/g, ' ').trim();
+    const labels = ['send message', 'message', 'next', 'chat', 'send a message', 'start a chat'];
     for (const label of labels) {
-      const btn = Array.from(document.querySelectorAll('button, div[role="button"], a')).find(
-        (el) => el.textContent.trim() === label && el.offsetParent !== null
-      );
+      const btn = candidates.find((el) => {
+        const t = needle(el.textContent || '');
+        return t === label || (t.includes('send') && t.includes('message')) || (t === 'next') || (t === 'chat');
+      });
+      if (btn) {
+        btn.click();
+        return true;
+      }
+    }
+    for (const label of labels) {
+      const btn = candidates.find((el) => needle(el.textContent || '').includes(label));
       if (btn) {
         btn.click();
         return true;
@@ -231,18 +247,33 @@ async function sendDMOnce(page, u, msg) {
     }
     return false;
   });
-  if (openedThread) await delay(2000);
+  if (openedThread) await delay(2500);
   await delay(2000);
 
   try {
-    await page.waitForFunction(() => window.location.href.includes('/direct/'), { timeout: 3000 });
-  } catch (e) {}
-  await delay(1500);
+    await page.waitForFunction(
+      () => !window.location.pathname.includes('/direct/new') && window.location.pathname.includes('/direct/'),
+      { timeout: 8000 }
+    );
+  } catch (e) {
+    if (page.url().includes('/direct/new')) {
+      await page.evaluate(() => {
+        const clickables = Array.from(document.querySelectorAll('button, div[role="button"], a'));
+        const nextOrChat = clickables.find((el) => {
+          const t = (el.textContent || '').toLowerCase().trim();
+          return t === 'next' || t === 'chat' || (t.includes('send') && t.includes('message'));
+        });
+        if (nextOrChat && nextOrChat.offsetParent) nextOrChat.click();
+      });
+      await delay(3000);
+    }
+  }
+  await delay(2000);
 
   const composeDiagnostic = () =>
     page.evaluate(() => {
       const textareas = document.querySelectorAll('textarea');
-      const editables = document.querySelectorAll('div[contenteditable="true"]');
+      const editables = document.querySelectorAll('div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"]');
       const roleBoxes = document.querySelectorAll('[role="textbox"]');
       const visible = (el) => el.offsetParent !== null;
       return {
@@ -257,11 +288,11 @@ async function sendDMOnce(page, u, msg) {
       };
     });
 
-  const composeSelector = 'textarea, div[contenteditable="true"], [role="textbox"]';
+  const composeSelector = 'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]';
   logger.log('Waiting for compose area...');
   let composeFound = false;
   try {
-    await page.waitForSelector(composeSelector, { timeout: 15000 });
+    await page.waitForSelector(composeSelector, { timeout: 20000 });
     composeFound = true;
   } catch (e) {
     const diag = await composeDiagnostic().catch(() => ({}));
@@ -280,7 +311,7 @@ async function sendDMOnce(page, u, msg) {
         const t = (p + ' ' + a).toLowerCase();
         return t.includes('message') || t.includes('add a message') || t.includes('write a message');
       };
-      const all = document.querySelectorAll('textarea, div[contenteditable="true"], [role="textbox"]');
+      const all = document.querySelectorAll('textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]');
       for (const el of all) {
         if (el.offsetParent === null) continue;
         if (byPlaceholder(el)) return el;
@@ -307,7 +338,7 @@ async function sendDMOnce(page, u, msg) {
   }
 
   const keyboardSent = await page.evaluate((text) => {
-    const focusable = document.querySelector('textarea, [contenteditable="true"], [role="textbox"]');
+    const focusable = document.querySelector('textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]');
     if (!focusable || focusable.offsetParent === null) return false;
     focusable.focus();
     focusable.click();
