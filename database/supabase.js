@@ -451,7 +451,8 @@ async function getConversationParticipantUsernames(clientId) {
     if (error) return new Set();
     const set = new Set();
     for (const row of data || []) {
-      const u = normalizeUsername(row.participant_username || '');
+      const raw = (row.participant_username || '').trim().replace(/^@/, '');
+      const u = raw.toLowerCase();
       if (u) set.add(u);
     }
     return set;

@@ -472,11 +472,31 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       }
 
       const shortcode = getShortcodeFromPostUrl(postUrl);
-      const source = shortcode ? 'comments:' + shortcode : 'comments:' + postUrl;
-
       const normalizedUrl = postUrl.includes('instagram.com') ? postUrl : 'https://www.instagram.com/p/' + postUrl + '/';
       await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
+
+      const postAuthor = await page.evaluate(function () {
+        const blacklist = ['explore', 'direct', 'accounts', 'reels', 'stories', 'p', 'tv', 'tags'];
+        const anchors = document.querySelectorAll('a[href^="/"]');
+        for (let i = 0; i < Math.min(anchors.length, 15); i++) {
+          const href = (anchors[i].getAttribute('href') || '').trim();
+          const m = href.match(/^\/([^/?#]+)\/?$/);
+          if (!m) continue;
+          const u = m[1].toLowerCase();
+          if (u && u.length >= 2 && u.length <= 30 && /^[a-z0-9._]+$/.test(u) && blacklist.indexOf(u) === -1) {
+            return u;
+          }
+        }
+        return null;
+      });
+
+      if (postAuthor) {
+        await updateScrapeJob(jobId, { target_username: postAuthor });
+        logger.log('[Scraper] Post author: @' + postAuthor);
+      }
+
+      const source = postAuthor ? 'comments:' + postAuthor : (shortcode ? 'comments:' + shortcode : 'comments:' + postUrl);
 
       let noNewCount = 0;
       let scrollCount = 0;
@@ -496,7 +516,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         });
 
         let newUsernames = usernames.filter(
-          (u) => !seenUsernames.has(u) && !BLACKLIST.has(u) && !inConvos.has(u)
+          (u) => !seenUsernames.has(u) && !BLACKLIST.has(u) && !inConvos.has(u) && (!postAuthor || u !== postAuthor)
         );
         newUsernames = [...new Set(newUsernames)];
         if (maxLeads && totalScraped + newUsernames.length > maxLeads) {

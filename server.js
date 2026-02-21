@@ -374,8 +374,13 @@ app.post('/api/scraper/start', async (req, res) => {
   if (scrapeType === 'followers' && !target_username) {
     return res.status(400).json({ ok: false, error: 'target_username is required for follower scrape' });
   }
-  if (scrapeType === 'comments' && (!post_urls || !Array.isArray(post_urls) || post_urls.length === 0)) {
-    return res.status(400).json({ ok: false, error: 'post_urls (array of Instagram post URLs) is required for comment scrape' });
+  if (scrapeType === 'comments') {
+    if (!post_urls || !Array.isArray(post_urls) || post_urls.length === 0) {
+      return res.status(400).json({ ok: false, error: 'post_urls (array of Instagram post URLs) is required for comment scrape' });
+    }
+    if (post_urls.some((u) => typeof u !== 'string')) {
+      return res.status(400).json({ ok: false, error: 'post_urls must be an array of strings' });
+    }
   }
   if (!isSupabaseConfigured()) {
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
@@ -386,7 +391,7 @@ app.post('/api/scraper/start', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Scraper not connected' });
     }
 
-    const targetForJob = scrapeType === 'followers' ? target_username.trim().replace(/^@/, '') : 'comments';
+    const targetForJob = scrapeType === 'followers' ? target_username.trim().replace(/^@/, '') : '_comment_scrape';
     const jobId = await createScrapeJob(
       clientId,
       targetForJob,
