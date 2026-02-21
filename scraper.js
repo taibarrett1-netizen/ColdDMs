@@ -11,6 +11,7 @@ const {
   getScraperSession,
   saveScraperSession,
   createScrapeJob,
+  updateScrapeJob,
   getScrapeJob,
   upsertLeadsBatch,
 } = require('./database/supabase');
@@ -265,10 +266,14 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           if (debugData && debugData.included.length < 20) debugData.included.push(u);
         }
 
-        if (debugData) {
-          return { usernames: usernames, debug: debugData };
+        const deduped = [];
+        for (var di = 0; di < usernames.length; di++) {
+          if (deduped.indexOf(usernames[di]) === -1) deduped.push(usernames[di]);
         }
-        return { usernames: usernames };
+        if (debugData) {
+          return { usernames: deduped, debug: debugData };
+        }
+        return { usernames: deduped };
       }, SCRAPER_DEBUG);
 
       const batch = Array.isArray(batchResult) ? batchResult : batchResult.usernames;
@@ -296,6 +301,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       let newUsernames = batch.filter(
         (u) => !seenUsernames.has(u) && !BLACKLIST.has(u) && u !== cleanTarget
       );
+      newUsernames = [...new Set(newUsernames)];
       if (effectiveMax && totalScraped + newUsernames.length > effectiveMax) {
         newUsernames = newUsernames.slice(0, effectiveMax - totalScraped);
       }
@@ -384,9 +390,10 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
   } catch (err) {
     logger.error('[Scraper] Follower scrape failed', err);
     try {
-      await updateScrapeJob(jobId, {
+      const { updateScrapeJob: updateJob } = require('./database/supabase');
+      await updateJob(jobId, {
         status: 'failed',
-        error_message: err.message || String(err),
+        error_message: (err && err.message) || String(err),
       });
     } catch (e) {
       logger.error('[Scraper] Failed to update job status', e);
