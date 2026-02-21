@@ -364,7 +364,7 @@ app.post('/api/scraper/status', async (req, res) => {
 });
 
 app.post('/api/scraper/start', async (req, res) => {
-  const { clientId, target_username } = req.body || {};
+  const { clientId, target_username, max_leads } = req.body || {};
   if (!clientId || !target_username) {
     return res.status(400).json({ ok: false, error: 'clientId and target_username are required' });
   }
@@ -377,7 +377,9 @@ app.post('/api/scraper/start', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Scraper not connected' });
     }
     const jobId = await createScrapeJob(clientId, target_username.trim().replace(/^@/, ''));
-    runFollowerScrape(clientId, jobId, target_username).catch((err) => {
+    const scrapeOptions = {};
+    if (max_leads != null && max_leads > 0) scrapeOptions.maxLeads = max_leads;
+    runFollowerScrape(clientId, jobId, target_username, scrapeOptions).catch((err) => {
       console.error('[API] Scraper background job error', err);
     });
     res.json({ ok: true, jobId });

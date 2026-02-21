@@ -1,0 +1,9 @@
+
+Logs
+pm2 logs ig-dm-bot --lines 50
+Stream logs in real time:
+pm2 logs ig-dm-bot
+For both dashboard and bot:
+pm2 logs --lines 50
+
+cd ~/ColdDMs && git pull origin main && npm install && pm2 restart ig-dm-bot ig-dm-dashboard

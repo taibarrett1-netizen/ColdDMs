@@ -56,8 +56,10 @@ async function connectScraper(instagramUsername, instagramPassword) {
 /**
  * Run follower scrape in the background. Call from API without awaiting.
  * Loads scraper session, navigates to profile, paginates followers, upserts leads.
+ * @param {number} [options.maxLeads] - Optional. Stop when this many NEW leads have been added. Omit for no limit.
  */
-async function runFollowerScrape(clientId, jobId, targetUsername) {
+async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) {
+  const maxLeads = options.maxLeads != null ? Math.max(1, parseInt(options.maxLeads, 10) || 0) : null;
   const sb = require('./database/supabase').getSupabase();
   if (!sb || !clientId || !jobId) {
     logger.error('[Scraper] Missing clientId or jobId');
@@ -179,6 +181,10 @@ async function runFollowerScrape(clientId, jobId, targetUsername) {
         totalScraped = seenUsernames.size;
         await updateScrapeJob(jobId, { scraped_count: totalScraped });
         noNewCount = 0;
+        if (maxLeads && totalScraped >= maxLeads) {
+          logger.log(`[Scraper] Reached max_leads (${maxLeads}). Stopping.`);
+          break;
+        }
       } else {
         noNewCount++;
         if (noNewCount >= MAX_NO_NEW) break;
