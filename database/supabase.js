@@ -128,17 +128,19 @@ async function alreadySent(clientId, username) {
   return !!data;
 }
 
-async function logSentMessage(clientId, username, message, status = 'success') {
+async function logSentMessage(clientId, username, message, status = 'success', campaignId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
   const u = normalizeUsername(username);
   const date = getToday();
-  const { error: insertErr } = await sb.from('cold_dm_sent_messages').insert({
+  const insertPayload = {
     client_id: clientId,
     username: u,
     message: message || null,
     status,
-  });
+  };
+  if (campaignId) insertPayload.campaign_id = campaignId;
+  const { error: insertErr } = await sb.from('cold_dm_sent_messages').insert(insertPayload);
   if (insertErr) throw insertErr;
 
   const { data: existing } = await sb
@@ -280,6 +282,223 @@ async function updateSettingsInstagramUsername(clientId, instagramUsername) {
   await sb.from('cold_dm_settings').update({ instagram_username: instagramUsername, updated_at: new Date().toISOString() }).eq('client_id', clientId);
 }
 
+// --- Scraper session ---
+async function getScraperSession(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return null;
+  const { data, error } = await sb
+    .from('cold_dm_scraper_sessions')
+    .select('session_data, instagram_username')
+    .eq('client_id', clientId)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function saveScraperSession(clientId, sessionData, instagramUsername) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const { error } = await sb
+    .from('cold_dm_scraper_sessions')
+    .upsert(
+      {
+        client_id: clientId,
+        session_data: sessionData,
+        instagram_username: instagramUsername || null,
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'client_id' }
+    );
+  if (error) throw error;
+}
+
+// --- Scrape jobs ---
+async function createScrapeJob(clientId, targetUsername) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const { data, error } = await sb
+    .from('cold_dm_scrape_jobs')
+    .insert({
+      client_id: clientId,
+      target_username: targetUsername,
+      status: 'running',
+      scraped_count: 0,
+      started_at: new Date().toISOString(),
+    })
+    .select('id')
+    .single();
+  if (error) throw error;
+  return data?.id;
+}
+
+async function updateScrapeJob(jobId, updates) {
+  const sb = getSupabase();
+  if (!sb || !jobId) throw new Error('Supabase or jobId missing');
+  const payload = { ...updates };
+  if (payload.status === 'completed' || payload.status === 'failed' || payload.status === 'cancelled') {
+    payload.finished_at = new Date().toISOString();
+  }
+  const { error } = await sb.from('cold_dm_scrape_jobs').update(payload).eq('id', jobId);
+  if (error) throw error;
+}
+
+async function getScrapeJob(jobId) {
+  const sb = getSupabase();
+  if (!sb || !jobId) return null;
+  const { data, error } = await sb.from('cold_dm_scrape_jobs').select('*').eq('id', jobId).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function getLatestScrapeJob(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return null;
+  const { data, error } = await sb
+    .from('cold_dm_scrape_jobs')
+    .select('id, target_username, status, scraped_count')
+    .eq('client_id', clientId)
+    .order('started_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function cancelScrapeJob(clientId, jobId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  if (jobId) {
+    const { error } = await sb.from('cold_dm_scrape_jobs').update({ status: 'cancelled', finished_at: new Date().toISOString() }).eq('id', jobId).eq('client_id', clientId);
+    if (error) throw error;
+    return true;
+  }
+  const { data: running } = await sb
+    .from('cold_dm_scrape_jobs')
+    .select('id')
+    .eq('client_id', clientId)
+    .eq('status', 'running')
+    .order('started_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (running?.id) {
+    const { error } = await sb
+      .from('cold_dm_scrape_jobs')
+      .update({ status: 'cancelled', finished_at: new Date().toISOString() })
+      .eq('id', running.id);
+    if (error) throw error;
+    return true;
+  }
+  return false;
+}
+
+// --- Leads upsert (for scraper) ---
+async function upsertLead(clientId, username, source) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const u = normalizeUsername(username);
+  const { error } = await sb
+    .from('cold_dm_leads')
+    .upsert(
+      {
+        client_id: clientId,
+        username: u,
+        source: source || null,
+        added_at: new Date().toISOString(),
+      },
+      { onConflict: 'client_id,username', ignoreDuplicates: true }
+    );
+  if (error) throw error;
+}
+
+async function upsertLeadsBatch(clientId, usernames, source) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const rows = usernames.map((u) => ({
+    client_id: clientId,
+    username: normalizeUsername(u),
+    source: source || null,
+    added_at: new Date().toISOString(),
+  }));
+  if (rows.length === 0) return 0;
+  const { error } = await sb
+    .from('cold_dm_leads')
+    .upsert(rows, { onConflict: 'client_id,username', ignoreDuplicates: true });
+  if (error) throw error;
+  return rows.length;
+}
+
+// --- Campaigns ---
+async function getActiveCampaigns(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return [];
+  const { data, error } = await sb
+    .from('cold_dm_campaigns')
+    .select('id, name, message_template_id')
+    .eq('client_id', clientId)
+    .eq('status', 'active')
+    .order('created_at', { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
+async function getMessageTemplateById(templateId) {
+  const sb = getSupabase();
+  if (!sb || !templateId) return null;
+  const { data, error } = await sb
+    .from('cold_dm_message_templates')
+    .select('message_text')
+    .eq('id', templateId)
+    .maybeSingle();
+  if (error) throw error;
+  return data?.message_text || null;
+}
+
+async function getNextPendingCampaignLead(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return null;
+  const campaigns = await getActiveCampaigns(clientId);
+  for (const camp of campaigns) {
+    const templateText = camp.message_template_id
+      ? await getMessageTemplateById(camp.message_template_id)
+      : null;
+    if (!templateText) continue;
+    const { data: clRow, error } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('id, lead_id')
+      .eq('campaign_id', camp.id)
+      .eq('status', 'pending')
+      .order('id', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (error) throw error;
+    if (!clRow?.lead_id) continue;
+    const { data: leadRow, error: leadErr } = await sb
+      .from('cold_dm_leads')
+      .select('username')
+      .eq('id', clRow.lead_id)
+      .eq('client_id', clientId)
+      .maybeSingle();
+    if (leadErr || !leadRow?.username) continue;
+    return {
+      campaignLeadId: clRow.id,
+      campaignId: camp.id,
+      leadId: clRow.lead_id,
+      username: normalizeUsername(leadRow.username),
+      messageText: templateText,
+    };
+  }
+  return null;
+}
+
+async function updateCampaignLeadStatus(campaignLeadId, status) {
+  const sb = getSupabase();
+  if (!sb || !campaignLeadId) throw new Error('Supabase or campaignLeadId missing');
+  const payload = { status };
+  if (status === 'sent' || status === 'failed') payload.sent_at = new Date().toISOString();
+  const { error } = await sb.from('cold_dm_campaign_leads').update(payload).eq('id', campaignLeadId);
+  if (error) throw error;
+}
+
 module.exports = {
   getSupabase,
   isSupabaseConfigured,
@@ -302,4 +521,17 @@ module.exports = {
   getSentUsernames,
   clearFailedAttempts,
   updateSettingsInstagramUsername,
+  getScraperSession,
+  saveScraperSession,
+  createScrapeJob,
+  updateScrapeJob,
+  getScrapeJob,
+  getLatestScrapeJob,
+  cancelScrapeJob,
+  upsertLead,
+  upsertLeadsBatch,
+  getActiveCampaigns,
+  getMessageTemplateById,
+  getNextPendingCampaignLead,
+  updateCampaignLeadStatus,
 };

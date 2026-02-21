@@ -26,6 +26,33 @@ function randomDelay(minMs, maxMs) {
   return minMs + Math.floor(Math.random() * (maxMs - minMs + 1));
 }
 
+/** Optional warm behaviour: scroll feed, like 1–2 posts. Called between DM batches. */
+async function warmBehaviour(page) {
+  try {
+    await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 15000 });
+    await delay(2000 + Math.floor(Math.random() * 3000));
+    await page.evaluate(() => {
+      window.scrollTo(0, 300 + Math.random() * 400);
+    });
+    await delay(10000 + Math.floor(Math.random() * 20000));
+    const liked = await page.evaluate(() => {
+      const likeBtns = Array.from(document.querySelectorAll('[aria-label="Like"], svg[aria-label="Like"]')).slice(0, 2);
+      for (const btn of likeBtns) {
+        const el = btn.closest('button') || btn.closest('[role="button"]') || btn;
+        if (el && el.offsetParent) {
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    });
+    if (liked) await delay(5000);
+    logger.log('[Warm] Light activity completed.');
+  } catch (e) {
+    logger.warn('[Warm] Warm behaviour skipped: ' + e.message);
+  }
+}
+
 async function humanDelay() {
   await delay(500 + Math.floor(Math.random() * 1500));
 }
@@ -298,11 +325,13 @@ async function sendDMOnce(page, u, msg) {
   return { ok: false, reason: 'no_compose' };
 }
 
-async function sendDM(page, username, adapter) {
+async function sendDM(page, username, adapter, options = {}) {
+  const { messageOverride, campaignId, campaignLeadId } = options;
   const u = normalizeUsername(username);
   const sent = await Promise.resolve(adapter.alreadySent(u));
   if (sent) {
     logger.warn(`Already sent to @${u}, skipping.`);
+    if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed').catch(() => {});
     return { ok: false, reason: 'already_sent' };
   }
 
@@ -320,18 +349,22 @@ async function sendDM(page, username, adapter) {
     return { ok: false, reason: 'hourly_limit' };
   }
 
-  const msg = adapter.getRandomMessage();
+  const msg = messageOverride || adapter.getRandomMessage();
+  const logSent = (status) => adapter.logSentMessage(u, msg, status, campaignId);
+
   let lastError;
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
       const result = await sendDMOnce(page, u, msg);
       if (result.ok) {
-        await Promise.resolve(adapter.logSentMessage(u, msg, 'success'));
+        await Promise.resolve(logSent('success'));
+        if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent').catch(() => {});
         logger.log(`Sent to @${u}: ${msg.slice(0, 30)}...`);
         return { ok: true };
       }
       if (result.reason === 'user_not_found' || result.reason === 'no_compose') {
-        await Promise.resolve(adapter.logSentMessage(u, msg, 'failed'));
+        await Promise.resolve(logSent('failed'));
+        if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed').catch(() => {});
         logger.warn(`Send failed for @${u}: ${result.reason}`);
         return result;
       }
@@ -343,7 +376,8 @@ async function sendDM(page, username, adapter) {
     }
   }
   logger.error(`Error sending to @${u} after ${MAX_SEND_RETRIES} retries`, lastError);
-  await Promise.resolve(adapter.logSentMessage(u, msg, 'failed'));
+  await Promise.resolve(logSent('failed'));
+  if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed').catch(() => {});
   return { ok: false, reason: lastError.message };
 }
 
@@ -375,6 +409,7 @@ async function runBot() {
 
   let leads;
   let adapter;
+  let getNextWork = null;
   let minDelayMs = MIN_DELAY_MS;
   let maxDelayMs = MAX_DELAY_MS;
 
@@ -395,12 +430,28 @@ async function runBot() {
       dailyLimit: Math.min(settings?.daily_send_limit ?? 100, 200),
       maxPerHour: settings?.max_sends_per_hour ?? 20,
       alreadySent: (u) => sb.alreadySent(clientId, u),
-      logSentMessage: (u, msg, status) => sb.logSentMessage(clientId, u, msg, status),
+      logSentMessage: (u, msg, status, campaignId) => sb.logSentMessage(clientId, u, msg, status, campaignId),
       getDailyStats: () => sb.getDailyStats(clientId),
       getHourlySent: () => sb.getHourlySent(clientId),
       getControl: () => sb.getControl(clientId),
       setControl: (v) => sb.setControl(clientId, v),
       getRandomMessage: () => messages[Math.floor(Math.random() * messages.length)],
+    };
+    getNextWork = async () => {
+      const campaign = await sb.getNextPendingCampaignLead(clientId);
+      if (campaign) {
+        return {
+          type: 'campaign',
+          username: campaign.username,
+          messageOverride: campaign.messageText,
+          campaignId: campaign.campaignId,
+          campaignLeadId: campaign.campaignLeadId,
+        };
+      }
+      const sentSet = await sb.getSentUsernames(clientId);
+      const pending = leads.filter((u) => !sentSet.has(sb.normalizeUsername(u)));
+      if (pending.length) return { type: 'lead', username: pending[0] };
+      return null;
     };
     const filtered = [];
     for (const u of leads) {
@@ -421,7 +472,7 @@ async function runBot() {
       dailyLimit: DAILY_LIMIT,
       maxPerHour: MAX_PER_HOUR,
       alreadySent: (u) => alreadySent(u),
-      logSentMessage: (u, msg, status) => logSentMessage(u, msg, status),
+      logSentMessage: (u, msg, status, _campaignId) => logSentMessage(u, msg, status),
       getDailyStats: () => getDailyStats(),
       getHourlySent: () => getHourlySent(),
       getControl: () => getControl('pause'),
@@ -430,11 +481,18 @@ async function runBot() {
     };
   }
 
-  logger.log(`Loaded ${leads.length} leads to process.`);
-  if (leads.length === 0) {
+  if (useSupabase && clientId) {
+    const work = await getNextWork();
+    if (!work) {
+      logger.log('No campaign leads or leads to send. Done.');
+      return;
+    }
+  } else if (leads.length === 0) {
     logger.log('No leads to send. Done.');
     return;
   }
+
+  logger.log(`Starting sender loop${useSupabase && clientId ? ' (campaign-aware)' : ''}.`);
 
   const launchOpts = {
     headless: HEADLESS,
@@ -487,21 +545,47 @@ async function runBot() {
   }
 
   let index = 0;
+  let sendsSinceWarm = 0;
   const runOne = async () => {
     const pause = await Promise.resolve(adapter.getControl());
     if (pause === '1' || pause === 1) {
       logger.log('Bot paused via control flag.');
       return;
     }
-    if (index >= leads.length) {
-      logger.log('All leads processed.');
-      await browser.close();
-      process.exit(0);
+    let work;
+    if (getNextWork) {
+      work = await getNextWork();
+      if (!work) {
+        logger.log('All campaign leads and leads processed.');
+        await browser.close();
+        process.exit(0);
+      }
+    } else {
+      if (index >= leads.length) {
+        logger.log('All leads processed.');
+        await browser.close();
+        process.exit(0);
+      }
+      work = { type: 'lead', username: leads[index] };
     }
+    const options =
+      work.type === 'campaign'
+        ? {
+            messageOverride: work.messageOverride,
+            campaignId: work.campaignId,
+            campaignLeadId: work.campaignLeadId,
+          }
+        : {};
+    const result = await sendDM(page, work.username, adapter, options);
+    if (result.ok && !getNextWork) index += 1;
 
-    const username = leads[index];
-    const result = await sendDM(page, username, adapter);
-    if (result.ok) index += 1;
+    if (result.ok && useSessionCookies) {
+      sendsSinceWarm += 1;
+      if (sendsSinceWarm >= 3 + Math.floor(Math.random() * 3)) {
+        sendsSinceWarm = 0;
+        await warmBehaviour(page);
+      }
+    }
 
     const nextDelay = randomDelay(minDelayMs, maxDelayMs);
     logger.log(`Next send in ${Math.round(nextDelay / 60000)} minutes.`);

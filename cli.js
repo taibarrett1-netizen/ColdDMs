@@ -51,8 +51,9 @@ async function main() {
   }
 
   if (command === '--start' || !command) {
-    if (!fs.existsSync(csvPath)) {
-      logger.error(`Leads file not found: ${csvPath}. Create leads.csv or set LEADS_CSV in .env`);
+    const { isSupabaseConfigured } = require('./database/supabase');
+    if (!isSupabaseConfigured() && !fs.existsSync(csvPath)) {
+      logger.error(`Leads file not found: ${csvPath}. Create leads.csv or set LEADS_CSV in .env (or use Supabase)`);
       process.exit(1);
     }
     const { runBot } = require('./bot');

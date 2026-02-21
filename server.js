@@ -16,8 +16,14 @@ const {
   getLeads: getLeadsSupabase,
   saveSession,
   updateSettingsInstagramUsername,
+  getScraperSession,
+  saveScraperSession,
+  getLatestScrapeJob,
+  createScrapeJob,
+  cancelScrapeJob,
 } = require('./database/supabase');
 const { loadLeadsFromCSV, connectInstagram } = require('./bot');
+const { connectScraper, runFollowerScrape } = require('./scraper');
 const { MESSAGES } = require('./config/messages');
 
 const app = express();
@@ -272,6 +278,128 @@ app.post('/api/reset-failed', async (req, res) => {
     const cleared = clearFailedAttempts();
     res.json({ ok: true, cleared });
   } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// --- Scraper API ---
+app.post('/api/scraper/connect', async (req, res) => {
+  const { username, password, clientId } = req.body || {};
+  if (!username || !password || !clientId) {
+    return res.status(400).json({ ok: false, error: 'username, password, and clientId are required' });
+  }
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
+  }
+  try {
+    const result = await connectScraper(username, password);
+    await saveScraperSession(clientId, { cookies: result.cookies }, result.username);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[API] Scraper connect failed', e);
+    res.status(500).json({ ok: false, error: e.message || 'Login failed' });
+  }
+});
+
+app.get('/api/scraper/status', async (req, res) => {
+  const clientId = req.query.clientId || req.body?.clientId;
+  if (!clientId) {
+    return res.status(400).json({ error: 'clientId is required' });
+  }
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ error: 'Supabase not configured' });
+  }
+  try {
+    const session = await getScraperSession(clientId);
+    const connected = !!(session?.session_data?.cookies?.length);
+    const response = {
+      connected,
+      instagram_username: session?.instagram_username || null,
+    };
+    const job = await getLatestScrapeJob(clientId);
+    if (job) {
+      response.currentJob = {
+        id: job.id,
+        target_username: job.target_username,
+        status: job.status,
+        scraped_count: job.scraped_count,
+      };
+    }
+    res.json(response);
+  } catch (e) {
+    console.error('[API] Scraper status error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/scraper/status', async (req, res) => {
+  const clientId = req.body?.clientId || req.query.clientId;
+  if (!clientId) {
+    return res.status(400).json({ error: 'clientId is required' });
+  }
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ error: 'Supabase not configured' });
+  }
+  try {
+    const session = await getScraperSession(clientId);
+    const connected = !!(session?.session_data?.cookies?.length);
+    const response = {
+      connected,
+      instagram_username: session?.instagram_username || null,
+    };
+    const job = await getLatestScrapeJob(clientId);
+    if (job) {
+      response.currentJob = {
+        id: job.id,
+        target_username: job.target_username,
+        status: job.status,
+        scraped_count: job.scraped_count,
+      };
+    }
+    res.json(response);
+  } catch (e) {
+    console.error('[API] Scraper status error', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post('/api/scraper/start', async (req, res) => {
+  const { clientId, target_username } = req.body || {};
+  if (!clientId || !target_username) {
+    return res.status(400).json({ ok: false, error: 'clientId and target_username are required' });
+  }
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
+  }
+  try {
+    const session = await getScraperSession(clientId);
+    if (!session?.session_data?.cookies?.length) {
+      return res.status(400).json({ ok: false, error: 'Scraper not connected' });
+    }
+    const jobId = await createScrapeJob(clientId, target_username.trim().replace(/^@/, ''));
+    runFollowerScrape(clientId, jobId, target_username).catch((err) => {
+      console.error('[API] Scraper background job error', err);
+    });
+    res.json({ ok: true, jobId });
+  } catch (e) {
+    console.error('[API] Scraper start error', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/scraper/stop', async (req, res) => {
+  const { clientId, jobId } = req.body || {};
+  if (!clientId) {
+    return res.status(400).json({ ok: false, error: 'clientId is required' });
+  }
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
+  }
+  try {
+    const cancelled = await cancelScrapeJob(clientId, jobId || null);
+    res.json({ ok: true, cancelled });
+  } catch (e) {
+    console.error('[API] Scraper stop error', e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
