@@ -99,14 +99,44 @@ async function login(page, credentials) {
     if (el !== userEl && el !== passEl) el.dispose();
   }
   logger.log('Login form found, entering credentials...');
+  await userEl.click();
   await userEl.type(username, { delay: 80 + Math.floor(Math.random() * 60) });
   await userEl.dispose();
   await humanDelay();
+  await passEl.click();
   await passEl.type(password, { delay: 80 + Math.floor(Math.random() * 60) });
   await humanDelay();
-  await passEl.evaluate((el) => el.focus()).catch(() => {});
-  await passEl.dispose();
-  await page.keyboard.press('Enter');
+
+  const submitted = await page.evaluate(function () {
+    const form = document.querySelector('form');
+    if (form && typeof form.requestSubmit === 'function') {
+      form.requestSubmit();
+      return true;
+    }
+    if (form && typeof form.submit === 'function') {
+      form.submit();
+      return true;
+    }
+    const submit = document.querySelector('button[type="submit"]');
+    if (submit && submit.offsetParent) {
+      submit.scrollIntoView({ block: 'center' });
+      submit.click();
+      return true;
+    }
+    const logIn = Array.from(document.querySelectorAll('button, div[role="button"], [role="button"]')).find(function (el) {
+      const t = (el.textContent || '').trim();
+      return (t === 'Log in' || t === 'Log In') && el.offsetParent !== null;
+    });
+    if (logIn) {
+      logIn.scrollIntoView({ block: 'center' });
+      logIn.click();
+      return true;
+    }
+    return false;
+  });
+  if (!submitted) {
+    await page.keyboard.press('Enter');
+  }
   logger.log('Submitted login form, waiting for redirect...');
   await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
   await delay(4000);
