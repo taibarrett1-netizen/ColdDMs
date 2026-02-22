@@ -121,7 +121,9 @@ async function login(page, credentials) {
     return false;
   });
   if (!clicked) throw new Error('Log in button not found.');
-  await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+  logger.log('Clicked Log in, waiting for redirect...');
+  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
+  await delay(4000);
 
   for (let i = 0; i < 3; i++) {
     const dismissed = await page.evaluate(function () {
@@ -141,16 +143,25 @@ async function login(page, credentials) {
       return false;
     });
     if (dismissed) {
-      await delay(1500);
+      logger.log('Dismissed post-login popup');
+      await delay(2000);
     } else {
       break;
     }
   }
 
-  await delay(2500);
+  await delay(2000);
   const urlAfterLogin = page.url();
   if (urlAfterLogin.includes('/accounts/login')) {
-    throw new Error('Login may have failed; still on login page. Check credentials.');
+    const bodySnippet = await page.evaluate(() => (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 600)).catch(() => '');
+    let hint = '';
+    const lower = bodySnippet.toLowerCase();
+    if (lower.indexOf('password was incorrect') !== -1 || lower.indexOf('incorrect password') !== -1) hint = ' Wrong password.';
+    else if (lower.indexOf('username you entered') !== -1 || lower.indexOf("doesn't belong to an account") !== -1) hint = ' Username not found.';
+    else if (lower.indexOf('challenge') !== -1 || lower.indexOf('suspicious') !== -1 || lower.indexOf('verify') !== -1) hint = ' Instagram may require manual verification (challenge/captcha). Try logging in manually in a browser first.';
+    else if (lower.indexOf('try again later') !== -1 || lower.indexOf('too many requests') !== -1) hint = ' Rate limited. Try again later.';
+    logger.error('Login failed. Page snippet: ' + bodySnippet.replace(/\n/g, ' ').slice(0, 400));
+    throw new Error('Login may have failed; still on login page. Check credentials.' + hint);
   }
   logger.log('Logged in to Instagram.');
 }
