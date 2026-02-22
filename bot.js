@@ -459,9 +459,6 @@ async function runBot() {
           maxDelaySec: campaign.maxDelaySec,
         };
       }
-      const sentSet = await sb.getSentUsernames(clientId);
-      const pending = leads.filter((u) => !sentSet.has(sb.normalizeUsername(u)));
-      if (pending.length) return { type: 'lead', username: pending[0] };
       return null;
     };
     const filtered = [];
