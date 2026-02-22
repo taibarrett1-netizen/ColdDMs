@@ -99,7 +99,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     await applyMobileEmulation(page);
     await page.setCookie(...session.session_data.cookies);
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
-    await delay(2000);
+    await delay(randomDelay(1500, 3500));
 
     if (page.url().includes('/accounts/login')) {
       await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session expired. Reconnect scraper.' });
@@ -225,7 +225,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     }
 
     logger.log('[Scraper] Followers modal opened, extracting...');
-    await delay(3000);
+    await delay(randomDelay(2500, 5000));
 
     const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
 
@@ -483,7 +483,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     await applyMobileEmulation(page);
     await page.setCookie(...session.session_data.cookies);
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
-    await delay(2000);
+    await delay(randomDelay(1500, 3500));
 
     if (page.url().includes('/accounts/login')) {
       await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session expired. Reconnect scraper.' });
@@ -555,11 +555,23 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         });
         if (opened) {
           logger.log('[Scraper] Opened comment section');
-          await delay(3000);
+          await delay(randomDelay(3000, 6000));
+          for (let s = 0; s < 5; s++) {
+            await page.evaluate(function () {
+              const sel = 'div[style*="overflow"], [role="dialog"], section, article';
+              document.querySelectorAll(sel).forEach(function (el) {
+                if (el.scrollHeight > el.clientHeight && el.offsetParent) {
+                  el.scrollTop = el.scrollHeight;
+                }
+              });
+              window.scrollBy(0, 350);
+            });
+            await delay(randomDelay(1200, 2800));
+          }
           break;
         }
         await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-        await delay(1500);
+        await delay(randomDelay(1000, 2500));
       }
 
       let noNewCount = 0;
@@ -617,19 +629,24 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           }
           return false;
         });
-        if (commentsOpened) await delay(2000);
+        if (commentsOpened) await delay(randomDelay(1500, 3500));
 
         const scrolled = await page.evaluate(function () {
-          const scrollables = document.querySelectorAll('div[style*="overflow"], [role="dialog"], section');
+          const sel = 'div[style*="overflow"], [role="dialog"], section, article, div[style*="overflow-y"]';
+          const scrollables = Array.from(document.querySelectorAll(sel));
+          let didScroll = false;
           for (let i = 0; i < scrollables.length; i++) {
             const s = scrollables[i];
-            if (s.scrollHeight > s.clientHeight && s.offsetParent !== null) {
+            if (!s.offsetParent) continue;
+            const sh = s.scrollHeight;
+            const ch = s.clientHeight;
+            if (sh > ch) {
+              const prev = s.scrollTop;
               s.scrollTop = s.scrollHeight;
-              return true;
+              if (s.scrollTop !== prev) didScroll = true;
             }
           }
-          const dy = window.innerHeight * 0.8;
-          window.scrollBy(0, dy);
+          window.scrollBy(0, 400);
           return true;
         });
         if (!scrolled) break;
