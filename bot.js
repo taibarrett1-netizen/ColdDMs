@@ -121,24 +121,33 @@ async function login(page, credentials) {
     return false;
   });
   if (!clicked) throw new Error('Log in button not found.');
-  await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 }).catch(() => {});
+  await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
 
-  // "Save login" / "Not Now"
-  try {
-    const notNow = await page.$('button._a9--._a9_1');
-    if (notNow) {
-      await notNow.click();
-      await delay(1000);
+  for (let i = 0; i < 3; i++) {
+    const dismissed = await page.evaluate(function () {
+      const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]');
+      for (let d = 0; d < dialogs.length; d++) {
+        const txt = (dialogs[d].textContent || '').toLowerCase();
+        if (txt.indexOf('save your login') !== -1 || txt.indexOf('not now') !== -1 || txt.indexOf('turn on notifications') !== -1) {
+          const notNow = Array.from(dialogs[d].querySelectorAll('span, button, div[role="button"]')).find(function (el) {
+            return (el.textContent || '').trim().toLowerCase() === 'not now';
+          });
+          if (notNow) {
+            const btn = notNow.closest('[role="button"]') || notNow.closest('button') || notNow;
+            if (btn) { btn.click(); return true; }
+          }
+        }
+      }
+      return false;
+    });
+    if (dismissed) {
+      await delay(1500);
+    } else {
+      break;
     }
-  } catch (e) {}
+  }
 
-  // Notifications "Not Now"
-  try {
-    const notNow2 = await page.$('button._a9--._a9_1');
-    if (notNow2) await notNow2.click();
-  } catch (e) {}
-
-  await delay(2000);
+  await delay(2500);
   const urlAfterLogin = page.url();
   if (urlAfterLogin.includes('/accounts/login')) {
     throw new Error('Login may have failed; still on login page. Check credentials.');
