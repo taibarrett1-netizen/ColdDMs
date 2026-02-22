@@ -227,6 +227,29 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     logger.log('[Scraper] Followers modal opened, extracting...');
     await delay(randomDelay(2500, 5000));
 
+    const saveLoginDismissed = await page.evaluate(function () {
+      const dialogs = document.querySelectorAll('[role="dialog"]');
+      for (let i = 0; i < dialogs.length; i++) {
+        const d = dialogs[i];
+        const txt = (d.textContent || '').toLowerCase();
+        if (txt.indexOf('save your login info') !== -1) {
+          const notNow = Array.from(d.querySelectorAll('span, div[role="button"], button')).find(function (el) {
+            return (el.textContent || '').trim().toLowerCase() === 'not now';
+          });
+          if (notNow) {
+            const btn = notNow.closest('[role="button"]') || notNow.closest('button') || notNow;
+            if (btn) { btn.click(); return true; }
+          }
+          return false;
+        }
+      }
+      return false;
+    });
+    if (saveLoginDismissed) {
+      logger.log('[Scraper] Dismissed Save login info dialog');
+      await delay(randomDelay(1000, 2000));
+    }
+
     const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
 
     let totalScraped = 0;
