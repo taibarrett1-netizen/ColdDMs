@@ -540,51 +540,58 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
       const source = postAuthor ? 'comments:' + postAuthor : (shortcode ? 'comments:' + shortcode : 'comments:' + postUrl);
 
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const opened = await page.evaluate(function () {
-          const btns = Array.from(document.querySelectorAll('span, a, [role="button"], div[role="button"]'));
-          const commentBtn = btns.find(function (b) {
-            const t = (b.textContent || '').toLowerCase().trim();
-            return t.includes('view all') || t.includes('comment') || /^\d+\s*comment/.test(t);
-          });
-          if (commentBtn) {
-            commentBtn.click();
-            return true;
-          }
-          return false;
-        });
-        if (opened) {
-          const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
-          logger.log('[Scraper] Opened comment section');
-          await delay(randomDelay(3000, 6000));
-          for (let s = 0; s < 5; s++) {
-            const preScroll = SCRAPER_DEBUG
-              ? await page.evaluate(function () {
-                  return { anchors: document.querySelectorAll('a[href^="/"]').length, scrollH: document.documentElement.scrollHeight };
-                })
-              : null;
-            if (SCRAPER_DEBUG && s === 0) logger.log('[Scraper] Pre-scroll: anchors=' + (preScroll?.anchors || 0) + ' docHeight=' + (preScroll?.scrollH || 0));
-            await page.evaluate(function () {
-              const sel = 'div[style*="overflow"], [role="dialog"], section, article';
-              document.querySelectorAll(sel).forEach(function (el) {
-                if (el.scrollHeight > el.clientHeight && el.offsetParent) {
-                  el.scrollTop = el.scrollHeight;
-                }
-              });
-              window.scrollBy(0, 350);
+      if (shortcode) {
+        const commentsUrl = 'https://www.instagram.com/p/' + shortcode + '/c/';
+        logger.log('[Scraper] Navigating to comments page: ' + commentsUrl);
+        await page.goto(commentsUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await delay(randomDelay(3000, 6000));
+      } else {
+        for (let attempt = 0; attempt < 3; attempt++) {
+          const opened = await page.evaluate(function () {
+            const btns = Array.from(document.querySelectorAll('span, a, [role="button"], div[role="button"]'));
+            const commentBtn = btns.find(function (b) {
+              const t = (b.textContent || '').toLowerCase().trim();
+              return t.includes('view all') || t.includes('comment') || /^\d+\s*comment/.test(t);
             });
-            await delay(randomDelay(1200, 2800));
-            if (SCRAPER_DEBUG && s === 4) {
-              const post = await page.evaluate(function () {
-                return { anchors: document.querySelectorAll('a[href^="/"]').length };
-              });
-              logger.log('[Scraper] Post-scroll burst: anchors=' + post.anchors);
+            if (commentBtn) {
+              commentBtn.click();
+              return true;
             }
+            return false;
+          });
+          if (opened) {
+            const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
+            logger.log('[Scraper] Opened comment section');
+            await delay(randomDelay(3000, 6000));
+            for (let s = 0; s < 5; s++) {
+              const preScroll = SCRAPER_DEBUG
+                ? await page.evaluate(function () {
+                    return { anchors: document.querySelectorAll('a[href^="/"]').length, scrollH: document.documentElement.scrollHeight };
+                  })
+                : null;
+              if (SCRAPER_DEBUG && s === 0) logger.log('[Scraper] Pre-scroll: anchors=' + (preScroll?.anchors || 0) + ' docHeight=' + (preScroll?.scrollH || 0));
+              await page.evaluate(function () {
+                const sel = 'div[style*="overflow"], [role="dialog"], section, article';
+                document.querySelectorAll(sel).forEach(function (el) {
+                  if (el.scrollHeight > el.clientHeight && el.offsetParent) {
+                    el.scrollTop = el.scrollHeight;
+                  }
+                });
+                window.scrollBy(0, 350);
+              });
+              await delay(randomDelay(1200, 2800));
+              if (SCRAPER_DEBUG && s === 4) {
+                const post = await page.evaluate(function () {
+                  return { anchors: document.querySelectorAll('a[href^="/"]').length };
+                });
+                logger.log('[Scraper] Post-scroll burst: anchors=' + post.anchors);
+              }
+            }
+            break;
           }
-          break;
+          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+          await delay(randomDelay(1000, 2500));
         }
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-        await delay(randomDelay(1000, 2500));
       }
 
       let noNewCount = 0;
