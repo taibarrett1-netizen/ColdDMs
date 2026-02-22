@@ -540,6 +540,28 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
       const source = postAuthor ? 'comments:' + postAuthor : (shortcode ? 'comments:' + shortcode : 'comments:' + postUrl);
 
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const opened = await page.evaluate(function () {
+          const btns = Array.from(document.querySelectorAll('span, a, [role="button"], div[role="button"]'));
+          const commentBtn = btns.find(function (b) {
+            const t = (b.textContent || '').toLowerCase().trim();
+            return t.includes('view all') || t.includes('comment') || /^\d+\s*comment/.test(t);
+          });
+          if (commentBtn) {
+            commentBtn.click();
+            return true;
+          }
+          return false;
+        });
+        if (opened) {
+          logger.log('[Scraper] Opened comment section');
+          await delay(3000);
+          break;
+        }
+        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+        await delay(1500);
+      }
+
       let noNewCount = 0;
       let scrollCount = 0;
 
@@ -556,6 +578,11 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           }
           return [...new Set(out)];
         });
+
+        const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
+        if (SCRAPER_DEBUG) {
+          logger.log('[Scraper] Comment extract: raw=' + usernames.length + ', seen=' + seenUsernames.size);
+        }
 
         let newUsernames = usernames.filter(
           (u) => !seenUsernames.has(u) && !BLACKLIST.has(u) && !inConvos.has(u) && (!postAuthor || u !== postAuthor)
@@ -593,21 +620,22 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         if (commentsOpened) await delay(2000);
 
         const scrolled = await page.evaluate(function () {
-          const scrollables = document.querySelectorAll('div[style*="overflow"], [role="dialog"]');
+          const scrollables = document.querySelectorAll('div[style*="overflow"], [role="dialog"], section');
           for (let i = 0; i < scrollables.length; i++) {
             const s = scrollables[i];
-            if (s.scrollHeight > s.clientHeight) {
+            if (s.scrollHeight > s.clientHeight && s.offsetParent !== null) {
               s.scrollTop = s.scrollHeight;
               return true;
             }
           }
-          window.scrollTo(0, document.body.scrollHeight);
+          const dy = window.innerHeight * 0.8;
+          window.scrollBy(0, dy);
           return true;
         });
         if (!scrolled) break;
-        await delay(randomDelay(1500, 3000));
+        await delay(randomDelay(2000, 4000));
         scrollCount++;
-        if (scrollCount > 10) break;
+        if (scrollCount > 20) break;
       }
 
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
