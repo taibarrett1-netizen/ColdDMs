@@ -554,9 +554,16 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           return false;
         });
         if (opened) {
+          const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
           logger.log('[Scraper] Opened comment section');
           await delay(randomDelay(3000, 6000));
           for (let s = 0; s < 5; s++) {
+            const preScroll = SCRAPER_DEBUG
+              ? await page.evaluate(function () {
+                  return { anchors: document.querySelectorAll('a[href^="/"]').length, scrollH: document.documentElement.scrollHeight };
+                })
+              : null;
+            if (SCRAPER_DEBUG && s === 0) logger.log('[Scraper] Pre-scroll: anchors=' + (preScroll?.anchors || 0) + ' docHeight=' + (preScroll?.scrollH || 0));
             await page.evaluate(function () {
               const sel = 'div[style*="overflow"], [role="dialog"], section, article';
               document.querySelectorAll(sel).forEach(function (el) {
@@ -567,6 +574,12 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
               window.scrollBy(0, 350);
             });
             await delay(randomDelay(1200, 2800));
+            if (SCRAPER_DEBUG && s === 4) {
+              const post = await page.evaluate(function () {
+                return { anchors: document.querySelectorAll('a[href^="/"]').length };
+              });
+              logger.log('[Scraper] Post-scroll burst: anchors=' + post.anchors);
+            }
           }
           break;
         }
@@ -593,7 +606,14 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
         const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
         if (SCRAPER_DEBUG) {
-          logger.log('[Scraper] Comment extract: raw=' + usernames.length + ', seen=' + seenUsernames.size);
+          const why = usernames.map((u) => {
+            if (seenUsernames.has(u)) return u + ':seen';
+            if (BLACKLIST.has(u)) return u + ':blacklist';
+            if (inConvos.has(u)) return u + ':inConvos';
+            if (postAuthor && u === postAuthor) return u + ':postAuthor';
+            return u + ':new';
+          });
+          logger.log('[Scraper] Comment extract: raw=' + usernames.length + ' [' + usernames.join(',') + '] seen=' + Array.from(seenUsernames).join(',') + ' why=' + why.join(' '));
         }
 
         let newUsernames = usernames.filter(
@@ -614,6 +634,9 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           if (maxLeads && totalScraped >= maxLeads) break;
         } else {
           noNewCount++;
+          if (!SCRAPER_DEBUG && usernames.length > 0 && noNewCount === 1) {
+            logger.log('[Scraper] Comment extract: raw=' + usernames.length + ', new=0 (set SCRAPER_DEBUG=1 for details)');
+          }
           if (noNewCount >= 3) break;
         }
 
@@ -630,6 +653,18 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           return false;
         });
         if (commentsOpened) await delay(randomDelay(1500, 3500));
+
+        const scrollDebug = await page.evaluate(function () {
+          const sel = 'div[style*="overflow"], [role="dialog"], section, article, div[style*="overflow-y"]';
+          const scrollables = Array.from(document.querySelectorAll(sel));
+          const info = scrollables.slice(0, 8).map(function (s, i) {
+            return '#' + i + ':' + s.scrollHeight + '/' + s.clientHeight + ' top=' + s.scrollTop;
+          });
+          return { count: scrollables.length, items: info, anchors: document.querySelectorAll('a[href^="/"]').length };
+        });
+        if (SCRAPER_DEBUG) {
+          logger.log('[Scraper] Scroll: containers=' + scrollDebug.count + ' anchors=' + scrollDebug.anchors + ' ' + scrollDebug.items.join(' '));
+        }
 
         const scrolled = await page.evaluate(function () {
           const sel = 'div[style*="overflow"], [role="dialog"], section, article, div[style*="overflow-y"]';
