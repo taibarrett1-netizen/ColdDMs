@@ -103,25 +103,11 @@ async function login(page, credentials) {
   await userEl.dispose();
   await humanDelay();
   await passEl.type(password, { delay: 80 + Math.floor(Math.random() * 60) });
-  await passEl.dispose();
   await humanDelay();
-  const clicked = await page.evaluate(() => {
-    const submit = document.querySelector('button[type="submit"]');
-    if (submit) {
-      submit.click();
-      return true;
-    }
-    const logIn = Array.from(document.querySelectorAll('button, [role="button"]')).find(
-      (el) => el.textContent.trim() === 'Log in' && el.offsetParent !== null
-    );
-    if (logIn) {
-      logIn.click();
-      return true;
-    }
-    return false;
-  });
-  if (!clicked) throw new Error('Log in button not found.');
-  logger.log('Clicked Log in, waiting for redirect...');
+  await passEl.evaluate((el) => el.focus()).catch(() => {});
+  await passEl.dispose();
+  await page.keyboard.press('Enter');
+  logger.log('Submitted login form, waiting for redirect...');
   await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
   await delay(4000);
 
