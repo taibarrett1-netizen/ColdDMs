@@ -111,14 +111,24 @@ async function login(page, credentials) {
 
   let submitMethod = 'none';
   const clickTarget = await page.evaluate(function () {
-    const el = document.evaluate(
-      "//button[contains(normalize-space(.), 'Log in')] | //div[@role='button'][contains(normalize-space(.), 'Log in')] | //span[normalize-space(.)='Log in']/ancestor::button | //span[normalize-space(.)='Log in']/ancestor::div[@role='button']",
-      document, null, 9, null
-    ).singleNodeValue;
+    var el = null;
+    var xpaths = [
+      "//button[normalize-space(.)='Log in']",
+      "//div[@role='button'][normalize-space(.)='Log in']",
+      "//span[normalize-space(.)='Log in']/parent::button",
+      "//span[normalize-space(.)='Log in']/parent::div[@role='button']",
+      "//button[contains(., 'Log in') and not(contains(., 'Log into'))]",
+      "//div[@role='button'][contains(., 'Log in') and not(contains(., 'Log into'))]"
+    ];
+    for (var i = 0; i < xpaths.length; i++) {
+      var r = document.evaluate(xpaths[i], document, null, 9, null);
+      el = r.singleNodeValue;
+      if (el && el.offsetParent) break;
+    }
     if (!el) return null;
     el.scrollIntoView({ block: 'center' });
-    var r = el.getBoundingClientRect();
-    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    var rect = el.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
   });
   if (clickTarget) {
     await delay(300);
