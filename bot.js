@@ -110,14 +110,20 @@ async function login(page, credentials) {
   await humanDelay();
 
   let submitMethod = 'none';
-  const logInHandles = await page.$x("//button[contains(normalize-space(.), 'Log in')] | //div[@role='button'][contains(normalize-space(.), 'Log in')] | //span[normalize-space(.)='Log in']/ancestor::button | //span[normalize-space(.)='Log in']/ancestor::div[@role='button']");
-  if (logInHandles.length > 0) {
-    const btn = logInHandles[0];
-    await btn.evaluate((el) => el.scrollIntoView({ block: 'center' }));
+  const clickTarget = await page.evaluate(function () {
+    const el = document.evaluate(
+      "//button[contains(normalize-space(.), 'Log in')] | //div[@role='button'][contains(normalize-space(.), 'Log in')] | //span[normalize-space(.)='Log in']/ancestor::button | //span[normalize-space(.)='Log in']/ancestor::div[@role='button']",
+      document, null, 9, null
+    ).singleNodeValue;
+    if (!el) return null;
+    el.scrollIntoView({ block: 'center' });
+    var r = el.getBoundingClientRect();
+    return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+  });
+  if (clickTarget) {
     await delay(300);
-    await btn.click({ delay: 80 });
+    await page.mouse.click(clickTarget.x, clickTarget.y, { delay: 80 });
     submitMethod = 'puppeteerClick';
-    await btn.dispose().catch(() => {});
   }
   if (submitMethod === 'none') {
     await page.keyboard.press('Enter');
