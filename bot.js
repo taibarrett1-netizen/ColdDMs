@@ -8,6 +8,7 @@ const { getRandomMessage } = require('./config/messages');
 const { alreadySent, logSentMessage, getDailyStats, normalizeUsername, getControl, setControl } = require('./database/db');
 const sb = require('./database/supabase');
 const logger = require('./utils/logger');
+const { applyMobileEmulation } = require('./utils/mobile-viewport');
 
 puppeteer.use(StealthPlugin());
 
@@ -556,7 +557,7 @@ async function runBot() {
 
   try {
     page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
+    await applyMobileEmulation(page);
     if (useSessionCookies) {
       const session = await sb.getSession(clientId);
       const cookies = session?.session_data?.cookies;
@@ -676,7 +677,7 @@ async function connectInstagram(instagramUsername, instagramPassword) {
   });
   try {
     const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
+    await applyMobileEmulation(page);
     await login(page, { username: instagramUsername, password: instagramPassword });
     const cookies = await page.cookies();
     return { cookies, username: instagramUsername };

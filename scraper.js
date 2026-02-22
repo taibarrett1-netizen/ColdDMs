@@ -15,8 +15,11 @@ const {
   getScrapeJob,
   upsertLeadsBatch,
   getConversationParticipantUsernames,
+  getPlatformScraperSessionById,
+  recordScraperActions,
 } = require('./database/supabase');
 const logger = require('./utils/logger');
+const { applyMobileEmulation } = require('./utils/mobile-viewport');
 
 puppeteer.use(StealthPlugin());
 
@@ -44,7 +47,7 @@ async function connectScraper(instagramUsername, instagramPassword) {
   });
   try {
     const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
+    await applyMobileEmulation(page);
     const { login } = require('./bot');
     await login(page, { username: instagramUsername, password: instagramPassword });
     const cookies = await page.cookies();
@@ -70,7 +73,19 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
   let browser;
   try {
-    const session = await getScraperSession(clientId);
+    const job = await getScrapeJob(jobId);
+    let session = null;
+    let platformSessionId = null;
+    if (job?.platform_scraper_session_id) {
+      const platformSession = await getPlatformScraperSessionById(job.platform_scraper_session_id);
+      if (platformSession) {
+        session = platformSession;
+        platformSessionId = job.platform_scraper_session_id;
+      }
+    }
+    if (!session) {
+      session = await getScraperSession(clientId);
+    }
     if (!session?.session_data?.cookies?.length) {
       await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session not found or expired' });
       return;
@@ -81,7 +96,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     });
     const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
+    await applyMobileEmulation(page);
     await page.setCookie(...session.session_data.cookies);
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(2000);
@@ -120,8 +135,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     });
     await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
 
-    const job = await getScrapeJob(jobId);
-    if (job?.status === 'cancelled') return;
+    const jobCheck = await getScrapeJob(jobId);
+    if (jobCheck?.status === 'cancelled') return;
 
     const profileFollowerCount = await page.evaluate((target) => {
       function parseCount(str) {
@@ -382,13 +397,17 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     logger.log(`[Scraper] Job ${jobId} completed. Scraped ${totalScraped} followers from @${cleanTarget}`);
 
     try {
-      await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 10000 });
+      await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
       await delay(3000 + Math.floor(Math.random() * 5000));
       await page.evaluate(() => window.scrollTo(0, 200));
       await delay(5000 + Math.floor(Math.random() * 8000));
       logger.log('[Scraper] Post-scrape warm done.');
     } catch (e) {
       logger.warn('[Scraper] Post-scrape warm skipped: ' + e.message);
+    }
+    if (platformSessionId && totalScraped > 0) {
+      const actionCount = Math.max(20, totalScraped + 10);
+      await recordScraperActions(platformSessionId, actionCount).catch(() => {});
     }
   } catch (err) {
     logger.error('[Scraper] Follower scrape failed', err);
@@ -437,8 +456,20 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
   ]);
 
   let browser;
+  let platformSessionId = null;
   try {
-    const session = await getScraperSession(clientId);
+    const job = await getScrapeJob(jobId);
+    let session = null;
+    if (job?.platform_scraper_session_id) {
+      const platformSession = await getPlatformScraperSessionById(job.platform_scraper_session_id);
+      if (platformSession) {
+        session = platformSession;
+        platformSessionId = job.platform_scraper_session_id;
+      }
+    }
+    if (!session) {
+      session = await getScraperSession(clientId);
+    }
     if (!session?.session_data?.cookies?.length) {
       await updateScrapeJob(jobId, { status: 'failed', error_message: 'Scraper session not found or expired' });
       return;
@@ -449,7 +480,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     });
     const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
+    await applyMobileEmulation(page);
     await page.setCookie(...session.session_data.cookies);
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(2000);
@@ -459,10 +490,17 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       return;
     }
 
+    logger.log('[Scraper] Warming session before comment scrape...');
+    await delay(3000 + Math.floor(Math.random() * 5000));
+    await page.evaluate(() => window.scrollTo(0, 200 + Math.random() * 500));
+    await delay(2000 + Math.floor(Math.random() * 3000));
+
     logger.log('[Scraper] Comment scrape: ' + postUrls.length + ' post(s)');
     let totalScraped = 0;
     const seenUsernames = new Set();
     const inConvos = await getConversationParticipantUsernames(clientId);
+    const scraperUsername = (session?.instagram_username || '').trim().replace(/^@/, '').toLowerCase();
+    if (scraperUsername) seenUsernames.add(scraperUsername);
 
     for (const postUrl of postUrls) {
       const jobCheck = await getScrapeJob(jobId);
@@ -475,8 +513,6 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       const normalizedUrl = postUrl.includes('instagram.com') ? postUrl : 'https://www.instagram.com/p/' + postUrl + '/';
       await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
-
-      const scraperUsername = (session?.instagram_username || '').trim().replace(/^@/, '').toLowerCase();
 
       const candidateAuthors = await page.evaluate(function () {
         const blacklist = ['explore', 'direct', 'accounts', 'reels', 'stories', 'p', 'tv', 'tags'];
@@ -575,6 +611,21 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       }
 
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
+    }
+
+    try {
+      await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await delay(3000 + Math.floor(Math.random() * 5000));
+      await page.evaluate(() => window.scrollTo(0, 200));
+      await delay(5000 + Math.floor(Math.random() * 8000));
+      logger.log('[Scraper] Post-scrape warm done.');
+    } catch (e) {
+      logger.warn('[Scraper] Post-scrape warm skipped: ' + e.message);
+    }
+
+    if (platformSessionId && totalScraped > 0) {
+      const actionCount = Math.max(20, totalScraped + 10);
+      await recordScraperActions(platformSessionId, actionCount).catch(() => {});
     }
 
     await updateScrapeJob(jobId, { status: 'completed', scraped_count: totalScraped });

@@ -356,8 +356,131 @@ async function saveScraperSession(clientId, sessionData, instagramUsername) {
   if (error) throw error;
 }
 
+// --- Platform scraper sessions (rotation pool) ---
+async function getPlatformScraperSessions() {
+  const sb = getSupabase();
+  if (!sb) return [];
+  const { data, error } = await sb
+    .from('cold_dm_platform_scraper_sessions')
+    .select('id, session_data, instagram_username, daily_actions_limit')
+    .order('id', { ascending: true });
+  if (error) return [];
+  return data || [];
+}
+
+async function getPlatformScraperSessionById(id) {
+  if (!id) return null;
+  const sb = getSupabase();
+  if (!sb) return null;
+  const { data, error } = await sb
+    .from('cold_dm_platform_scraper_sessions')
+    .select('id, session_data, instagram_username')
+    .eq('id', id)
+    .maybeSingle();
+  if (error) return null;
+  return data;
+}
+
+async function getPlatformScraperUsageToday(sessionIds) {
+  if (!sessionIds || sessionIds.length === 0) return {};
+  const sb = getSupabase();
+  if (!sb) return {};
+  const today = new Date().toISOString().slice(0, 10);
+  const { data, error } = await sb
+    .from('cold_dm_scraper_daily_usage')
+    .select('platform_scraper_session_id, actions_count')
+    .in('platform_scraper_session_id', sessionIds)
+    .eq('usage_date', today);
+  if (error) return {};
+  const map = {};
+  for (const row of data || []) {
+    map[row.platform_scraper_session_id] = row.actions_count || 0;
+  }
+  return map;
+}
+
+async function pickScraperSessionForJob(clientId) {
+  const sessions = await getPlatformScraperSessions();
+  if (sessions.length === 0) {
+    const clientSession = await getScraperSession(clientId);
+    if (clientSession) return { source: 'client', session: clientSession, platformSessionId: null };
+    return null;
+  }
+  const sessionIds = sessions.map((s) => s.id);
+  const usage = await getPlatformScraperUsageToday(sessionIds);
+  const candidates = sessions.filter((s) => (usage[s.id] || 0) < (s.daily_actions_limit || 500));
+  if (candidates.length === 0) {
+    const clientSession = await getScraperSession(clientId);
+    if (clientSession) return { source: 'client', session: clientSession, platformSessionId: null };
+    return null;
+  }
+  candidates.sort((a, b) => (usage[a.id] || 0) - (usage[b.id] || 0));
+  const picked = candidates[0];
+  return {
+    source: 'platform',
+    session: { session_data: picked.session_data, instagram_username: picked.instagram_username },
+    platformSessionId: picked.id,
+  };
+}
+
+async function recordScraperActions(platformSessionId, count) {
+  if (!platformSessionId || count <= 0) return;
+  const sb = getSupabase();
+  if (!sb) return;
+  const today = new Date().toISOString().slice(0, 10);
+  const { data: existing } = await sb
+    .from('cold_dm_scraper_daily_usage')
+    .select('id, actions_count')
+    .eq('platform_scraper_session_id', platformSessionId)
+    .eq('usage_date', today)
+    .maybeSingle();
+  const newCount = (existing?.actions_count || 0) + count;
+  if (existing) {
+    await sb
+      .from('cold_dm_scraper_daily_usage')
+      .update({ actions_count: newCount, updated_at: new Date().toISOString() })
+      .eq('id', existing.id);
+  } else {
+    await sb.from('cold_dm_scraper_daily_usage').insert({
+      platform_scraper_session_id: platformSessionId,
+      usage_date: today,
+      actions_count: newCount,
+    });
+  }
+}
+
+async function savePlatformScraperSession(sessionData, instagramUsername, dailyActionsLimit = 500) {
+  const sb = getSupabase();
+  if (!sb) throw new Error('Supabase not configured');
+  const username = (instagramUsername || '').trim().replace(/^@/, '');
+  if (!username) throw new Error('Instagram username required');
+  const { data, error } = await sb
+    .from('cold_dm_platform_scraper_sessions')
+    .upsert(
+      {
+        session_data: sessionData,
+        instagram_username: username,
+        daily_actions_limit: Math.max(1, parseInt(dailyActionsLimit, 10) || 500),
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'instagram_username' }
+    )
+    .select('id')
+    .single();
+  if (error) {
+    const { error: insertErr } = await sb.from('cold_dm_platform_scraper_sessions').insert({
+      session_data: sessionData,
+      instagram_username: username,
+      daily_actions_limit: Math.max(1, parseInt(dailyActionsLimit, 10) || 500),
+    });
+    if (insertErr) throw insertErr;
+    return;
+  }
+  return data?.id;
+}
+
 // --- Scrape jobs ---
-async function createScrapeJob(clientId, targetUsername, leadGroupId = null, scrapeType = 'followers', postUrls = null) {
+async function createScrapeJob(clientId, targetUsername, leadGroupId = null, scrapeType = 'followers', postUrls = null, platformScraperSessionId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
   const payload = {
@@ -370,6 +493,7 @@ async function createScrapeJob(clientId, targetUsername, leadGroupId = null, scr
   if (leadGroupId) payload.lead_group_id = leadGroupId;
   if (scrapeType) payload.scrape_type = scrapeType;
   if (postUrls && Array.isArray(postUrls) && postUrls.length) payload.post_urls = postUrls;
+  if (platformScraperSessionId) payload.platform_scraper_session_id = platformScraperSessionId;
   const { data, error } = await sb
     .from('cold_dm_scrape_jobs')
     .insert(payload)
@@ -681,6 +805,11 @@ module.exports = {
   updateSettingsInstagramUsername,
   getScraperSession,
   saveScraperSession,
+  getPlatformScraperSessions,
+  getPlatformScraperSessionById,
+  pickScraperSessionForJob,
+  recordScraperActions,
+  savePlatformScraperSession,
   getConversationParticipantUsernames,
   createScrapeJob,
   updateScrapeJob,

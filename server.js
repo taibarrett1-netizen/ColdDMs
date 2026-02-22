@@ -21,6 +21,8 @@ const {
   getLatestScrapeJob,
   createScrapeJob,
   cancelScrapeJob,
+  pickScraperSessionForJob,
+  savePlatformScraperSession,
 } = require('./database/supabase');
 const { loadLeadsFromCSV, connectInstagram } = require('./bot');
 const { connectScraper, runFollowerScrape, runCommentScrape } = require('./scraper');
@@ -386,9 +388,9 @@ app.post('/api/scraper/start', async (req, res) => {
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
   }
   try {
-    const session = await getScraperSession(clientId);
-    if (!session?.session_data?.cookies?.length) {
-      return res.status(400).json({ ok: false, error: 'Scraper not connected' });
+    const picked = await pickScraperSessionForJob(clientId);
+    if (!picked?.session?.session_data?.cookies?.length) {
+      return res.status(400).json({ ok: false, error: 'Scraper not connected. Connect a scraper or add platform scraper accounts.' });
     }
 
     const targetForJob = scrapeType === 'followers' ? target_username.trim().replace(/^@/, '') : '_comment_scrape';
@@ -397,7 +399,8 @@ app.post('/api/scraper/start', async (req, res) => {
       targetForJob,
       lead_group_id || null,
       scrapeType,
-      scrapeType === 'comments' ? post_urls : null
+      scrapeType === 'comments' ? post_urls : null,
+      picked.platformSessionId || null
     );
 
     const scrapeOptions = {};
@@ -434,6 +437,29 @@ app.post('/api/scraper/stop', async (req, res) => {
   } catch (e) {
     console.error('[API] Scraper stop error', e);
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post('/api/scraper/connect-platform', async (req, res) => {
+  const { username, password, daily_actions_limit } = req.body || {};
+  if (!username || !password) {
+    return res.status(400).json({ ok: false, error: 'username and password are required' });
+  }
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
+  }
+  try {
+    const { connectScraper } = require('./scraper');
+    const { cookies, username: instagramUsername } = await connectScraper(username, password);
+    await savePlatformScraperSession(
+      { cookies },
+      instagramUsername,
+      daily_actions_limit != null ? daily_actions_limit : 500
+    );
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[API] Platform scraper connect error', e);
+    res.status(500).json({ ok: false, error: e.message || 'Login failed' });
   }
 });
 
