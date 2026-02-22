@@ -109,61 +109,22 @@ async function login(page, credentials) {
   await passEl.type(password, { delay: 80 + Math.floor(Math.random() * 60) });
   await humanDelay();
 
-  const submitResult = await page.evaluate(function () {
-    const out = { method: 'none', formFound: false, submitBtnFound: false, logInFound: false, formAction: '', inputsInForm: 0 };
-    const form = document.querySelector('form');
-    out.formFound = !!form;
-    if (form) {
-      out.formAction = (form.getAttribute('action') || '').slice(0, 80);
-      out.inputsInForm = form.querySelectorAll('input').length;
-    }
-    const submit = document.querySelector('button[type="submit"]');
-    out.submitBtnFound = !!(submit && submit.offsetParent);
-    const logIn = Array.from(document.querySelectorAll('button, div[role="button"], [role="button"]')).find(function (el) {
-      const t = (el.textContent || '').trim();
-      return (t === 'Log in' || t === 'Log In') && el.offsetParent !== null;
-    });
-    out.logInFound = !!logIn;
-
-    if (form && typeof form.requestSubmit === 'function') {
-      try { form.requestSubmit(); out.method = 'formRequestSubmit'; return out; } catch (e) { out.method = 'formRequestSubmit_err'; return out; }
-    }
-    if (form && typeof form.submit === 'function') {
-      form.submit();
-      out.method = 'formSubmit';
-      return out;
-    }
-    if (submit && submit.offsetParent) {
-      submit.scrollIntoView({ block: 'center' });
-      submit.click();
-      out.method = 'submitClick';
-      return out;
-    }
-    if (logIn) {
-      logIn.scrollIntoView({ block: 'center' });
-      logIn.click();
-      out.method = 'logInClick';
-      return out;
-    }
-    return out;
-  });
-
-  if (LOGIN_DEBUG || submitResult.method === 'none') {
-    logger.log('[LOGIN_DEBUG] formFound=' + submitResult.formFound + ' formAction=' + (submitResult.formAction || '') + ' inputsInForm=' + submitResult.inputsInForm + ' submitBtn=' + submitResult.submitBtnFound + ' logInBtn=' + submitResult.logInFound + ' method=' + submitResult.method);
+  let submitMethod = 'none';
+  const logInHandles = await page.$x("//button[contains(normalize-space(.), 'Log in')] | //div[@role='button'][contains(normalize-space(.), 'Log in')] | //span[normalize-space(.)='Log in']/ancestor::button | //span[normalize-space(.)='Log in']/ancestor::div[@role='button']");
+  if (logInHandles.length > 0) {
+    const btn = logInHandles[0];
+    await btn.evaluate((el) => el.scrollIntoView({ block: 'center' }));
+    await delay(300);
+    await btn.click({ delay: 80 });
+    submitMethod = 'puppeteerClick';
+    await btn.dispose().catch(() => {});
   }
-
-  if (submitResult.method === 'none') {
+  if (submitMethod === 'none') {
     await page.keyboard.press('Enter');
-    if (LOGIN_DEBUG) logger.log('[LOGIN_DEBUG] Fallback: pressed Enter');
+    submitMethod = 'enterKey';
   }
 
-  const inputsFilled = await page.evaluate(function () {
-    const ins = document.querySelectorAll('input[type="text"], input[type="email"], input:not([type])');
-    const userVal = Array.from(ins).find(function (i) { return i.offsetParent && (i.type === 'text' || i.type === 'email' || i.type === ''); });
-    const passIns = document.querySelector('input[type="password"]');
-    return { usernameLen: userVal ? (userVal.value || '').length : 0, passwordLen: passIns ? (passIns.value || '').length : 0 };
-  }).catch(() => ({}));
-  if (LOGIN_DEBUG) logger.log('[LOGIN_DEBUG] After submit attempt: usernameLen=' + (inputsFilled.usernameLen || 0) + ' passwordLen=' + (inputsFilled.passwordLen || 0));
+  if (LOGIN_DEBUG) logger.log('[LOGIN_DEBUG] submitMethod=' + submitMethod);
 
   logger.log('Submitted login form, waiting for redirect...');
   await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
@@ -204,7 +165,7 @@ async function login(page, credentials) {
     else if (lower.indexOf('username you entered') !== -1 || lower.indexOf("doesn't belong to an account") !== -1) hint = ' Username not found.';
     else if (lower.indexOf('challenge') !== -1 || lower.indexOf('suspicious') !== -1 || lower.indexOf('verify') !== -1) hint = ' Instagram may require manual verification (challenge/captcha). Try logging in manually in a browser first.';
     else if (lower.indexOf('try again later') !== -1 || lower.indexOf('too many requests') !== -1) hint = ' Rate limited. Try again later.';
-    logger.error('Login failed. submitMethod=' + (submitResult ? submitResult.method : '?') + ' formFound=' + (submitResult ? submitResult.formFound : '?') + ' url=' + urlAfterLogin);
+    logger.error('Login failed. submitMethod=' + submitMethod + ' url=' + urlAfterLogin);
     logger.error('Login failed. Page snippet: ' + bodySnippet.replace(/\n/g, ' ').slice(0, 400));
     throw new Error('Login may have failed; still on login page. Check credentials.' + hint);
   }
