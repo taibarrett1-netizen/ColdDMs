@@ -251,8 +251,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         const dialog = document.querySelector('[role="dialog"]');
         const root = dialog || document.body;
 
-        function isInSuggestedRow(anchor) {
-          var p = anchor.parentElement;
+        function isInSuggestedRow(el) {
+          var p = el.parentElement;
           for (var up = 0; up < 12 && p; up++) {
             var t = (p.textContent || '').toLowerCase();
             if (t.indexOf('suggested for you') !== -1 || t.indexOf('people you may know') !== -1 || t.indexOf('similar accounts') !== -1) return true;
@@ -261,19 +261,38 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           return false;
         }
 
-        const anchors = root.querySelectorAll('a[href^="/"]');
-        var debugData = debug ? { total: anchors.length, included: [], excluded: [], excludedReasons: [] } : null;
+        function isInRestrictedMessage(el) {
+          var p = el.parentElement;
+          for (var up = 0; up < 8 && p; up++) {
+            var t = (p.textContent || '').toLowerCase();
+            if (t.indexOf('can see all followers') !== -1 || t.indexOf('can see all following') !== -1) return true;
+            p = p.parentElement;
+          }
+          return false;
+        }
+
+        function parseUsernameFromHref(href) {
+          if (!href || typeof href !== 'string') return null;
+          var path = href.trim();
+          if (path.indexOf('http') === 0) {
+            try { path = new URL(path).pathname; } catch (e) { return null; }
+          }
+          var m = path.match(/^\/([^/?#]+)\/?$/);
+          if (!m) return null;
+          var u = m[1].toLowerCase();
+          if (u.length < 2 || u.length > 30 || !/^[a-z0-9._]+$/.test(u)) return null;
+          return u;
+        }
+
+        var anchors = root.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]');
+        var debugData = debug ? { total: anchors.length, fromSpans: 0, included: [], excluded: [], excludedReasons: [] } : null;
 
         for (var i = 0; i < anchors.length; i++) {
           var a = anchors[i];
-          const href = (a.getAttribute('href') || '').trim();
-          const m = href.match(/^\/([^/?#]+)\/?$/);
-          if (!m) continue;
-          var u = m[1].toLowerCase();
-          if (!u || u.length < 2 || u.length > 30 || !/^[a-z0-9._]+$/.test(u)) continue;
+          var u = parseUsernameFromHref(a.getAttribute('href'));
+          if (!u) continue;
 
-          var inSuggested = isInSuggestedRow(a);
-          if (inSuggested) {
+          if (isInSuggestedRow(a)) {
             if (debugData) debugData.excluded.push(u);
             continue;
           }
@@ -282,11 +301,26 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           if (debugData && debugData.included.length < 20) debugData.included.push(u);
         }
 
+        if (usernames.length === 0) {
+          var spans = root.querySelectorAll('span[dir="auto"]');
+          for (var si = 0; si < spans.length; si++) {
+            var sp = spans[si];
+            var txt = (sp.textContent || '').trim();
+            if (txt.length < 2 || txt.length > 30 || !/^[a-z0-9._]+$/.test(txt)) continue;
+            if (isInSuggestedRow(sp) || isInRestrictedMessage(sp)) continue;
+            var parentLink = sp.closest('a');
+            if (!parentLink) continue;
+            usernames.push(txt.toLowerCase());
+            if (debugData) debugData.fromSpans++;
+          }
+        }
+
         const deduped = [];
         for (var di = 0; di < usernames.length; di++) {
           if (deduped.indexOf(usernames[di]) === -1) deduped.push(usernames[di]);
         }
         if (debugData) {
+          debugData.total = anchors.length;
           return { usernames: deduped, debug: debugData };
         }
         return { usernames: deduped };
@@ -295,7 +329,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       const batch = Array.isArray(batchResult) ? batchResult : batchResult.usernames;
       if (SCRAPER_DEBUG && batchResult.debug) {
         const d = batchResult.debug;
-        logger.log('[Scraper] DEBUG: total profile links=' + d.total + ', included=' + d.included.length + ', excluded (suggested)=' + d.excluded.length);
+        logger.log('[Scraper] DEBUG: profile links=' + d.total + ', included=' + d.included.length + ', excluded=' + d.excluded.length + (d.fromSpans ? ', fromSpans=' + d.fromSpans : ''));
         if (d.included.length) logger.log('[Scraper] DEBUG included: ' + d.included.join(', '));
         if (d.excluded.length) logger.log('[Scraper] DEBUG excluded: ' + d.excluded.join(', '));
         if (scrollCount === 0) {
