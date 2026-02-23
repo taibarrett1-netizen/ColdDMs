@@ -109,7 +109,7 @@ async function login(page, credentials) {
     if (url.includes('instagram.com')) {
       if (allInstagramRequests.length < 20) allInstagramRequests.push({ method, url: url.slice(0, 120), status });
     }
-    if (url.includes('login') || (url.includes('accounts') && (url.includes('web') || url.includes('api')))) {
+    if (url.includes('login') || url.includes('ajax/bz') || (url.includes('accounts') && (url.includes('web') || url.includes('api')))) {
       try {
         let body = '';
         try { body = (await response.text()).slice(0, 500); } catch (e) {}
@@ -128,7 +128,10 @@ async function login(page, credentials) {
   await passEl.type(password, { delay: 80 + Math.floor(Math.random() * 60) });
   await humanDelay();
 
-  let submitMethod = 'none';
+  await page.keyboard.press('Enter');
+  await delay(800);
+  let submitMethod = 'enterKey';
+
   const clickTarget = await page.evaluate(function () {
     var el = null;
     var xpaths = [
@@ -150,13 +153,9 @@ async function login(page, credentials) {
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
   });
   if (clickTarget) {
-    await delay(300);
+    await delay(200);
     await page.mouse.click(clickTarget.x, clickTarget.y, { delay: 80 });
-    submitMethod = 'puppeteerClick';
-  }
-  if (submitMethod === 'none') {
-    await page.keyboard.press('Enter');
-    submitMethod = 'enterKey';
+    submitMethod = 'enterKeyThenClick';
   }
 
   if (LOGIN_DEBUG) logger.log('[LOGIN_DEBUG] submitMethod=' + submitMethod);
