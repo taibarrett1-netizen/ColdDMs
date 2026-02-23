@@ -100,11 +100,17 @@ async function login(page, credentials) {
   }
   const LOGIN_DEBUG = process.env.LOGIN_DEBUG === '1' || process.env.LOGIN_DEBUG === 'true';
   const loginResponses = [];
+  const allInstagramRequests = [];
   const respHandler = async (response) => {
     const url = response.url();
+    const status = response.status();
+    const req = response.request();
+    const method = req.method();
+    if (url.includes('instagram.com')) {
+      if (allInstagramRequests.length < 20) allInstagramRequests.push({ method, url: url.slice(0, 120), status });
+    }
     if (url.includes('login') || (url.includes('accounts') && (url.includes('web') || url.includes('api')))) {
       try {
-        const status = response.status();
         let body = '';
         try { body = (await response.text()).slice(0, 500); } catch (e) {}
         loginResponses.push({ url: url.slice(0, 100), status, body: body.slice(0, 300) });
@@ -196,7 +202,8 @@ async function login(page, credentials) {
     else if (lower.indexOf('challenge') !== -1 || lower.indexOf('suspicious') !== -1 || lower.indexOf('verify') !== -1) hint = ' Instagram may require manual verification (challenge/captcha). Try logging in manually in a browser first.';
     else if (lower.indexOf('try again later') !== -1 || lower.indexOf('too many requests') !== -1) hint = ' Rate limited. Try again later.';
     logger.error('Login failed. submitMethod=' + submitMethod + ' url=' + urlAfterLogin);
-    if (loginResponses.length) logger.error('Login API responses: ' + JSON.stringify(loginResponses.slice(-3)));
+    logger.error('Login API responses (count=' + loginResponses.length + '): ' + (loginResponses.length ? JSON.stringify(loginResponses.slice(-5)) : 'none captured'));
+    if (allInstagramRequests.length) logger.error('Recent Instagram requests: ' + JSON.stringify(allInstagramRequests.slice(-10)));
     logger.error('Login failed. Page snippet: ' + bodySnippet.replace(/\n/g, ' ').slice(0, 400));
     throw new Error('Login may have failed; still on login page. Check credentials.' + hint);
   }
