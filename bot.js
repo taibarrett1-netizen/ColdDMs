@@ -99,6 +99,19 @@ async function login(page, credentials) {
     if (el !== userEl && el !== passEl) el.dispose();
   }
   const LOGIN_DEBUG = process.env.LOGIN_DEBUG === '1' || process.env.LOGIN_DEBUG === 'true';
+  const loginResponses = [];
+  const respHandler = async (response) => {
+    const url = response.url();
+    if (url.includes('login') || (url.includes('accounts') && (url.includes('web') || url.includes('api')))) {
+      try {
+        const status = response.status();
+        let body = '';
+        try { body = (await response.text()).slice(0, 500); } catch (e) {}
+        loginResponses.push({ url: url.slice(0, 100), status, body: body.slice(0, 300) });
+      } catch (e) {}
+    }
+  };
+  page.on('response', respHandler);
 
   logger.log('Login form found, entering credentials...');
   await userEl.click();
@@ -172,6 +185,7 @@ async function login(page, credentials) {
   }
 
   await delay(2000);
+  page.off('response', respHandler);
   const urlAfterLogin = page.url();
   if (urlAfterLogin.includes('/accounts/login')) {
     const bodySnippet = await page.evaluate(() => (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 600)).catch(() => '');
@@ -182,6 +196,7 @@ async function login(page, credentials) {
     else if (lower.indexOf('challenge') !== -1 || lower.indexOf('suspicious') !== -1 || lower.indexOf('verify') !== -1) hint = ' Instagram may require manual verification (challenge/captcha). Try logging in manually in a browser first.';
     else if (lower.indexOf('try again later') !== -1 || lower.indexOf('too many requests') !== -1) hint = ' Rate limited. Try again later.';
     logger.error('Login failed. submitMethod=' + submitMethod + ' url=' + urlAfterLogin);
+    if (loginResponses.length) logger.error('Login API responses: ' + JSON.stringify(loginResponses.slice(-3)));
     logger.error('Login failed. Page snippet: ' + bodySnippet.replace(/\n/g, ' ').slice(0, 400));
     throw new Error('Login may have failed; still on login page. Check credentials.' + hint);
   }
