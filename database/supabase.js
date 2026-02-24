@@ -764,7 +764,7 @@ async function getNextPendingCampaignLead(clientId) {
     if (error || !clRow?.lead_id) continue;
     const { data: leadRow } = await sb
       .from('cold_dm_leads')
-      .select('username')
+      .select('username, first_name, last_name')
       .eq('id', clRow.lead_id)
       .eq('client_id', clientId)
       .maybeSingle();
@@ -774,6 +774,8 @@ async function getNextPendingCampaignLead(clientId) {
       campaignId: camp.id,
       leadId: clRow.lead_id,
       username: normalizeUsername(leadRow.username),
+      first_name: leadRow.first_name ?? null,
+      last_name: leadRow.last_name ?? null,
       messageText,
       messageGroupId: camp.message_group_id || null,
       dailySendLimit: camp.daily_send_limit,

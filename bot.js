@@ -9,6 +9,7 @@ const { alreadySent, logSentMessage, getDailyStats, normalizeUsername, getContro
 const sb = require('./database/supabase');
 const logger = require('./utils/logger');
 const { applyMobileEmulation } = require('./utils/mobile-viewport');
+const { substituteVariables } = require('./utils/message-variables');
 
 puppeteer.use(StealthPlugin());
 
@@ -586,8 +587,13 @@ async function runBotMultiTenant() {
       continue;
     }
 
+    const messageOverride = substituteVariables(work.messageText, {
+      username: work.username,
+      first_name: work.first_name,
+      last_name: work.last_name,
+    });
     const options = {
-      messageOverride: work.messageText,
+      messageOverride,
       campaignId: work.campaignId,
       campaignLeadId: work.campaignLeadId,
       messageGroupId: work.messageGroupId,
