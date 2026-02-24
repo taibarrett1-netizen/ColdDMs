@@ -10,6 +10,7 @@ const {
   getClientId,
   setClientId,
   setControl: setControlSupabase,
+  getClientStatusMessage: getClientStatusMessageSupabase,
   getDailyStats: getDailyStatsSupabase,
   getRecentSent: getRecentSentSupabase,
   clearFailedAttempts: clearFailedAttemptsSupabase,
@@ -74,13 +75,19 @@ app.get('/api/status', (req, res) => {
   getBotProcessRunning(async (processRunning) => {
     try {
       if (useSupabase) {
-        const stats = await getDailyStatsSupabase(clientId);
-        const leads = await getLeadsSupabase(clientId);
-        const { getSentUsernames } = require('./database/supabase');
-        const sentSet = await getSentUsernames(clientId);
+        const [stats, leads, statusMessage, sentSet] = await Promise.all([
+          getDailyStatsSupabase(clientId),
+          getLeadsSupabase(clientId),
+          getClientStatusMessageSupabase(clientId),
+          (async () => {
+            const { getSentUsernames } = require('./database/supabase');
+            return getSentUsernames(clientId);
+          })(),
+        ]);
         const remaining = leads.filter((u) => !sentSet.has(u.replace(/^@/, ''))).length;
         return res.json({
           processRunning,
+          statusMessage: statusMessage ?? null,
           todaySent: stats.total_sent,
           todayFailed: stats.total_failed,
           leadsTotal: leads.length,

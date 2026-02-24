@@ -274,6 +274,35 @@ async function setControl(clientId, pause) {
 }
 
 /**
+ * Set a human-readable status message for this client (e.g. "Sending…", "Hourly limit reached. Next send in ~60 min.").
+ * Dashboard can display this for running campaigns.
+ */
+async function setClientStatusMessage(clientId, message) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return;
+  const now = new Date().toISOString();
+  await sb
+    .from('cold_dm_control')
+    .update({ status_message: message == null ? null : String(message).slice(0, 500), status_updated_at: now, updated_at: now })
+    .eq('client_id', clientId);
+}
+
+/**
+ * Get the current status message for a client (set by the bot).
+ */
+async function getClientStatusMessage(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return null;
+  const { data, error } = await sb
+    .from('cold_dm_control')
+    .select('status_message')
+    .eq('client_id', clientId)
+    .maybeSingle();
+  if (error) return null;
+  return data?.status_message ?? null;
+}
+
+/**
  * Returns client_ids that have pause = 0 (sending allowed).
  * Used by multi-tenant worker to find clients that may have work.
  */
@@ -854,6 +883,8 @@ module.exports = {
   getHourlySent,
   getControl,
   setControl,
+  setClientStatusMessage,
+  getClientStatusMessage,
   getRecentSent,
   getSentUsernames,
   clearFailedAttempts,

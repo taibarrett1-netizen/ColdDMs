@@ -623,18 +623,25 @@ async function runBotMultiTenant() {
       first_name: work.first_name,
       last_name: work.last_name,
     };
+    sb.setClientStatusMessage(clientId, 'Sending…').catch(() => {});
     const sendResult = await sendDM(page, work.username, adapter, options);
 
     let delayMs;
     if (!sendResult.ok && sendResult.reason === 'hourly_limit') {
       delayMs = randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
       logger.log(`Hourly limit reached. Sleeping ${Math.round(delayMs / 60000)} minutes until window resets.`);
+      sb.setClientStatusMessage(clientId, 'Hourly limit reached. Next send in ~60 min.').catch(() => {});
+    } else if (!sendResult.ok && sendResult.reason === 'daily_limit') {
+      delayMs = randomDelay(5 * 60 * 1000, 10 * 60 * 1000);
+      logger.log(`Daily limit reached. Rechecking in ${Math.round(delayMs / 60000)} minutes.`);
+      sb.setClientStatusMessage(clientId, 'Daily limit reached.').catch(() => {});
     } else {
       delayMs =
         work.minDelaySec != null && work.maxDelaySec != null
           ? randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000)
           : randomDelay(minDelayMs, maxDelayMs);
       logger.log(`Next send in ${Math.round(delayMs / 60000)} minutes.`);
+      sb.setClientStatusMessage(clientId, `Waiting. Next send in ${Math.round(delayMs / 60000)} min.`).catch(() => {});
     }
     await delay(delayMs);
   }
