@@ -212,7 +212,7 @@ async function login(page, credentials) {
 
 const MAX_SEND_RETRIES = 3;
 
-async function sendDMOnce(page, u, msg) {
+async function sendDMOnce(page, u, messageTemplate, nameFallback = {}) {
   await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
   await humanDelay();
 
@@ -338,6 +338,28 @@ async function sendDMOnce(page, u, msg) {
     logger.log('Compose diagnostic: ' + JSON.stringify(diag));
   }
 
+  const displayNameFromPage = await page.evaluate(() => {
+    const body = document.body && document.body.innerText;
+    if (!body) return null;
+    const words = body.split(/\s+/).filter(Boolean);
+    for (let i = 0; i < words.length; i++) {
+      const w = words[i];
+      if (w.length >= 2 && w.length <= 30 && w === w.toLowerCase() && /^[a-z0-9._]+$/.test(w) && !/^https?:\/\//.test(w)) {
+        if (i >= 2) return { first_name: words[i - 2], last_name: words[i - 1] };
+        if (i >= 1) return { first_name: words[i - 1], last_name: '' };
+        return null;
+      }
+    }
+    return null;
+  });
+
+  const leadFromPage = {
+    username: u,
+    first_name: displayNameFromPage?.first_name ?? nameFallback.first_name ?? null,
+    last_name: displayNameFromPage?.last_name ?? nameFallback.last_name ?? null,
+  };
+  const msg = substituteVariables(messageTemplate, leadFromPage);
+
   if (composeFound) {
     const diag = await composeDiagnostic().catch(() => ({}));
     logger.log('Compose diagnostic: ' + JSON.stringify(diag));
@@ -369,7 +391,7 @@ async function sendDMOnce(page, u, msg) {
       await humanDelay();
       await page.keyboard.press('Enter');
       await delay(1500);
-      return { ok: true };
+      return { ok: true, finalMessage: msg };
     }
     await composeEl.dispose();
     logger.warn('Compose element not found after selector matched');
@@ -388,7 +410,7 @@ async function sendDMOnce(page, u, msg) {
     await humanDelay();
     await page.keyboard.press('Enter');
     await delay(1500);
-    return { ok: true };
+    return { ok: true, finalMessage: msg };
   }
 
   return { ok: false, reason: 'no_compose' };
@@ -418,21 +440,23 @@ async function sendDM(page, username, adapter, options = {}) {
     return { ok: false, reason: 'hourly_limit' };
   }
 
-  const msg = messageOverride || adapter.getRandomMessage();
-  const logSent = (status) => adapter.logSentMessage(u, msg, status, campaignId, messageGroupId);
+  const messageTemplate = messageOverride || adapter.getRandomMessage();
+  const logSent = (status, finalMsg) => adapter.logSentMessage(u, finalMsg != null ? finalMsg : messageTemplate, status, campaignId, messageGroupId);
 
   let lastError;
+  const nameFallback = { first_name: options.first_name, last_name: options.last_name };
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
-      const result = await sendDMOnce(page, u, msg);
+      const result = await sendDMOnce(page, u, messageTemplate, nameFallback);
       if (result.ok) {
-        await Promise.resolve(logSent('success'));
+        const finalMessage = result.finalMessage != null ? result.finalMessage : messageTemplate;
+        await Promise.resolve(logSent('success', finalMessage));
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent').catch(() => {});
-        logger.log(`Sent to @${u}: ${msg.slice(0, 30)}...`);
+        logger.log(`Sent to @${u}: ${(finalMessage || messageTemplate).slice(0, 30)}...`);
         return { ok: true };
       }
       if (result.reason === 'user_not_found' || result.reason === 'no_compose') {
-        await Promise.resolve(logSent('failed'));
+        await Promise.resolve(logSent('failed', result.finalMessage));
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed').catch(() => {});
         logger.warn(`Send failed for @${u}: ${result.reason}`);
         return result;
@@ -445,7 +469,7 @@ async function sendDM(page, username, adapter, options = {}) {
     }
   }
   logger.error(`Error sending to @${u} after ${MAX_SEND_RETRIES} retries`, lastError);
-  await Promise.resolve(logSent('failed'));
+  await Promise.resolve(logSent('failed', null));
   if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed').catch(() => {});
   return { ok: false, reason: lastError.message };
 }
@@ -587,13 +611,8 @@ async function runBotMultiTenant() {
       continue;
     }
 
-    const messageOverride = substituteVariables(work.messageText, {
-      username: work.username,
-      first_name: work.first_name,
-      last_name: work.last_name,
-    });
     const options = {
-      messageOverride,
+      messageOverride: work.messageText,
       campaignId: work.campaignId,
       campaignLeadId: work.campaignLeadId,
       messageGroupId: work.messageGroupId,
@@ -601,14 +620,22 @@ async function runBotMultiTenant() {
       hourlySendLimit: work.hourlySendLimit,
       minDelaySec: work.minDelaySec,
       maxDelaySec: work.maxDelaySec,
+      first_name: work.first_name,
+      last_name: work.last_name,
     };
-    await sendDM(page, work.username, adapter, options);
+    const sendResult = await sendDM(page, work.username, adapter, options);
 
-    const delayMs =
-      work.minDelaySec != null && work.maxDelaySec != null
-        ? randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000)
-        : randomDelay(minDelayMs, maxDelayMs);
-    logger.log(`Next send in ${Math.round(delayMs / 60000)} minutes.`);
+    let delayMs;
+    if (!sendResult.ok && sendResult.reason === 'hourly_limit') {
+      delayMs = randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
+      logger.log(`Hourly limit reached. Sleeping ${Math.round(delayMs / 60000)} minutes until window resets.`);
+    } else {
+      delayMs =
+        work.minDelaySec != null && work.maxDelaySec != null
+          ? randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000)
+          : randomDelay(minDelayMs, maxDelayMs);
+      logger.log(`Next send in ${Math.round(delayMs / 60000)} minutes.`);
+    }
     await delay(delayMs);
   }
 }

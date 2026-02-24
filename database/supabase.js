@@ -635,17 +635,37 @@ async function upsertLead(clientId, username, source) {
   if (error) throw error;
 }
 
-async function upsertLeadsBatch(clientId, usernames, source, leadGroupId = null) {
+/**
+ * @param {string} clientId
+ * @param {string[]|{ username: string, display_name?: string }[]} leadsOrUsernames - Usernames only (e.g. comment scrape) or { username, display_name } from follower scrape.
+ */
+async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
-  const rows = usernames.map((u) => {
+  const rows = leadsOrUsernames.map((item) => {
+    const username = typeof item === 'string' ? item : item.username;
+    const displayName = typeof item === 'string' ? null : (item.display_name || null);
+    let first_name = null;
+    let last_name = null;
+    if (displayName && typeof displayName === 'string') {
+      const trimmed = displayName.trim();
+      const spaceIdx = trimmed.indexOf(' ');
+      if (spaceIdx > 0) {
+        first_name = trimmed.slice(0, spaceIdx).trim();
+        last_name = trimmed.slice(spaceIdx + 1).trim();
+      } else {
+        first_name = trimmed;
+      }
+    }
     const row = {
       client_id: clientId,
-      username: normalizeUsername(u),
+      username: normalizeUsername(username),
       source: source || null,
       added_at: new Date().toISOString(),
     };
     if (leadGroupId) row.lead_group_id = leadGroupId;
+    if (first_name != null) row.first_name = first_name;
+    if (last_name != null) row.last_name = last_name;
     return row;
   });
   if (rows.length === 0) return 0;

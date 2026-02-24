@@ -270,7 +270,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       }
 
       const batchResult = await page.evaluate((debug) => {
-        const usernames = [];
+        const leads = [];
         const dialog = document.querySelector('[role="dialog"]');
         const root = dialog || document.body;
 
@@ -307,6 +307,20 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           return u;
         }
 
+        function getDisplayNameFromAnchor(anchor, username) {
+          var spans = anchor.querySelectorAll('span[dir="auto"], span');
+          var withSpace = null;
+          var fallback = null;
+          for (var i = 0; i < spans.length; i++) {
+            var txt = (spans[i].textContent || '').trim();
+            if (!txt || txt.toLowerCase() === username) continue;
+            if (txt.length > 50) continue;
+            if (txt.indexOf(' ') !== -1) withSpace = txt;
+            else if (!fallback) fallback = txt;
+          }
+          return withSpace || fallback || null;
+        }
+
         var anchors = root.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]');
         var debugData = debug ? { total: anchors.length, fromSpans: 0, included: [], excluded: [], excludedReasons: [] } : null;
 
@@ -320,11 +334,12 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
             continue;
           }
 
-          usernames.push(u);
+          var displayName = getDisplayNameFromAnchor(a, u);
+          leads.push({ username: u, display_name: displayName });
           if (debugData && debugData.included.length < 20) debugData.included.push(u);
         }
 
-        if (usernames.length === 0) {
+        if (leads.length === 0) {
           var spans = root.querySelectorAll('span[dir="auto"]');
           for (var si = 0; si < spans.length; si++) {
             var sp = spans[si];
@@ -333,23 +348,30 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
             if (isInSuggestedRow(sp) || isInRestrictedMessage(sp)) continue;
             var parentLink = sp.closest('a');
             if (!parentLink) continue;
-            usernames.push(txt.toLowerCase());
+            var u = txt.toLowerCase();
+            var displayName = parentLink ? getDisplayNameFromAnchor(parentLink, u) : null;
+            leads.push({ username: u, display_name: displayName });
             if (debugData) debugData.fromSpans++;
           }
         }
 
-        const deduped = [];
-        for (var di = 0; di < usernames.length; di++) {
-          if (deduped.indexOf(usernames[di]) === -1) deduped.push(usernames[di]);
+        var seen = {};
+        var deduped = [];
+        for (var di = 0; di < leads.length; di++) {
+          var L = leads[di];
+          if (!seen[L.username]) {
+            seen[L.username] = true;
+            deduped.push(L);
+          }
         }
         if (debugData) {
           debugData.total = anchors.length;
-          return { usernames: deduped, debug: debugData };
+          return { leads: deduped, debug: debugData };
         }
-        return { usernames: deduped };
+        return { leads: deduped };
       }, SCRAPER_DEBUG);
 
-      const batch = Array.isArray(batchResult) ? batchResult : batchResult.usernames;
+      const batch = batchResult.leads || [];
       if (SCRAPER_DEBUG && batchResult.debug) {
         const d = batchResult.debug;
         logger.log('[Scraper] DEBUG: profile links=' + d.total + ', included=' + d.included.length + ', excluded=' + d.excluded.length + (d.fromSpans ? ', fromSpans=' + d.fromSpans : ''));
@@ -371,23 +393,35 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         }
       }
 
-      let newUsernames = batch.filter(
-        (u) => !seenUsernames.has(u) && !BLACKLIST.has(u) && u !== cleanTarget
+      let newLeads = batch.filter(
+        (lead) => {
+          const u = typeof lead === 'string' ? lead : lead.username;
+          return !seenUsernames.has(u) && !BLACKLIST.has(u) && u !== cleanTarget;
+        }
       );
       const inConvos = await getConversationParticipantUsernames(clientId);
-      newUsernames = newUsernames.filter((u) => !inConvos.has(u));
-      newUsernames = [...new Set(newUsernames)];
-      if (effectiveMax && totalScraped + newUsernames.length > effectiveMax) {
-        newUsernames = newUsernames.slice(0, effectiveMax - totalScraped);
+      newLeads = newLeads.filter((lead) => {
+        const u = typeof lead === 'string' ? lead : lead.username;
+        return !inConvos.has(u);
+      });
+      const seenBatch = new Set();
+      newLeads = newLeads.filter((lead) => {
+        const u = typeof lead === 'string' ? lead : lead.username;
+        if (seenBatch.has(u)) return false;
+        seenBatch.add(u);
+        return true;
+      });
+      if (effectiveMax && totalScraped + newLeads.length > effectiveMax) {
+        newLeads = newLeads.slice(0, effectiveMax - totalScraped);
       }
-      for (const u of newUsernames) seenUsernames.add(u);
+      for (const lead of newLeads) seenUsernames.add(typeof lead === 'string' ? lead : lead.username);
 
-      if (newUsernames.length > 0) {
-        await upsertLeadsBatch(clientId, newUsernames, source, leadGroupId);
+      if (newLeads.length > 0) {
+        await upsertLeadsBatch(clientId, newLeads, source, leadGroupId);
         totalScraped = seenUsernames.size;
         await updateScrapeJob(jobId, { scraped_count: totalScraped });
         noNewCount = 0;
-        logger.log(`[Scraper] Batch: +${newUsernames.length} new, total ${totalScraped}`);
+        logger.log(`[Scraper] Batch: +${newLeads.length} new, total ${totalScraped}`);
         if (effectiveMax && totalScraped >= effectiveMax) {
           logger.log(`[Scraper] Reached limit (${effectiveMax}). Stopping.`);
           break;
