@@ -65,6 +65,8 @@ No inbound firewall ports are needed for the bot; it only makes outbound connect
 
 ## 7. Run with PM2
 
+Start the **ig-dm-bot** worker once and keep it running. It is a single long-running process that serves all clients (when using Supabase).
+
 ```bash
 npm install -g pm2
 pm2 start cli.js --name ig-dm-bot -- --start
@@ -72,6 +74,8 @@ pm2 save
 pm2 startup
 # Run the command that pm2 startup prints (so the bot restarts on reboot)
 ```
+
+**Always-on worker (Supabase):** The worker process should stay running. **Start** and **Stop** in the dashboard do **not** start or stop the process. They only set the per-client pause flag in the database (`cold_dm_control.pause`). Start = allow sending for that client (`pause = 0`). Stop = stop sending for that client (`pause = 1`). The worker keeps running and will skip clients that are paused; when there is no work for any client it sleeps 30–60s and re-checks. Start the worker once at deploy; the dashboard only toggles who is allowed to send.
 
 **Useful commands**
 

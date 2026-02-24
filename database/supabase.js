@@ -273,6 +273,37 @@ async function setControl(clientId, pause) {
   if (error) throw error;
 }
 
+/**
+ * Returns client_ids that have pause = 0 (sending allowed).
+ * Used by multi-tenant worker to find clients that may have work.
+ */
+async function getClientIdsWithPauseZero() {
+  const sb = getSupabase();
+  if (!sb) return [];
+  const { data, error } = await sb
+    .from('cold_dm_control')
+    .select('client_id')
+    .eq('pause', 0)
+    .order('client_id', { ascending: true });
+  if (error) throw error;
+  return (data || []).map((r) => r.client_id).filter(Boolean);
+}
+
+/**
+ * Returns next pending work from any client with pause = 0.
+ * Tries clients in order; returns first client that has a pending campaign lead.
+ * @returns {Promise<{ clientId: string, work: object } | null>}
+ */
+async function getNextPendingWorkAnyClient() {
+  const clientIds = await getClientIdsWithPauseZero();
+  if (clientIds.length === 0) return null;
+  for (const clientId of clientIds) {
+    const work = await getNextPendingCampaignLead(clientId);
+    if (work) return { clientId, work };
+  }
+  return null;
+}
+
 async function getRecentSent(clientId, limit = 50) {
   const sb = getSupabase();
   if (!sb || !clientId) return [];
@@ -775,6 +806,8 @@ async function updateCampaignLeadStatus(campaignLeadId, status) {
       .eq('status', 'pending');
     if (count === 0) {
       await sb.from('cold_dm_campaigns').update({ status: 'completed', updated_at: new Date().toISOString() }).eq('id', row.campaign_id);
+      const { data: camp } = await sb.from('cold_dm_campaigns').select('client_id').eq('id', row.campaign_id).maybeSingle();
+      if (camp?.client_id) await setControl(camp.client_id, 1);
     }
   }
 }
@@ -822,4 +855,6 @@ module.exports = {
   getMessageTemplateById,
   getNextPendingCampaignLead,
   updateCampaignLeadStatus,
+  getClientIdsWithPauseZero,
+  getNextPendingWorkAnyClient,
 };

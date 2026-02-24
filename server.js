@@ -253,12 +253,27 @@ app.post('/api/control/start', (req, res) => {
   const clientId = req.body?.clientId;
   if (isSupabaseConfigured()) {
     if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
-    setClientId(clientId);
     setControlSupabase(clientId, 0).catch((e) => console.error('[API] setControlSupabase', e));
-  } else {
-    setControl('pause', '0');
+    console.log('[API] Start (pause=0) for clientId=', clientId);
+    getBotProcessRunning((processRunning) => {
+      if (processRunning) {
+        return res.json({ ok: true, processRunning: true });
+      }
+      exec(`pm2 start cli.js --name ${BOT_PM2_NAME} -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
+        const out = (stdout || '') + (stderr || '');
+        const alreadyRunning = /already (running|launched)|online/i.test(out);
+        if (err && !alreadyRunning) {
+          console.error('[API] Start failed', err, stderr);
+          return res.status(500).json({ ok: false, error: (stderr || err.message || '').toString().trim() });
+        }
+        console.log('[API] Worker started (was not running).');
+        res.json({ ok: true, processRunning: true });
+      });
+    });
+    return;
   }
-  console.log('[API] Start bot requested', clientId ? `clientId=${clientId}` : '');
+  setControl('pause', '0');
+  console.log('[API] Start bot requested (legacy)');
   exec(`pm2 start cli.js --name ${BOT_PM2_NAME} -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
     const out = (stdout || '') + (stderr || '');
     const alreadyRunning = /already (running|launched)|online/i.test(out);
@@ -468,10 +483,12 @@ app.post('/api/control/stop', (req, res) => {
   if (isSupabaseConfigured()) {
     if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
     setControlSupabase(clientId, 1).catch((e) => console.error('[API] setControlSupabase', e));
-  } else {
-    setControl('pause', '1');
+    console.log('[API] Stop (pause=1) for clientId=', clientId, '- worker process is not stopped.');
+    getBotProcessRunning((processRunning) => res.json({ ok: true, processRunning }));
+    return;
   }
-  console.log('[API] Stop bot requested', clientId ? `clientId=${clientId}` : '');
+  setControl('pause', '1');
+  console.log('[API] Stop bot requested (legacy)');
   exec(`pm2 stop ${BOT_PM2_NAME}`, (err, stdout, stderr) => {
     if (err) {
       console.error('[API] Stop failed', err, stderr);

@@ -467,109 +467,192 @@ function loadLeadsFromCSV(csvPath) {
   });
 }
 
-async function runBot() {
-  const useSupabase = sb.isSupabaseConfigured();
-  const clientId = useSupabase ? sb.getClientId() : null;
-  if (useSupabase && !clientId) {
-    logger.error('Supabase configured but no clientId (set COLD_DM_CLIENT_ID or start via dashboard with clientId).');
-    throw new Error('No clientId for Cold DM bot.');
+/** Build adapter and delays for a client (Supabase multi-tenant). Returns null if client has no templates (should not happen for campaign work). */
+async function buildAdapterForClient(clientId) {
+  const settings = await sb.getSettings(clientId);
+  const messages = await sb.getMessageTemplates(clientId);
+  const minDelayMs = (settings?.min_delay_minutes ?? 5) * 60 * 1000;
+  const maxDelayMs = (settings?.max_delay_minutes ?? 30) * 60 * 1000;
+  const adapter = {
+    dailyLimit: Math.min(settings?.daily_send_limit ?? 100, 200),
+    maxPerHour: settings?.max_sends_per_hour ?? 20,
+    alreadySent: (u) => sb.alreadySent(clientId, u),
+    logSentMessage: (u, msg, status, campaignId, messageGroupId) =>
+      sb.logSentMessage(clientId, u, msg, status, campaignId, messageGroupId),
+    getDailyStats: () => sb.getDailyStats(clientId),
+    getHourlySent: () => sb.getHourlySent(clientId),
+    getControl: () => sb.getControl(clientId),
+    setControl: (v) => sb.setControl(clientId, v),
+    getRandomMessage: () =>
+      messages?.length ? messages[Math.floor(Math.random() * messages.length)] : '',
+  };
+  return { adapter, minDelayMs, maxDelayMs };
+}
+
+const NO_WORK_SLEEP_MS_MIN = 30 * 1000;
+const NO_WORK_SLEEP_MS_MAX = 60 * 1000;
+
+/**
+ * Multi-tenant always-on loop: one worker serves all clients with pause=0 and pending work.
+ * Never exits; sleeps and re-checks when no work.
+ */
+async function runBotMultiTenant() {
+  logger.log('Starting multi-tenant sender loop (always-on).');
+  const launchOpts = {
+    headless: HEADLESS,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  };
+  let browser;
+  try {
+    browser = await puppeteer.launch(launchOpts);
+  } catch (e) {
+    logger.error('Browser launch failed', e);
+    throw e;
+  }
+  let page;
+  let currentSessionId = null;
+  const campaignRoundRobin = new Map();
+
+  async function ensurePageSession(pg, session) {
+    const cookies = session?.session_data?.cookies;
+    if (!cookies?.length) return false;
+    if (currentSessionId === session.id) return true;
+    try {
+      const existing = await pg.cookies();
+      if (existing.length) await pg.deleteCookie(...existing);
+      await pg.setCookie(...cookies);
+      await pg.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+      await delay(2000);
+      if (pg.url().includes('/accounts/login')) {
+        logger.error('Instagram session expired for account ' + (session.instagram_username || session.id));
+        return false;
+      }
+      currentSessionId = session.id;
+      return true;
+    } catch (e) {
+      logger.error('Failed to switch session: ' + e.message);
+      return false;
+    }
   }
 
+  try {
+    page = await browser.newPage();
+    await applyMobileEmulation(page);
+  } catch (err) {
+    logger.error('Page setup failed', err);
+    await browser.close().catch(() => {});
+    throw err;
+  }
+
+  for (;;) {
+    const next = await sb.getNextPendingWorkAnyClient();
+    if (!next) {
+      const sleepMs = randomDelay(NO_WORK_SLEEP_MS_MIN, NO_WORK_SLEEP_MS_MAX);
+      logger.log(`No work for any client. Rechecking in ${Math.round(sleepMs / 1000)}s.`);
+      await delay(sleepMs);
+      continue;
+    }
+    const { clientId, work } = next;
+    const pause = await sb.getControl(clientId);
+    if (pause === '1' || pause === 1) {
+      continue;
+    }
+    const built = await buildAdapterForClient(clientId);
+    if (!built) {
+      logger.warn('No adapter for client ' + clientId + ', skipping.');
+      continue;
+    }
+    const { adapter, minDelayMs, maxDelayMs } = built;
+
+    const sessions = await sb.getSessionsForCampaign(clientId, work.campaignId);
+    if (!sessions || sessions.length === 0) {
+      logger.warn('No sessions for campaign ' + work.campaignId + ', failing lead.');
+      await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed').catch(() => {});
+      await delay(randomDelay(2000, 5000));
+      continue;
+    }
+    let state = campaignRoundRobin.get(work.campaignId);
+    if (!state) {
+      state = { lastIndex: -1 };
+      campaignRoundRobin.set(work.campaignId, state);
+    }
+    state.lastIndex = (state.lastIndex + 1) % sessions.length;
+    const session = sessions[state.lastIndex];
+    const ok = await ensurePageSession(page, session);
+    if (!ok) {
+      logger.warn('Could not load session for campaign, failing lead.');
+      await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed').catch(() => {});
+      await delay(randomDelay(2000, 5000));
+      continue;
+    }
+
+    const options = {
+      messageOverride: work.messageText,
+      campaignId: work.campaignId,
+      campaignLeadId: work.campaignLeadId,
+      messageGroupId: work.messageGroupId,
+      dailySendLimit: work.dailySendLimit,
+      hourlySendLimit: work.hourlySendLimit,
+      minDelaySec: work.minDelaySec,
+      maxDelaySec: work.maxDelaySec,
+    };
+    await sendDM(page, work.username, adapter, options);
+
+    const delayMs =
+      work.minDelaySec != null && work.maxDelaySec != null
+        ? randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000)
+        : randomDelay(minDelayMs, maxDelayMs);
+    logger.log(`Next send in ${Math.round(delayMs / 60000)} minutes.`);
+    await delay(delayMs);
+  }
+}
+
+async function runBot() {
+  const useSupabase = sb.isSupabaseConfigured();
+
+  if (useSupabase) {
+    await runBotMultiTenant();
+    return;
+  }
+
+  const clientId = sb.getClientId();
   let leads;
   let adapter;
-  let getNextWork = null;
   let minDelayMs = MIN_DELAY_MS;
   let maxDelayMs = MAX_DELAY_MS;
 
-  if (useSupabase && clientId) {
-    const settings = await sb.getSettings(clientId);
-    const messages = await sb.getMessageTemplates(clientId);
-    leads = await sb.getLeads(clientId);
-    const session = await sb.getSession(clientId);
-    if (!session || !session.session_data || !session.session_data.cookies) {
-      throw new Error('No Instagram session. Connect Instagram from the Cold Outreach tab first.');
-    }
-    if (!messages || messages.length === 0) {
-      throw new Error('No message templates. Add at least one in Cold Outreach.');
-    }
-    minDelayMs = (settings?.min_delay_minutes ?? 5) * 60 * 1000;
-    maxDelayMs = (settings?.max_delay_minutes ?? 30) * 60 * 1000;
-    adapter = {
-      dailyLimit: Math.min(settings?.daily_send_limit ?? 100, 200),
-      maxPerHour: settings?.max_sends_per_hour ?? 20,
-      alreadySent: (u) => sb.alreadySent(clientId, u),
-      logSentMessage: (u, msg, status, campaignId, messageGroupId) =>
-        sb.logSentMessage(clientId, u, msg, status, campaignId, messageGroupId),
-      getDailyStats: () => sb.getDailyStats(clientId),
-      getHourlySent: () => sb.getHourlySent(clientId),
-      getControl: () => sb.getControl(clientId),
-      setControl: (v) => sb.setControl(clientId, v),
-      getRandomMessage: () => messages[Math.floor(Math.random() * messages.length)],
-    };
-    getNextWork = async () => {
-      const campaign = await sb.getNextPendingCampaignLead(clientId);
-      if (campaign) {
-        return {
-          type: 'campaign',
-          username: campaign.username,
-          messageOverride: campaign.messageText,
-          campaignId: campaign.campaignId,
-          campaignLeadId: campaign.campaignLeadId,
-          messageGroupId: campaign.messageGroupId,
-          dailySendLimit: campaign.dailySendLimit,
-          hourlySendLimit: campaign.hourlySendLimit,
-          minDelaySec: campaign.minDelaySec,
-          maxDelaySec: campaign.maxDelaySec,
-        };
-      }
-      return null;
-    };
-    const filtered = [];
-    for (const u of leads) {
-      const sent = await sb.alreadySent(clientId, u);
-      if (!sent) filtered.push(u);
-    }
-    leads = filtered;
-  } else {
-    const csvPath = process.env.LEADS_CSV || 'leads.csv';
-    try {
-      leads = await loadLeadsFromCSV(csvPath);
-    } catch (e) {
-      logger.error('Failed to load leads', e);
-      throw e;
-    }
-    leads = leads.filter((u) => !alreadySent(u));
-    adapter = {
-      dailyLimit: DAILY_LIMIT,
-      maxPerHour: MAX_PER_HOUR,
-      alreadySent: (u) => alreadySent(u),
-      logSentMessage: (u, msg, status, _campaignId) => logSentMessage(u, msg, status),
-      getDailyStats: () => getDailyStats(),
-      getHourlySent: () => getHourlySent(),
-      getControl: () => getControl('pause'),
-      setControl: (v) => setControl('pause', v),
-      getRandomMessage: () => getRandomMessage(),
-    };
+  const csvPath = process.env.LEADS_CSV || 'leads.csv';
+  try {
+    leads = await loadLeadsFromCSV(csvPath);
+  } catch (e) {
+    logger.error('Failed to load leads', e);
+    throw e;
   }
+  leads = leads.filter((u) => !alreadySent(u));
+  adapter = {
+    dailyLimit: DAILY_LIMIT,
+    maxPerHour: MAX_PER_HOUR,
+    alreadySent: (u) => alreadySent(u),
+    logSentMessage: (u, msg, status, _campaignId) => logSentMessage(u, msg, status),
+    getDailyStats: () => getDailyStats(),
+    getHourlySent: () => getHourlySent(),
+    getControl: () => getControl('pause'),
+    setControl: (v) => setControl('pause', v),
+    getRandomMessage: () => getRandomMessage(),
+  };
 
-  if (useSupabase && clientId) {
-    const work = await getNextWork();
-    if (!work) {
-      logger.log('No campaign leads or leads to send. Done.');
-      return;
-    }
-  } else if (leads.length === 0) {
+  if (leads.length === 0) {
     logger.log('No leads to send. Done.');
     return;
   }
 
-  logger.log(`Starting sender loop${useSupabase && clientId ? ' (campaign-aware)' : ''}.`);
+  logger.log('Starting sender loop (legacy CSV mode).');
 
   const launchOpts = {
     headless: HEADLESS,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
   };
-  const useSessionCookies = useSupabase && clientId;
+  const useSessionCookies = false;
   if (!useSessionCookies) {
     try {
       if (!fs.existsSync(BROWSER_PROFILE_DIR)) fs.mkdirSync(BROWSER_PROFILE_DIR, { recursive: true });
@@ -649,62 +732,16 @@ async function runBot() {
       setTimeout(runOne, 30000);
       return;
     }
-    let work;
-    if (getNextWork) {
-      work = await getNextWork();
-      if (!work) {
-        logger.log('All campaign leads and leads processed.');
-        await browser.close();
-        process.exit(0);
-      }
-    } else {
-      if (index >= leads.length) {
-        logger.log('All leads processed.');
-        await browser.close();
-        process.exit(0);
-      }
-      work = { type: 'lead', username: leads[index] };
+    if (index >= leads.length) {
+      logger.log('All leads processed.');
+      await browser.close();
+      process.exit(0);
     }
-    const options =
-      work.type === 'campaign'
-        ? {
-            messageOverride: work.messageOverride,
-            campaignId: work.campaignId,
-            campaignLeadId: work.campaignLeadId,
-            messageGroupId: work.messageGroupId,
-            dailySendLimit: work.dailySendLimit,
-            hourlySendLimit: work.hourlySendLimit,
-            minDelaySec: work.minDelaySec,
-            maxDelaySec: work.maxDelaySec,
-          }
-        : {};
-
-    if (work.type === 'campaign' && useSessionCookies && clientId) {
-      const sessions = await sb.getSessionsForCampaign(clientId, work.campaignId);
-      if (sessions.length === 0) {
-        logger.warn('No sessions for campaign ' + work.campaignId + ', skipping lead.');
-        await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed').catch(() => {});
-        setImmediate(runOne);
-        return;
-      }
-      let state = campaignRoundRobin.get(work.campaignId);
-      if (!state) {
-        state = { lastIndex: -1 };
-        campaignRoundRobin.set(work.campaignId, state);
-      }
-      state.lastIndex = (state.lastIndex + 1) % sessions.length;
-      const session = sessions[state.lastIndex];
-      const ok = await ensurePageSession(page, session);
-      if (!ok) {
-        logger.warn('Could not load session for campaign, failing lead.');
-        await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed').catch(() => {});
-        setImmediate(runOne);
-        return;
-      }
-    }
+    const work = { type: 'lead', username: leads[index] };
+    const options = {};
 
     const result = await sendDM(page, work.username, adapter, options);
-    if (result.ok && !getNextWork) index += 1;
+    if (result.ok) index += 1;
 
     const delayMs =
       work.type === 'campaign' && work.minDelaySec != null && work.maxDelaySec != null
