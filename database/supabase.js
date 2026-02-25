@@ -44,6 +44,23 @@ function getToday() {
   return new Date().toISOString().slice(0, 10);
 }
 
+/** Returns YYYY-MM-DD in the given IANA timezone; falls back to UTC if invalid/missing. */
+function getTodayInTimezone(timezone) {
+  if (!timezone || typeof timezone !== 'string') return getToday();
+  try {
+    return new Date().toLocaleDateString('en-CA', { timeZone: timezone.trim() });
+  } catch (e) {
+    return getToday();
+  }
+}
+
+/** Returns "today" (YYYY-MM-DD) in the client's configured timezone for daily stats/limits. */
+async function getTodayForClient(clientId) {
+  const settings = await getSettings(clientId);
+  const tz = settings?.timezone;
+  return getTodayInTimezone(tz);
+}
+
 function normalizeUsername(username) {
   const u = String(username).trim();
   return u.startsWith('@') ? u.slice(1) : u;
@@ -175,7 +192,7 @@ async function logSentMessage(clientId, username, message, status = 'success', c
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
   const u = normalizeUsername(username);
-  const date = getToday();
+  const date = await getTodayForClient(clientId);
   const insertPayload = {
     client_id: clientId,
     username: u,
@@ -219,7 +236,7 @@ async function logSentMessage(clientId, username, message, status = 'success', c
 async function getDailyStats(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return { date: getToday(), total_sent: 0, total_failed: 0 };
-  const date = getToday();
+  const date = await getTodayForClient(clientId);
   const { data, error } = await sb
     .from('cold_dm_daily_stats')
     .select('total_sent, total_failed')
@@ -333,6 +350,75 @@ async function getNextPendingWorkAnyClient() {
   return null;
 }
 
+/**
+ * If the client has pending campaign leads but is currently outside all campaign schedule windows (in their timezone), returns a status message. Otherwise null.
+ */
+async function getClientOutsideScheduleStatus(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return null;
+  const settings = await getSettings(clientId);
+  const timezone = settings?.timezone || null;
+  const tzLabel = timezone || 'UTC';
+  const campaigns = await getActiveCampaigns(clientId);
+  let firstWindow = null;
+  let hasPending = false;
+  let allOutside = true;
+  for (const camp of campaigns) {
+    const { count, error: err } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', camp.id)
+      .eq('status', 'pending');
+    if (err || (count ?? 0) === 0) continue;
+    hasPending = true;
+    const inSchedule = isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, timezone);
+    if (inSchedule) {
+      allOutside = false;
+      break;
+    }
+    if (!firstWindow && (camp.schedule_start_time || camp.schedule_end_time)) {
+      const start = camp.schedule_start_time ? String(camp.schedule_start_time).slice(0, 5) : '00:00';
+      const end = camp.schedule_end_time ? String(camp.schedule_end_time).slice(0, 5) : '24:00';
+      firstWindow = `${start}–${end}`;
+    }
+  }
+  if (!hasPending || !allOutside || !firstWindow) return null;
+  return `Outside schedule. Sends between ${firstWindow} (${tzLabel}).`;
+}
+
+/**
+ * Returns the status message and reason when there is no sendable work for this client
+ * (outside schedule, daily limit, hourly limit, or no pending leads).
+ * @returns {{ message: string | null, reason: 'outside_schedule' | 'daily_limit' | 'hourly_limit' | 'no_pending' }}
+ */
+async function getClientNoWorkReason(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return { message: null, reason: 'no_pending' };
+  const outsideMsg = await getClientOutsideScheduleStatus(clientId);
+  if (outsideMsg) return { message: outsideMsg, reason: 'outside_schedule' };
+
+  const campaigns = await getActiveCampaigns(clientId);
+  const campaignIds = (campaigns || []).map((c) => c.id).filter(Boolean);
+  if (campaignIds.length === 0) return { message: null, reason: 'no_pending' };
+  const { count: pendingCount } = await sb
+    .from('cold_dm_campaign_leads')
+    .select('*', { count: 'exact', head: true })
+    .in('campaign_id', campaignIds)
+    .eq('status', 'pending');
+  if ((pendingCount ?? 0) === 0) return { message: null, reason: 'no_pending' };
+
+  const [stats, hourlySent, settings] = await Promise.all([
+    getDailyStats(clientId),
+    getHourlySent(clientId),
+    getSettings(clientId),
+  ]);
+  const dailyLimit = settings?.daily_send_limit ?? 100;
+  const hourlyLimit = settings?.max_sends_per_hour ?? 20;
+  if (stats.total_sent >= dailyLimit) return { message: 'Daily limit reached.', reason: 'daily_limit' };
+  if (hourlySent >= hourlyLimit) return { message: 'Hourly limit reached.', reason: 'hourly_limit' };
+  return { message: null, reason: 'no_pending' };
+}
+
 async function getRecentSent(clientId, limit = 50) {
   const sb = getSupabase();
   if (!sb || !clientId) return [];
@@ -360,7 +446,7 @@ async function getSentUsernames(clientId) {
 async function clearFailedAttempts(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return 0;
-  const date = getToday();
+  const date = await getTodayForClient(clientId);
   const { data: deleted } = await sb
     .from('cold_dm_sent_messages')
     .delete()
@@ -724,10 +810,23 @@ async function getActiveCampaigns(clientId) {
   return data || [];
 }
 
-function isWithinSchedule(scheduleStart, scheduleEnd) {
+/**
+ * @param {string} [timezone] - IANA timezone (e.g. Europe/Berlin). If omitted, uses UTC.
+ */
+function isWithinSchedule(scheduleStart, scheduleEnd, timezone) {
   if (!scheduleStart && !scheduleEnd) return true;
   const now = new Date();
-  const current = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
+  let current;
+  if (timezone) {
+    try {
+      current = now.toLocaleTimeString('en-CA', { timeZone: timezone, hour12: false });
+      if (current.length === 7) current = '0' + current;
+    } catch (e) {
+      current = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
+    }
+  } else {
+    current = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
+  }
   const start = scheduleStart ? String(scheduleStart).slice(0, 8) : '00:00:00';
   const end = scheduleEnd ? String(scheduleEnd).slice(0, 8) : '23:59:59';
   if (start <= end) return current >= start && current <= end;
@@ -761,9 +860,11 @@ async function getMessageTemplateById(templateId) {
 async function getNextPendingCampaignLead(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return null;
+  const settings = await getSettings(clientId);
+  const timezone = settings?.timezone || null;
   const campaigns = await getActiveCampaigns(clientId);
   for (const camp of campaigns) {
-    if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time)) continue;
+    if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, timezone)) continue;
     let messageText = null;
     if (camp.message_group_id) {
       messageText = await getRandomMessageFromGroup(camp.message_group_id);
@@ -818,6 +919,13 @@ async function getNextPendingCampaignLead(clientId) {
       .eq('client_id', clientId)
       .maybeSingle();
     if (!leadRow?.username) continue;
+
+    const [stats, hourlySent] = await Promise.all([getDailyStats(clientId), getHourlySent(clientId)]);
+    const dailyLimit = camp.daily_send_limit ?? settings?.daily_send_limit ?? 100;
+    const hourlyLimit = camp.hourly_send_limit ?? settings?.max_sends_per_hour ?? 20;
+    if (stats.total_sent >= dailyLimit) continue;
+    if (hourlySent >= hourlyLimit) continue;
+
     return {
       campaignLeadId: clRow.id,
       campaignId: camp.id,
@@ -910,4 +1018,6 @@ module.exports = {
   updateCampaignLeadStatus,
   getClientIdsWithPauseZero,
   getNextPendingWorkAnyClient,
+  getClientOutsideScheduleStatus,
+  getClientNoWorkReason,
 };

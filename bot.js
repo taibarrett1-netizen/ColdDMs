@@ -572,8 +572,20 @@ async function runBotMultiTenant() {
   for (;;) {
     const next = await sb.getNextPendingWorkAnyClient();
     if (!next) {
+      const clientIds = await sb.getClientIdsWithPauseZero();
+      const reasons = new Set();
+      for (const cid of clientIds) {
+        const { message, reason } = await sb.getClientNoWorkReason(cid).catch(() => ({ message: null, reason: 'no_pending' }));
+        if (message) await sb.setClientStatusMessage(cid, message).catch(() => {});
+        if (reason && reason !== 'no_pending') reasons.add(reason);
+      }
       const sleepMs = randomDelay(NO_WORK_SLEEP_MS_MIN, NO_WORK_SLEEP_MS_MAX);
-      logger.log(`No work for any client. Rechecking in ${Math.round(sleepMs / 1000)}s.`);
+      const reasonLog =
+        reasons.has('outside_schedule') ? 'Outside schedule. Pending leads waiting for send window.'
+        : reasons.has('daily_limit') ? 'Daily limit reached.'
+        : reasons.has('hourly_limit') ? 'Hourly limit reached.'
+        : 'No work for any client.';
+      logger.log(`${reasonLog} Rechecking in ${Math.round(sleepMs / 1000)}s.`);
       await delay(sleepMs);
       continue;
     }

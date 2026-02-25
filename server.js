@@ -11,6 +11,7 @@ const {
   setClientId,
   setControl: setControlSupabase,
   getClientStatusMessage: getClientStatusMessageSupabase,
+  getClientOutsideScheduleStatus,
   getDailyStats: getDailyStatsSupabase,
   getRecentSent: getRecentSentSupabase,
   clearFailedAttempts: clearFailedAttemptsSupabase,
@@ -75,19 +76,21 @@ app.get('/api/status', (req, res) => {
   getBotProcessRunning(async (processRunning) => {
     try {
       if (useSupabase) {
-        const [stats, leads, statusMessage, sentSet] = await Promise.all([
+        const [stats, leads, statusMessage, outsideSchedule, sentSet] = await Promise.all([
           getDailyStatsSupabase(clientId),
           getLeadsSupabase(clientId),
           getClientStatusMessageSupabase(clientId),
+          getClientOutsideScheduleStatus(clientId),
           (async () => {
             const { getSentUsernames } = require('./database/supabase');
             return getSentUsernames(clientId);
           })(),
         ]);
         const remaining = leads.filter((u) => !sentSet.has(u.replace(/^@/, ''))).length;
+        const displayStatus = (outsideSchedule && String(outsideSchedule).trim()) ? outsideSchedule : (statusMessage ?? null);
         return res.json({
           processRunning,
-          statusMessage: statusMessage ?? null,
+          statusMessage: displayStatus,
           todaySent: stats.total_sent,
           todayFailed: stats.total_failed,
           leadsTotal: leads.length,
