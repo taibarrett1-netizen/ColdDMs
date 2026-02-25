@@ -132,58 +132,49 @@ async function login(page, credentials) {
   const submitStyle = (process.env.LOGIN_SUBMIT || 'click').toLowerCase();
   let submitMethod = 'click';
 
-  const clickTarget = await page.evaluate(function () {
-    var el = null;
-    var xpaths = [
-      "//button[normalize-space(.)='Log in']",
-      "//div[@role='button'][normalize-space(.)='Log in']",
-      "//span[normalize-space(.)='Log in']/parent::button",
-      "//span[normalize-space(.)='Log in']/parent::div[@role='button']",
-      "//button[contains(., 'Log in') and not(contains(., 'Log into'))]",
-      "//div[@role='button'][contains(., 'Log in') and not(contains(., 'Log into'))]"
-    ];
-    for (var i = 0; i < xpaths.length; i++) {
-      var r = document.evaluate(xpaths[i], document, null, 9, null);
-      el = r.singleNodeValue;
-      if (el && el.offsetParent) break;
-    }
-    if (!el) return null;
-    el.scrollIntoView({ block: 'center' });
-    var rect = el.getBoundingClientRect();
-    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-  });
-
   if (submitStyle === 'enter' || submitStyle === 'enterthenclick') {
     await page.keyboard.press('Enter');
     await delay(800);
-    submitMethod = 'enterKey';
+    submitMethod = submitStyle === 'enter' ? 'enterKey' : 'enterKeyThenClick';
   }
-  if (clickTarget && (submitStyle !== 'enter')) {
-    await delay(200);
-    await page.mouse.click(clickTarget.x, clickTarget.y, { delay: 80 });
-    if (submitMethod === 'enterKey') submitMethod = 'enterKeyThenClick';
-    else submitMethod = 'click';
+  if (submitStyle !== 'enter') {
+    const clicked = await page.evaluate(function () {
+      var xpaths = [
+        "//button[normalize-space(.)='Log in']",
+        "//div[@role='button'][normalize-space(.)='Log in']",
+        "//span[normalize-space(.)='Log in']/parent::button",
+        "//span[normalize-space(.)='Log in']/parent::div[@role='button']",
+        "//button[contains(., 'Log in') and not(contains(., 'Log into'))]",
+        "//div[@role='button'][contains(., 'Log in') and not(contains(., 'Log into'))]"
+      ];
+      for (var i = 0; i < xpaths.length; i++) {
+        var r = document.evaluate(xpaths[i], document, null, 9, null);
+        var el = r.singleNodeValue;
+        if (el && el.offsetParent) { el.scrollIntoView({ block: 'center' }); el.click(); return true; }
+      }
+      return false;
+    });
+    if (clicked) submitMethod = submitStyle === 'enterthenclick' ? 'enterKeyThenClick' : 'click';
   }
 
   if (LOGIN_DEBUG) logger.log('[LOGIN_DEBUG] submitMethod=' + submitMethod);
 
   logger.log('Submitted login form, waiting for redirect...');
-  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
 
-  const loginWaitMs = Math.min(parseInt(process.env.LOGIN_WAIT_MS, 10) || 60000, 90000);
-  const pollIntervalMs = 2000;
+  const loginWaitMs = Math.min(parseInt(process.env.LOGIN_WAIT_MS, 10) || 20000, 90000);
+  const pollIntervalMs = 1000;
   const deadline = Date.now() + loginWaitMs;
-  let lastUrl = page.url();
+  const startedAt = Date.now();
   while (Date.now() < deadline) {
     await delay(pollIntervalMs);
     const url = page.url();
     if (!url.includes('/accounts/login')) {
-      logger.log('Redirect detected after ' + Math.round((Date.now() - (deadline - loginWaitMs)) / 1000) + 's');
+      logger.log('Redirect detected after ' + Math.round((Date.now() - startedAt) / 1000) + 's');
       break;
     }
-    if (url !== lastUrl) lastUrl = url;
   }
-  await delay(3000);
+  await delay(1500);
 
   if (page.url().includes('/accounts/login')) {
     logger.log('Still on login page; retrying submit (click only)...');
@@ -202,13 +193,13 @@ async function login(page, credentials) {
       return false;
     });
     if (retryClick) {
-      await delay(2000);
-      const retryDeadline = Date.now() + 30000;
+      await delay(1000);
+      const retryDeadline = Date.now() + 20000;
       while (Date.now() < retryDeadline) {
-        await delay(2000);
+        await delay(pollIntervalMs);
         if (!page.url().includes('/accounts/login')) break;
       }
-      await delay(2000);
+      await delay(1500);
     }
   }
 
