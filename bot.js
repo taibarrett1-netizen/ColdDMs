@@ -129,9 +129,8 @@ async function login(page, credentials) {
   await passEl.type(password, { delay: 80 + Math.floor(Math.random() * 60) });
   await humanDelay();
 
-  await page.keyboard.press('Enter');
-  await delay(800);
-  let submitMethod = 'enterKey';
+  const submitStyle = (process.env.LOGIN_SUBMIT || 'click').toLowerCase();
+  let submitMethod = 'click';
 
   const clickTarget = await page.evaluate(function () {
     var el = null;
@@ -153,17 +152,65 @@ async function login(page, credentials) {
     var rect = el.getBoundingClientRect();
     return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
   });
-  if (clickTarget) {
+
+  if (submitStyle === 'enter' || submitStyle === 'enterthenclick') {
+    await page.keyboard.press('Enter');
+    await delay(800);
+    submitMethod = 'enterKey';
+  }
+  if (clickTarget && (submitStyle !== 'enter')) {
     await delay(200);
     await page.mouse.click(clickTarget.x, clickTarget.y, { delay: 80 });
-    submitMethod = 'enterKeyThenClick';
+    if (submitMethod === 'enterKey') submitMethod = 'enterKeyThenClick';
+    else submitMethod = 'click';
   }
 
   if (LOGIN_DEBUG) logger.log('[LOGIN_DEBUG] submitMethod=' + submitMethod);
 
   logger.log('Submitted login form, waiting for redirect...');
-  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
-  await delay(4000);
+  await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+
+  const loginWaitMs = Math.min(parseInt(process.env.LOGIN_WAIT_MS, 10) || 60000, 90000);
+  const pollIntervalMs = 2000;
+  const deadline = Date.now() + loginWaitMs;
+  let lastUrl = page.url();
+  while (Date.now() < deadline) {
+    await delay(pollIntervalMs);
+    const url = page.url();
+    if (!url.includes('/accounts/login')) {
+      logger.log('Redirect detected after ' + Math.round((Date.now() - (deadline - loginWaitMs)) / 1000) + 's');
+      break;
+    }
+    if (url !== lastUrl) lastUrl = url;
+  }
+  await delay(3000);
+
+  if (page.url().includes('/accounts/login')) {
+    logger.log('Still on login page; retrying submit (click only)...');
+    const retryClick = await page.evaluate(function () {
+      var xpaths = [
+        "//button[normalize-space(.)='Log in']",
+        "//div[@role='button'][normalize-space(.)='Log in']",
+        "//span[normalize-space(.)='Log in']/parent::button",
+        "//span[normalize-space(.)='Log in']/parent::div[@role='button']"
+      ];
+      for (var i = 0; i < xpaths.length; i++) {
+        var r = document.evaluate(xpaths[i], document, null, 9, null);
+        var el = r.singleNodeValue;
+        if (el && el.offsetParent) { el.scrollIntoView({ block: 'center' }); el.click(); return true; }
+      }
+      return false;
+    });
+    if (retryClick) {
+      await delay(2000);
+      const retryDeadline = Date.now() + 30000;
+      while (Date.now() < retryDeadline) {
+        await delay(2000);
+        if (!page.url().includes('/accounts/login')) break;
+      }
+      await delay(2000);
+    }
+  }
 
   for (let i = 0; i < 3; i++) {
     const dismissed = await page.evaluate(function () {
@@ -199,8 +246,9 @@ async function login(page, credentials) {
     const lower = bodySnippet.toLowerCase();
     if (lower.indexOf('password was incorrect') !== -1 || lower.indexOf('incorrect password') !== -1) hint = ' Wrong password.';
     else if (lower.indexOf('username you entered') !== -1 || lower.indexOf("doesn't belong to an account") !== -1) hint = ' Username not found.';
-    else if (lower.indexOf('challenge') !== -1 || lower.indexOf('suspicious') !== -1 || lower.indexOf('verify') !== -1) hint = ' Instagram may require manual verification (challenge/captcha). Try logging in manually in a browser first.';
-    else if (lower.indexOf('try again later') !== -1 || lower.indexOf('too many requests') !== -1) hint = ' Rate limited. Try again later.';
+    else if (lower.indexOf('challenge') !== -1 || lower.indexOf('suspicious') !== -1 || lower.indexOf('verify') !== -1 || lower.indexOf('confirm it\'s you') !== -1 || lower.indexOf('security code') !== -1) hint = ' Instagram may require manual verification. Log in once in a normal browser (Chrome/Firefox), complete any challenge, then try again here.';
+    else if (lower.indexOf('try again later') !== -1 || lower.indexOf('too many requests') !== -1) hint = ' Rate limited. Try again in 30–60 minutes.';
+    else hint = ' If your password is correct, log in once in a normal browser to clear any security check, then retry.';
     logger.error('Login failed. submitMethod=' + submitMethod + ' url=' + urlAfterLogin);
     logger.error('Login API responses (count=' + loginResponses.length + '): ' + (loginResponses.length ? JSON.stringify(loginResponses.slice(-5)) : 'none captured'));
     if (allInstagramRequests.length) logger.error('Recent Instagram requests: ' + JSON.stringify(allInstagramRequests.slice(-10)));
