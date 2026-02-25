@@ -903,22 +903,38 @@ async function getNextPendingCampaignLead(clientId) {
       }
     }
 
-    const { data: clRow, error } = await sb
-      .from('cold_dm_campaign_leads')
-      .select('id, lead_id')
-      .eq('campaign_id', camp.id)
-      .eq('status', 'pending')
-      .order('id', { ascending: true })
-      .limit(1)
-      .maybeSingle();
-    if (error || !clRow?.lead_id) continue;
-    const { data: leadRow } = await sb
-      .from('cold_dm_leads')
-      .select('username, first_name, last_name')
-      .eq('id', clRow.lead_id)
-      .eq('client_id', clientId)
-      .maybeSingle();
-    if (!leadRow?.username) continue;
+    let clRow = null;
+    let leadRow = null;
+    for (;;) {
+      const { data: pendingRow, error } = await sb
+        .from('cold_dm_campaign_leads')
+        .select('id, lead_id')
+        .eq('campaign_id', camp.id)
+        .eq('status', 'pending')
+        .order('id', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+      if (error || !pendingRow?.lead_id) break;
+      const { data: leadData } = await sb
+        .from('cold_dm_leads')
+        .select('username, first_name, last_name')
+        .eq('id', pendingRow.lead_id)
+        .eq('client_id', clientId)
+        .maybeSingle();
+      if (!leadData?.username) {
+        await updateCampaignLeadStatus(pendingRow.id, 'failed').catch(() => {});
+        continue;
+      }
+      const sent = await alreadySent(clientId, leadData.username);
+      if (sent) {
+        await updateCampaignLeadStatus(pendingRow.id, 'sent').catch(() => {});
+        continue;
+      }
+      clRow = pendingRow;
+      leadRow = leadData;
+      break;
+    }
+    if (!clRow || !leadRow) continue;
 
     const [stats, hourlySent] = await Promise.all([getDailyStats(clientId), getHourlySent(clientId)]);
     const dailyLimit = camp.daily_send_limit ?? settings?.daily_send_limit ?? 100;

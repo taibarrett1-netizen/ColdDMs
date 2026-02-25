@@ -516,6 +516,7 @@ async function buildAdapterForClient(clientId) {
 
 const NO_WORK_SLEEP_MS_MIN = 30 * 1000;
 const NO_WORK_SLEEP_MS_MAX = 60 * 1000;
+const NO_WORK_LOG_THROTTLE_MS = 5 * 60 * 1000; // only log same no-work reason at most every 5 min
 
 /**
  * Multi-tenant always-on loop: one worker serves all clients with pause=0 and pending work.
@@ -537,6 +538,8 @@ async function runBotMultiTenant() {
   let page;
   let currentSessionId = null;
   const campaignRoundRobin = new Map();
+  let lastNoWorkLogTime = 0;
+  let lastNoWorkReason = '';
 
   async function ensurePageSession(pg, session) {
     const cookies = session?.session_data?.cookies;
@@ -585,10 +588,17 @@ async function runBotMultiTenant() {
         : reasons.has('daily_limit') ? 'Daily limit reached.'
         : reasons.has('hourly_limit') ? 'Hourly limit reached.'
         : 'No work for any client.';
-      logger.log(`${reasonLog} Rechecking in ${Math.round(sleepMs / 1000)}s.`);
+      const now = Date.now();
+      const shouldLog = reasonLog !== lastNoWorkReason || now - lastNoWorkLogTime >= NO_WORK_LOG_THROTTLE_MS;
+      if (shouldLog) {
+        logger.log(`${reasonLog} Rechecking in ${Math.round(sleepMs / 1000)}s.`);
+        lastNoWorkReason = reasonLog;
+        lastNoWorkLogTime = now;
+      }
       await delay(sleepMs);
       continue;
     }
+    lastNoWorkReason = '';
     const { clientId, work } = next;
     const pause = await sb.getControl(clientId);
     if (pause === '1' || pause === 1) {
