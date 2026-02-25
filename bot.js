@@ -514,9 +514,7 @@ async function buildAdapterForClient(clientId) {
   return { adapter, minDelayMs, maxDelayMs };
 }
 
-const NO_WORK_SLEEP_MS_MIN = 30 * 1000;
-const NO_WORK_SLEEP_MS_MAX = 60 * 1000;
-const NO_WORK_LOG_THROTTLE_MS = 5 * 60 * 1000; // only log same no-work reason at most every 5 min
+// When there's no work we exit; user starts the bot again from the dashboard when they want to run.
 
 /**
  * Multi-tenant always-on loop: one worker serves all clients with pause=0 and pending work.
@@ -538,8 +536,6 @@ async function runBotMultiTenant() {
   let page;
   let currentSessionId = null;
   const campaignRoundRobin = new Map();
-  let lastNoWorkLogTime = 0;
-  let lastNoWorkReason = '';
 
   async function ensurePageSession(pg, session) {
     const cookies = session?.session_data?.cookies;
@@ -576,29 +572,28 @@ async function runBotMultiTenant() {
     const next = await sb.getNextPendingWorkAnyClient();
     if (!next) {
       const clientIds = await sb.getClientIdsWithPauseZero();
-      const reasons = new Set();
+      let earliestResumeAt = null;
+      let resumeReason = '';
       for (const cid of clientIds) {
-        const { message, reason } = await sb.getClientNoWorkReason(cid).catch(() => ({ message: null, reason: 'no_pending' }));
-        if (message) await sb.setClientStatusMessage(cid, message).catch(() => {});
-        if (reason && reason !== 'no_pending') reasons.add(reason);
+        const info = await sb.getClientNoWorkResumeAt(cid).catch(() => ({ message: null, reason: 'no_pending', resumeAt: null }));
+        if (info.message) await sb.setClientStatusMessage(cid, info.message).catch(() => {});
+        if (info.reason === 'no_pending') continue;
+        if (info.resumeAt && (!earliestResumeAt || info.resumeAt.getTime() < earliestResumeAt.getTime())) {
+          earliestResumeAt = info.resumeAt;
+          resumeReason = info.reason;
+        }
       }
-      const sleepMs = randomDelay(NO_WORK_SLEEP_MS_MIN, NO_WORK_SLEEP_MS_MAX);
-      const reasonLog =
-        reasons.has('outside_schedule') ? 'Outside schedule. Pending leads waiting for send window.'
-        : reasons.has('daily_limit') ? 'Daily limit reached.'
-        : reasons.has('hourly_limit') ? 'Hourly limit reached.'
-        : 'No work for any client.';
-      const now = Date.now();
-      const shouldLog = reasonLog !== lastNoWorkReason || now - lastNoWorkLogTime >= NO_WORK_LOG_THROTTLE_MS;
-      if (shouldLog) {
-        logger.log(`${reasonLog} Rechecking in ${Math.round(sleepMs / 1000)}s.`);
-        lastNoWorkReason = reasonLog;
-        lastNoWorkLogTime = now;
+      if (!earliestResumeAt) {
+        logger.log('No work. Exiting. Start again from the dashboard when you have a campaign to run.');
+        await browser.close().catch(() => {});
+        process.exit(0);
       }
+      const sleepMs = Math.max(1000, earliestResumeAt.getTime() - Date.now());
+      const sleepMin = Math.round(sleepMs / 60000);
+      logger.log(`Paused (${resumeReason}). Resuming in ${sleepMin} min at ${earliestResumeAt.toISOString().slice(0, 16)}.`);
       await delay(sleepMs);
       continue;
     }
-    lastNoWorkReason = '';
     const { clientId, work } = next;
     const pause = await sb.getControl(clientId);
     if (pause === '1' || pause === 1) {

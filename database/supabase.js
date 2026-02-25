@@ -61,6 +61,102 @@ async function getTodayForClient(clientId) {
   return getTodayInTimezone(tz);
 }
 
+/** Returns the UTC Date for the start of the next calendar day (midnight) in the given IANA timezone. */
+function getNextMidnightInTimezone(timezone) {
+  if (!timezone || typeof timezone !== 'string') return new Date(Date.now() + 24 * 60 * 60 * 1000);
+  try {
+    const now = new Date();
+    const todayStr = getTodayInTimezone(timezone);
+    const [y, m, d] = todayStr.split('-').map(Number);
+    const tomorrowDate = new Date(Date.UTC(y, m - 1, d + 1));
+    const tomorrowStr = tomorrowDate.toLocaleDateString('en-CA', { timeZone: timezone.trim() });
+    let low = now.getTime();
+    let high = now.getTime() + 48 * 60 * 60 * 1000;
+    while (high - low > 60000) {
+      const mid = Math.floor((low + high) / 2);
+      const d2 = new Date(mid);
+      const datePart = d2.toLocaleDateString('en-CA', { timeZone: timezone.trim() });
+      const timePart = d2.toLocaleTimeString('en-CA', { timeZone: timezone.trim(), hour12: false });
+      if (datePart < tomorrowStr || (datePart === tomorrowStr && timePart.slice(0, 5) < '00:00')) low = mid + 1;
+      else high = mid;
+    }
+    return new Date(low);
+  } catch (e) {
+    return new Date(Date.now() + 24 * 60 * 60 * 1000);
+  }
+}
+
+/** Returns the UTC Date for the start of the next hour in the given IANA timezone. */
+function getNextHourStartInTimezone(timezone) {
+  if (!timezone || typeof timezone !== 'string') {
+    const d = new Date();
+    return new Date(d.getTime() + (60 - d.getUTCMinutes()) * 60 * 1000 - d.getUTCSeconds() * 1000);
+  }
+  try {
+    const now = new Date();
+    const tz = timezone.trim();
+    const timeStr = now.toLocaleTimeString('en-CA', { timeZone: tz, hour12: false });
+    const dateStr = now.toLocaleDateString('en-CA', { timeZone: tz });
+    const [h] = timeStr.split(':').map(Number);
+    const nextHour = (h + 1) % 24;
+    const targetDateStr = nextHour === 0 ? new Date(now.getTime() + 24 * 60 * 60 * 1000).toLocaleDateString('en-CA', { timeZone: tz }) : dateStr;
+    const targetTime = `${String(nextHour).padStart(2, '0')}:00`;
+    let low = now.getTime();
+    let high = now.getTime() + 2 * 60 * 60 * 1000;
+    while (high - low > 60000) {
+      const mid = Math.floor((low + high) / 2);
+      const d = new Date(mid);
+      const dStr = d.toLocaleDateString('en-CA', { timeZone: tz });
+      const tStr = d.toLocaleTimeString('en-CA', { timeZone: tz, hour12: false }).slice(0, 5);
+      if (dStr < targetDateStr || (dStr === targetDateStr && tStr < targetTime)) low = mid + 1;
+      else high = mid;
+    }
+    return new Date(low);
+  } catch (e) {
+    const d = new Date();
+    return new Date(d.getTime() + (60 - d.getUTCMinutes()) * 60 * 1000 - d.getUTCSeconds() * 1000);
+  }
+}
+
+/** Returns the UTC Date for the next time the schedule window opens (scheduleStart today or tomorrow in TZ). */
+function getNextScheduleStartInTimezone(scheduleStartTime, timezone) {
+  if (!scheduleStartTime) return null;
+  const startStr = String(scheduleStartTime).slice(0, 8);
+  const [sh, sm] = startStr.split(':').map(Number);
+  const startTime = `${String(sh).padStart(2, '0')}:${String(sm || 0).padStart(2, '0')}`;
+  if (!timezone || typeof timezone !== 'string') {
+    const now = new Date();
+    let next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), sh, sm || 0, 0));
+    if (next.getTime() <= now.getTime()) next = new Date(next.getTime() + 24 * 60 * 60 * 1000);
+    return next;
+  }
+  try {
+    const now = new Date();
+    const tz = timezone.trim();
+    const todayStr = getTodayInTimezone(tz);
+    const tomorrowStr = new Date(now.getTime() + 24 * 60 * 60 * 1000).toLocaleDateString('en-CA', { timeZone: tz });
+    const findMoment = (dateStr) => {
+      let low = now.getTime();
+      let high = now.getTime() + 48 * 60 * 60 * 1000;
+      while (high - low > 60000) {
+        const mid = Math.floor((low + high) / 2);
+        const d = new Date(mid);
+        const dStr = d.toLocaleDateString('en-CA', { timeZone: tz });
+        const tStr = d.toLocaleTimeString('en-CA', { timeZone: tz, hour12: false }).slice(0, 5);
+        if (dStr < dateStr || (dStr === dateStr && tStr < startTime)) low = mid + 1;
+        else high = mid;
+      }
+      return new Date(low);
+    };
+    const todayStart = findMoment(todayStr);
+    const tomorrowStart = findMoment(tomorrowStr);
+    if (todayStart.getTime() > now.getTime()) return todayStart;
+    return tomorrowStart;
+  } catch (e) {
+    return null;
+  }
+}
+
 function normalizeUsername(username) {
   const u = String(username).trim();
   return u.startsWith('@') ? u.slice(1) : u;
@@ -351,16 +447,14 @@ async function getNextPendingWorkAnyClient() {
 }
 
 /**
- * If the client has pending campaign leads but is currently outside all campaign schedule windows (in their timezone), returns a status message. Otherwise null.
+ * If the client has pending campaign leads but is currently outside all campaign schedule windows (per campaign timezone), returns a status message. Otherwise null.
  */
 async function getClientOutsideScheduleStatus(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return null;
-  const settings = await getSettings(clientId);
-  const timezone = settings?.timezone || null;
-  const tzLabel = timezone || 'UTC';
   const campaigns = await getActiveCampaigns(clientId);
   let firstWindow = null;
+  let tzLabel = 'UTC';
   let hasPending = false;
   let allOutside = true;
   for (const camp of campaigns) {
@@ -371,7 +465,8 @@ async function getClientOutsideScheduleStatus(clientId) {
       .eq('status', 'pending');
     if (err || (count ?? 0) === 0) continue;
     hasPending = true;
-    const inSchedule = isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, timezone);
+    const campaignTz = camp.timezone ?? null;
+    const inSchedule = isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz);
     if (inSchedule) {
       allOutside = false;
       break;
@@ -380,6 +475,7 @@ async function getClientOutsideScheduleStatus(clientId) {
       const start = camp.schedule_start_time ? String(camp.schedule_start_time).slice(0, 5) : '00:00';
       const end = camp.schedule_end_time ? String(camp.schedule_end_time).slice(0, 5) : '24:00';
       firstWindow = `${start}–${end}`;
+      tzLabel = campaignTz || 'UTC';
     }
   }
   if (!hasPending || !allOutside || !firstWindow) return null;
@@ -392,31 +488,87 @@ async function getClientOutsideScheduleStatus(clientId) {
  * @returns {{ message: string | null, reason: 'outside_schedule' | 'daily_limit' | 'hourly_limit' | 'no_pending' }}
  */
 async function getClientNoWorkReason(clientId) {
-  const sb = getSupabase();
-  if (!sb || !clientId) return { message: null, reason: 'no_pending' };
-  const outsideMsg = await getClientOutsideScheduleStatus(clientId);
-  if (outsideMsg) return { message: outsideMsg, reason: 'outside_schedule' };
+  const r = await getClientNoWorkResumeAt(clientId);
+  return { message: r.message, reason: r.reason };
+}
 
+/**
+ * Returns message, reason, and resumeAt (UTC Date) when we should wake and retry.
+ * resumeAt is null only when reason is 'no_pending' (campaign completed).
+ */
+async function getClientNoWorkResumeAt(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return { message: null, reason: 'no_pending', resumeAt: null };
+
+  const settings = await getSettings(clientId);
   const campaigns = await getActiveCampaigns(clientId);
   const campaignIds = (campaigns || []).map((c) => c.id).filter(Boolean);
-  if (campaignIds.length === 0) return { message: null, reason: 'no_pending' };
-  const { count: pendingCount } = await sb
-    .from('cold_dm_campaign_leads')
-    .select('*', { count: 'exact', head: true })
-    .in('campaign_id', campaignIds)
-    .eq('status', 'pending');
-  if ((pendingCount ?? 0) === 0) return { message: null, reason: 'no_pending' };
 
-  const [stats, hourlySent, settings] = await Promise.all([
-    getDailyStats(clientId),
-    getHourlySent(clientId),
-    getSettings(clientId),
-  ]);
+  const { count: pendingCount } =
+    campaignIds.length > 0
+      ? await sb
+          .from('cold_dm_campaign_leads')
+          .select('*', { count: 'exact', head: true })
+          .in('campaign_id', campaignIds)
+          .eq('status', 'pending')
+      : { count: 0 };
+  if ((pendingCount ?? 0) === 0) return { message: null, reason: 'no_pending', resumeAt: null };
+
+  let earliestScheduleResume = null;
+  let firstWindow = null;
+  let tzLabel = 'UTC';
+  let allOutside = true;
+  for (const camp of campaigns) {
+    const { count: campPending } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', camp.id)
+      .eq('status', 'pending');
+    if ((campPending ?? 0) === 0) continue;
+    const campaignTz = camp.timezone ?? null;
+    const inSchedule = isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz);
+    if (inSchedule) {
+      allOutside = false;
+      break;
+    }
+    if (!firstWindow && (camp.schedule_start_time || camp.schedule_end_time)) {
+      const start = camp.schedule_start_time ? String(camp.schedule_start_time).slice(0, 5) : '00:00';
+      const end = camp.schedule_end_time ? String(camp.schedule_end_time).slice(0, 5) : '24:00';
+      firstWindow = `${start}–${end}`;
+      tzLabel = campaignTz || 'UTC';
+    }
+    const nextStart = getNextScheduleStartInTimezone(camp.schedule_start_time, campaignTz);
+    if (nextStart && (!earliestScheduleResume || nextStart.getTime() < earliestScheduleResume.getTime())) {
+      earliestScheduleResume = nextStart;
+    }
+  }
+  if (allOutside && earliestScheduleResume && firstWindow) {
+    return {
+      message: `Outside schedule. Sends between ${firstWindow} (${tzLabel}).`,
+      reason: 'outside_schedule',
+      resumeAt: earliestScheduleResume,
+    };
+  }
+
+  const clientTz = settings?.timezone ?? null;
+  const [stats, hourlySent] = await Promise.all([getDailyStats(clientId), getHourlySent(clientId)]);
   const dailyLimit = settings?.daily_send_limit ?? 100;
   const hourlyLimit = settings?.max_sends_per_hour ?? 20;
-  if (stats.total_sent >= dailyLimit) return { message: 'Daily limit reached.', reason: 'daily_limit' };
-  if (hourlySent >= hourlyLimit) return { message: 'Hourly limit reached.', reason: 'hourly_limit' };
-  return { message: null, reason: 'no_pending' };
+  if (stats.total_sent >= dailyLimit) {
+    return {
+      message: 'Daily limit reached.',
+      reason: 'daily_limit',
+      resumeAt: getNextMidnightInTimezone(clientTz),
+    };
+  }
+  if (hourlySent >= hourlyLimit) {
+    return {
+      message: 'Hourly limit reached.',
+      reason: 'hourly_limit',
+      resumeAt: getNextHourStartInTimezone(clientTz),
+    };
+  }
+  return { message: null, reason: 'no_pending', resumeAt: null };
 }
 
 async function getRecentSent(clientId, limit = 50) {
@@ -795,13 +947,14 @@ async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId 
 }
 
 // --- Campaigns ---
+// Campaign config (timezone, schedule, limits, delays) is read from DB on every get-next-work / can-run check. Do not cache; re-evaluate when user changes campaign in dashboard.
 async function getActiveCampaigns(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return [];
   const { data, error } = await sb
     .from('cold_dm_campaigns')
     .select(
-      'id, name, message_template_id, message_group_id, schedule_start_time, schedule_end_time, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec'
+      'id, name, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec'
     )
     .eq('client_id', clientId)
     .eq('status', 'active')
@@ -811,7 +964,8 @@ async function getActiveCampaigns(clientId) {
 }
 
 /**
- * @param {string} [timezone] - IANA timezone (e.g. Europe/Berlin). If omitted, uses UTC.
+ * Schedule window uses campaign timezone (cold_dm_campaigns.timezone). Not cold_dm_settings.timezone.
+ * @param {string} [timezone] - IANA timezone from campaign row (e.g. America/New_York). If omitted/null, uses UTC.
  */
 function isWithinSchedule(scheduleStart, scheduleEnd, timezone) {
   if (!scheduleStart && !scheduleEnd) return true;
@@ -861,10 +1015,10 @@ async function getNextPendingCampaignLead(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return null;
   const settings = await getSettings(clientId);
-  const timezone = settings?.timezone || null;
   const campaigns = await getActiveCampaigns(clientId);
   for (const camp of campaigns) {
-    if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, timezone)) continue;
+    const campaignTz = camp.timezone ?? null;
+    if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz)) continue;
     let messageText = null;
     if (camp.message_group_id) {
       messageText = await getRandomMessageFromGroup(camp.message_group_id);
@@ -1036,4 +1190,5 @@ module.exports = {
   getNextPendingWorkAnyClient,
   getClientOutsideScheduleStatus,
   getClientNoWorkReason,
+  getClientNoWorkResumeAt,
 };

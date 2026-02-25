@@ -59,6 +59,7 @@ One row per scrape run (follower scrape).
 | status               | TEXT      | NO       |
 | schedule_start_time  | TIME      | YES      |
 | schedule_end_time    | TIME      | YES      |
+| timezone             | TEXT      | YES (IANA e.g. America/New_York; null = UTC for schedule) |
 | daily_send_limit     | INT       | YES      |
 | hourly_send_limit    | INT       | YES      |
 | min_delay_sec        | INT       | YES      |
@@ -68,8 +69,9 @@ One row per scrape run (follower scrape).
 
 - **status:** `draft` | `active` | `paused` | `completed`. Only `active` campaigns are processed by the sender.
 - **message_group_id:** Use this instead of `message_template_id`. Pick a **random** message from `cold_dm_message_group_messages` where `message_group_id = campaign.message_group_id`.
-- **schedule_start_time / schedule_end_time:** Send only when current time (in client timezone or UTC) is within this range. Example: 09:00–17:00.
-- **daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec:** Campaign-level overrides. When set, override global settings from `cold_dm_settings`. When null, use global values.
+- **timezone:** IANA timezone (e.g. `America/New_York`) for the schedule window. When null, schedule uses UTC. Do **not** use `cold_dm_settings.timezone` for the send window.
+- **schedule_start_time / schedule_end_time:** Send only when current time in **this campaign’s timezone** (`cold_dm_campaigns.timezone` or UTC if null) is within this range. Example: 09:00–17:00.
+- **daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec:** Campaign-level overrides. When null, fall back to `cold_dm_settings` (per client).
 - Index: `(client_id)`.
 
 ### 1.4 cold_dm_lead_groups
