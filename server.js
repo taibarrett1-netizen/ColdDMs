@@ -269,7 +269,7 @@ app.post('/api/control/start', (req, res) => {
       if (processRunning) {
         return res.json({ ok: true, processRunning: true });
       }
-      exec(`pm2 start cli.js --name ${BOT_PM2_NAME} -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
+      exec(`pm2 start cli.js --name ${BOT_PM2_NAME} --no-autorestart -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
         const out = (stdout || '') + (stderr || '');
         const alreadyRunning = /already (running|launched)|online/i.test(out);
         if (err && !alreadyRunning) {
@@ -284,7 +284,7 @@ app.post('/api/control/start', (req, res) => {
   }
   setControl('pause', '0');
   console.log('[API] Start bot requested (legacy)');
-  exec(`pm2 start cli.js --name ${BOT_PM2_NAME} -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
+  exec(`pm2 start cli.js --name ${BOT_PM2_NAME} --no-autorestart -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
     const out = (stdout || '') + (stderr || '');
     const alreadyRunning = /already (running|launched)|online/i.test(out);
     if (err && !alreadyRunning) {
