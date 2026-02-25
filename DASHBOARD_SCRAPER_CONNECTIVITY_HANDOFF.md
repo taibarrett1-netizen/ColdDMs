@@ -134,6 +134,8 @@ If using `cold-dm-vps-proxy`:
 2. The proxy forwards `/api/scraper/*` to the VPS with the same path and body.
 3. The dashboard calls the proxy URL (e.g. your Supabase project URL + `/functions/v1/cold-dm-vps-proxy`) with path `/api/scraper/connect`, `/api/scraper/status`, etc., and includes `clientId` from the current user/tenant context.
 
+**Avoiding 504 (VPS did not respond in time):** The Edge Function must allow enough time for the VPS to reply. The VPS responds to `/api/status` within 8 seconds (or with 503 if its own timeout fires). Use a **proxy timeout of at least 15 seconds** when forwarding to the VPS. For a fast connectivity check without DB/pm2, the proxy can call **GET /api/health** (same auth); the VPS returns `{ ok: true }` immediately.
+
 ---
 
 ## Quick reference

@@ -11,11 +11,11 @@ const {
   setClientId,
   setControl: setControlSupabase,
   getClientStatusMessage: getClientStatusMessageSupabase,
-  getClientOutsideScheduleStatus,
   getDailyStats: getDailyStatsSupabase,
   getRecentSent: getRecentSentSupabase,
   clearFailedAttempts: clearFailedAttemptsSupabase,
   getLeads: getLeadsSupabase,
+  getLeadsTotalAndRemaining,
   saveSession,
   updateSettingsInstagramUsername,
   getScraperSession,
@@ -69,58 +69,87 @@ function getBotProcessRunning(cb) {
   });
 }
 
+const STATUS_TIMEOUT_MS = 8000; // respond before typical Edge Function timeouts (~10–15s); status uses fast queries
+
+// --- API: health (for proxy/dashboard connectivity check; no DB or pm2) ---
+app.get('/api/health', (req, res) => {
+  res.json({ ok: true });
+});
+
 // --- API: status & stats ---
+// Returns immediately using only fast queries and stored status (set by the sender loop). No schedule recomputation.
 app.get('/api/status', (req, res) => {
   const clientId = req.query.clientId;
   const useSupabase = isSupabaseConfigured() && clientId;
-  getBotProcessRunning(async (processRunning) => {
+  let responded = false;
+  const send = (status, body) => {
+    if (responded) return;
+    responded = true;
+    clearTimeout(timer);
+    res.status(status).json(body);
+  };
+  const timer = setTimeout(() => {
+    if (responded) return;
+    console.warn('[API] /api/status timeout – responding 503');
+    send(503, {
+      error: 'Status request timed out. Try again.',
+      processRunning: false,
+      statusMessage: null,
+      todaySent: 0,
+      todayFailed: 0,
+      leadsTotal: 0,
+      leadsRemaining: 0,
+    });
+  }, STATUS_TIMEOUT_MS);
+
+  const processRunningPromise = new Promise((resolve) => getBotProcessRunning(resolve));
+
+  (async () => {
     try {
       if (useSupabase) {
-        const [stats, leads, statusMessage, outsideSchedule, sentSet] = await Promise.all([
+        const [processRunning, stats, statusMessage, leadsCounts] = await Promise.all([
+          processRunningPromise,
           getDailyStatsSupabase(clientId),
-          getLeadsSupabase(clientId),
           getClientStatusMessageSupabase(clientId),
-          getClientOutsideScheduleStatus(clientId),
-          (async () => {
-            const { getSentUsernames } = require('./database/supabase');
-            return getSentUsernames(clientId);
-          })(),
+          getLeadsTotalAndRemaining(clientId),
         ]);
-        const remaining = leads.filter((u) => !sentSet.has(u.replace(/^@/, ''))).length;
-        const displayStatus = (outsideSchedule && String(outsideSchedule).trim()) ? outsideSchedule : (statusMessage ?? null);
-        return res.json({
+        send(200, {
           processRunning,
-          statusMessage: displayStatus,
+          statusMessage: statusMessage ?? null,
           todaySent: stats.total_sent,
           todayFailed: stats.total_failed,
-          leadsTotal: leads.length,
-          leadsRemaining: remaining,
+          leadsTotal: leadsCounts.total,
+          leadsRemaining: leadsCounts.remaining,
         });
+      } else {
+        const processRunning = await processRunningPromise;
+        const stats = getDailyStats();
+        loadLeadsFromCSV(leadsPath)
+          .then((leads) => {
+            const leadsRemaining = leads.filter((u) => !alreadySent(u)).length;
+            send(200, {
+              processRunning,
+              todaySent: stats.total_sent,
+              todayFailed: stats.total_failed,
+              leadsTotal: leads.length,
+              leadsRemaining,
+            });
+          })
+          .catch(() => {
+            send(200, {
+              processRunning,
+              todaySent: stats.total_sent,
+              todayFailed: stats.total_failed,
+              leadsTotal: 0,
+              leadsRemaining: 0,
+            });
+          });
       }
-      const stats = getDailyStats();
-      loadLeadsFromCSV(leadsPath).then((leads) => {
-        const leadsRemaining = leads.filter((u) => !alreadySent(u)).length;
-        res.json({
-          processRunning,
-          todaySent: stats.total_sent,
-          todayFailed: stats.total_failed,
-          leadsTotal: leads.length,
-          leadsRemaining,
-        });
-      }).catch(() => {
-        res.json({
-          processRunning,
-          todaySent: stats.total_sent,
-          todayFailed: stats.total_failed,
-          leadsTotal: 0,
-          leadsRemaining: 0,
-        });
-      });
     } catch (e) {
       console.error('[API] Status error', e);
-      res.status(500).json({ error: e.message });
+      send(500, { error: e.message });
     }
-  });
+  })();
 });
 
 app.get('/api/stats', (req, res) => {
@@ -259,40 +288,28 @@ app.post('/api/instagram/connect', async (req, res) => {
 });
 
 // --- API: bot control (PM2 start/stop) ---
+// Return 200 immediately; pm2 start/stop runs in background. Sender loop does the actual wait (schedule, limits).
 app.post('/api/control/start', (req, res) => {
   const clientId = req.body?.clientId;
   if (isSupabaseConfigured()) {
     if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
     setControlSupabase(clientId, 0).catch((e) => console.error('[API] setControlSupabase', e));
     console.log('[API] Start (pause=0) for clientId=', clientId);
-    getBotProcessRunning((processRunning) => {
-      if (processRunning) {
-        return res.json({ ok: true, processRunning: true });
-      }
-      exec(`pm2 start cli.js --name ${BOT_PM2_NAME} --no-autorestart -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
-        const out = (stdout || '') + (stderr || '');
-        const alreadyRunning = /already (running|launched)|online/i.test(out);
-        if (err && !alreadyRunning) {
-          console.error('[API] Start failed', err, stderr);
-          return res.status(500).json({ ok: false, error: (stderr || err.message || '').toString().trim() });
-        }
-        console.log('[API] Worker started (was not running).');
-        res.json({ ok: true, processRunning: true });
-      });
+    res.json({ ok: true, processRunning: true });
+    exec(`pm2 start cli.js --name ${BOT_PM2_NAME} --no-autorestart -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
+      const out = (stdout || '') + (stderr || '');
+      const alreadyRunning = /already (running|launched)|online/i.test(out);
+      if (err && !alreadyRunning) console.error('[API] pm2 start failed', err, stderr);
+      else if (!alreadyRunning) console.log('[API] Worker started.');
     });
     return;
   }
   setControl('pause', '0');
   console.log('[API] Start bot requested (legacy)');
+  res.json({ ok: true, processRunning: true });
   exec(`pm2 start cli.js --name ${BOT_PM2_NAME} --no-autorestart -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
-    const out = (stdout || '') + (stderr || '');
-    const alreadyRunning = /already (running|launched)|online/i.test(out);
-    if (err && !alreadyRunning) {
-      console.error('[API] Start failed', err, stderr);
-      return res.status(500).json({ ok: false, error: (stderr || err.message || '').toString().trim() });
-    }
-    console.log('[API] Bot start command executed');
-    res.json({ ok: true, processRunning: true });
+    if (err) console.error('[API] pm2 start failed', err, stderr);
+    else console.log('[API] Bot start command executed.');
   });
 });
 
@@ -493,20 +510,15 @@ app.post('/api/control/stop', (req, res) => {
   if (isSupabaseConfigured()) {
     if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
     setControlSupabase(clientId, 1).catch((e) => console.error('[API] setControlSupabase', e));
-    console.log('[API] Stop (pause=1) for clientId=', clientId, '- worker process is not stopped.');
-    getBotProcessRunning((processRunning) => res.json({ ok: true, processRunning }));
+    console.log('[API] Stop (pause=1) for clientId=', clientId);
+    res.json({ ok: true, processRunning: false });
+    exec(`pm2 stop ${BOT_PM2_NAME}`, () => {});
     return;
   }
   setControl('pause', '1');
   console.log('[API] Stop bot requested (legacy)');
-  exec(`pm2 stop ${BOT_PM2_NAME}`, (err, stdout, stderr) => {
-    if (err) {
-      console.error('[API] Stop failed', err, stderr);
-      return res.status(500).json({ ok: false, error: stderr || err.message });
-    }
-    console.log('[API] Bot stopped');
-    res.json({ ok: true, processRunning: false });
-  });
+  res.json({ ok: true, processRunning: false });
+  exec(`pm2 stop ${BOT_PM2_NAME}`, () => {});
 });
 
 // --- serve dashboard ---

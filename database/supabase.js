@@ -80,7 +80,7 @@ function getNextMidnightInTimezone(timezone) {
       if (datePart < tomorrowStr || (datePart === tomorrowStr && timePart.slice(0, 5) < '00:00')) low = mid + 1;
       else high = mid;
     }
-    return new Date(low);
+    return new Date(high);
   } catch (e) {
     return new Date(Date.now() + 24 * 60 * 60 * 1000);
   }
@@ -111,7 +111,7 @@ function getNextHourStartInTimezone(timezone) {
       if (dStr < targetDateStr || (dStr === targetDateStr && tStr < targetTime)) low = mid + 1;
       else high = mid;
     }
-    return new Date(low);
+    return new Date(high);
   } catch (e) {
     const d = new Date();
     return new Date(d.getTime() + (60 - d.getUTCMinutes()) * 60 * 1000 - d.getUTCSeconds() * 1000);
@@ -146,7 +146,7 @@ function getNextScheduleStartInTimezone(scheduleStartTime, timezone) {
         if (dStr < dateStr || (dStr === dateStr && tStr < startTime)) low = mid + 1;
         else high = mid;
       }
-      return new Date(low);
+      return new Date(high);
     };
     const todayStart = findMoment(todayStr);
     const tomorrowStart = findMoment(tomorrowStr);
@@ -195,6 +195,19 @@ async function getLeads(clientId) {
     .eq('client_id', clientId);
   if (error) throw error;
   return (data || []).map((r) => normalizeUsername(r.username)).filter(Boolean);
+}
+
+/** Fast counts for status: total leads and remaining (not yet sent). Uses RPC when available; falls back to full fetch if migration 005 not run. */
+async function getLeadsTotalAndRemaining(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return { total: 0, remaining: 0 };
+  const { data, error } = await sb.rpc('get_cold_dm_leads_counts', { p_client_id: clientId });
+  if (!error && data != null) {
+    return { total: data.total ?? 0, remaining: data.remaining ?? 0 };
+  }
+  const [leads, sentSet] = await Promise.all([getLeads(clientId), getSentUsernames(clientId)]);
+  const remaining = leads.filter((u) => !sentSet.has(u)).length;
+  return { total: leads.length, remaining };
 }
 
 async function getSession(clientId) {
@@ -1151,6 +1164,7 @@ module.exports = {
   getSettings,
   getMessageTemplates,
   getLeads,
+  getLeadsTotalAndRemaining,
   getSession,
   getSessions,
   getSessionsForCampaign,
