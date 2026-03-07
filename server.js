@@ -268,8 +268,9 @@ app.post('/api/leads/upload', upload.single('file'), (req, res) => {
 });
 
 // --- API: Instagram connect (one-time; password never stored) ---
+// If account has 2FA, first call returns { ok: false, code: 'two_factor_required' }; send same username, password, clientId plus twoFactorCode (6-digit) to complete.
 app.post('/api/instagram/connect', async (req, res) => {
-  const { username, password, clientId } = req.body || {};
+  const { username, password, clientId, twoFactorCode } = req.body || {};
   if (!username || !password || !clientId) {
     return res.status(400).json({ ok: false, error: 'username, password, and clientId are required' });
   }
@@ -277,12 +278,15 @@ app.post('/api/instagram/connect', async (req, res) => {
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
   }
   try {
-    const result = await connectInstagram(username, password);
+    const result = await connectInstagram(username, password, twoFactorCode || null);
     await saveSession(clientId, { cookies: result.cookies }, result.username);
     await updateSettingsInstagramUsername(clientId, result.username);
     res.json({ ok: true });
   } catch (e) {
     console.error('[API] Instagram connect failed', e);
+    if (e.code === 'TWO_FACTOR_REQUIRED') {
+      return res.status(200).json({ ok: false, code: 'two_factor_required', message: e.message || 'Enter the 6-digit code from your app or WhatsApp.' });
+    }
     res.status(500).json({ ok: false, error: e.message || 'Login failed' });
   }
 });

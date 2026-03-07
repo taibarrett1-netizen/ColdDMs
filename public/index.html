@@ -36,6 +36,11 @@
     .msg.success { background: #1e4620; color: #a3cfbb; }
     .msg.error { background: #4a1c1c; color: #f1aeb5; }
     input[type="file"] { margin-top: 0.5rem; }
+    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 100; align-items: center; justify-content: center; }
+    .modal-overlay.show { display: flex; }
+    .modal { background: #252525; border-radius: 8px; padding: 1.5rem; min-width: 320px; max-width: 90%; }
+    .modal h3 { margin-top: 0; }
+    .modal-actions { margin-top: 1rem; display: flex; gap: 0.5rem; }
   </style>
 </head>
 <body>
@@ -43,6 +48,7 @@
   <nav>
     <a href="#" class="nav-link active" data-panel="dashboard">Dashboard</a>
     <a href="#" class="nav-link" data-panel="settings">Settings</a>
+    <a href="#" class="nav-link" data-panel="connect">Connect</a>
     <a href="#" class="nav-link" data-panel="leads">Leads</a>
     <a href="#" class="nav-link" data-panel="sent">Sent</a>
   </nav>
@@ -93,6 +99,21 @@
     </div>
   </div>
 
+  <div id="panel-connect" class="panel">
+    <div class="card">
+      <h2>Connect Instagram (Cold Outreach)</h2>
+      <p class="msg" id="connect-msg" style="display:none;"></p>
+      <label>Client ID</label>
+      <input type="text" id="connect-client-id" placeholder="Your client/user id (required for Supabase)">
+      <label>Instagram username</label>
+      <input type="text" id="connect-username" placeholder="username">
+      <label>Instagram password</label>
+      <input type="password" id="connect-password" placeholder="••••••••">
+      <button id="btn-connect" class="success">Connect</button>
+      <p style="margin-top:0.5rem; color:#888; font-size:0.9rem;">We do not store your password. If the account has 2FA, you will be asked for the 6-digit code.</p>
+    </div>
+  </div>
+
   <div id="panel-leads" class="panel">
     <div class="card">
       <h2>Leads (usernames to DM)</h2>
@@ -118,7 +139,22 @@
     </div>
   </div>
 
+  <div id="modal-2fa" class="modal-overlay" aria-hidden="true">
+    <div class="modal">
+      <h3>Two-factor code required</h3>
+      <p>Enter the 6-digit code from your authenticator app or WhatsApp.</p>
+      <label>Security code</label>
+      <input type="text" id="twofa-code" inputmode="numeric" pattern="[0-9]*" maxlength="6" placeholder="000000" autocomplete="one-time-code">
+      <div class="modal-actions">
+        <button id="btn-twofa-submit" class="success">Submit</button>
+        <button id="btn-twofa-cancel" class="danger">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <script>
+    let connectPending = null;
+
     function showPanel(id) {
       document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
       document.querySelectorAll('.nav-link').forEach(a => a.classList.remove('active'));
@@ -127,6 +163,33 @@
       if (id === 'dashboard') refreshStatus();
       if (id === 'sent') loadSent();
       if (id === 'leads') loadLeads();
+    }
+
+    function showConnectMsg(text, success) {
+      const el = document.getElementById('connect-msg');
+      el.textContent = text;
+      el.className = 'msg ' + (success ? 'success' : 'error');
+      el.style.display = 'block';
+      setTimeout(() => { el.style.display = 'none'; }, 5000);
+    }
+
+    function doConnect(username, password, clientId, twoFactorCode) {
+      const body = { username, password, clientId };
+      if (twoFactorCode) body.twoFactorCode = String(twoFactorCode).replace(/\D/g, '').slice(0, 6);
+      return fetch('/api/instagram/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).then(r => r.json());
+    }
+
+    function open2FAModal() {
+      document.getElementById('twofa-code').value = '';
+      document.getElementById('modal-2fa').classList.add('show');
+      document.getElementById('modal-2fa').setAttribute('aria-hidden', 'false');
+      document.getElementById('twofa-code').focus();
+    }
+
+    function close2FAModal() {
+      document.getElementById('modal-2fa').classList.remove('show');
+      document.getElementById('modal-2fa').setAttribute('aria-hidden', 'true');
+      connectPending = null;
     }
     document.querySelectorAll('.nav-link').forEach(a => {
       a.addEventListener('click', (e) => { e.preventDefault(); showPanel(a.dataset.panel); });
@@ -282,6 +345,51 @@
         .catch(() => showControlMsg('Request failed.', false))
         .finally(() => { btn.disabled = false; });
     });
+
+    document.getElementById('btn-connect').addEventListener('click', () => {
+      const username = document.getElementById('connect-username').value.trim();
+      const password = document.getElementById('connect-password').value;
+      const clientId = document.getElementById('connect-client-id').value.trim();
+      if (!username || !password) { showConnectMsg('Enter username and password.', false); return; }
+      if (!clientId) { showConnectMsg('Client ID is required (Supabase).', false); return; }
+      const btn = document.getElementById('btn-connect');
+      btn.disabled = true;
+      doConnect(username, password, clientId).then((data) => {
+        if (data.ok) {
+          showConnectMsg('Connected. Password and code were not stored.', true);
+          document.getElementById('connect-password').value = '';
+          document.getElementById('twofa-code').value = '';
+          connectPending = null;
+        } else if (data.code === 'two_factor_required') {
+          connectPending = { username, password, clientId };
+          open2FAModal();
+          showConnectMsg('Enter the 6-digit code below.', false);
+        } else {
+          showConnectMsg(data.error || data.message || 'Connect failed.', false);
+        }
+      }).catch(() => showConnectMsg('Request failed.', false)).finally(() => { btn.disabled = false; });
+    });
+
+    document.getElementById('btn-twofa-submit').addEventListener('click', () => {
+      if (!connectPending) return;
+      const code = document.getElementById('twofa-code').value.trim();
+      if (!code) return;
+      const btn = document.getElementById('btn-twofa-submit');
+      btn.disabled = true;
+      doConnect(connectPending.username, connectPending.password, connectPending.clientId, code).then((data) => {
+        if (data.ok) {
+          showConnectMsg('Connected. Password and code were not stored.', true);
+          document.getElementById('connect-password').value = '';
+          document.getElementById('connect-username').value = '';
+          document.getElementById('twofa-code').value = '';
+          close2FAModal();
+        } else {
+          showConnectMsg(data.error || data.message || 'Code may be wrong or expired. Try again.', false);
+        }
+      }).catch(() => showConnectMsg('Request failed.', false)).finally(() => { btn.disabled = false; });
+    });
+
+    document.getElementById('btn-twofa-cancel').addEventListener('click', () => close2FAModal());
 
     loadSettings();
     refreshStatus();

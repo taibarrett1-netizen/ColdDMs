@@ -176,6 +176,62 @@ async function login(page, credentials) {
   }
   await delay(1500);
 
+  // Handle two-factor authentication page
+  if (page.url().includes('/accounts/login/two_factor')) {
+    const twoFactorCode = credentials?.twoFactorCode ? String(credentials.twoFactorCode).replace(/\D/g, '').slice(0, 6) : '';
+    if (!twoFactorCode) {
+      page.off('response', respHandler);
+      const err = new Error('Two-factor authentication required. Enter the 6-digit code from your authenticator app or WhatsApp.');
+      err.code = 'TWO_FACTOR_REQUIRED';
+      throw err;
+    }
+    logger.log('On 2FA page, entering security code...');
+    const codeEntered = await page.evaluate((code) => {
+      const inputs = Array.from(document.querySelectorAll('input'));
+      const visible = inputs.filter((el) => el.offsetParent != null && el.type !== 'hidden');
+      const codeInput = visible.find((el) => {
+        const p = (el.placeholder || '').toLowerCase();
+        const a = (el.getAttribute('aria-label') || '').toLowerCase();
+        return p.includes('code') || p.includes('security') || a.includes('code') || a.includes('security') || (el.type !== 'password' && el.type !== 'email');
+      }) || visible[0];
+      if (!codeInput) return false;
+      codeInput.focus();
+      codeInput.value = '';
+      codeInput.value = code;
+      codeInput.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    }, twoFactorCode);
+    if (!codeEntered) {
+      page.off('response', respHandler);
+      const err = new Error('Two-factor code input not found on page.');
+      err.code = 'TWO_FACTOR_REQUIRED';
+      throw err;
+    }
+    await humanDelay();
+    const confirmClicked = await page.evaluate(function () {
+      const labels = ['Confirm', 'Next', 'Submit'];
+      const buttons = Array.from(document.querySelectorAll('button, div[role="button"], input[type="submit"]'));
+      for (const label of labels) {
+        const btn = buttons.find((el) => (el.textContent || el.value || '').trim() === label);
+        if (btn && btn.offsetParent) { btn.scrollIntoView({ block: 'center' }); btn.click(); return true; }
+      }
+      const confirmLike = buttons.find((el) => /confirm|next|submit/i.test((el.textContent || el.value || '').trim()));
+      if (confirmLike && confirmLike.offsetParent) { confirmLike.click(); return true; }
+      return false;
+    });
+    if (confirmClicked) {
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+      await delay(2000);
+    }
+    if (page.url().includes('/accounts/login/two_factor')) {
+      page.off('response', respHandler);
+      const err = new Error('Two-factor code may be wrong or expired. Try again with a fresh code.');
+      err.code = 'TWO_FACTOR_REQUIRED';
+      throw err;
+    }
+    logger.log('2FA code accepted.');
+  }
+
   if (page.url().includes('/accounts/login')) {
     logger.log('Still on login page; retrying submit (click only)...');
     const retryClick = await page.evaluate(function () {
@@ -862,8 +918,9 @@ async function runBot() {
 /**
  * One-time connect: log in with given credentials and return session (cookies).
  * Used by POST /api/instagram/connect. Password is never stored.
+ * If the account has 2FA, call again with twoFactorCode (6-digit from app or WhatsApp).
  */
-async function connectInstagram(instagramUsername, instagramPassword) {
+async function connectInstagram(instagramUsername, instagramPassword, twoFactorCode = null) {
   const useMobile = process.env.DISABLE_MOBILE_LOGIN !== '1' && process.env.DISABLE_MOBILE_LOGIN !== 'true';
   if (!useMobile) logger.log('Using desktop view for login (DISABLE_MOBILE_LOGIN is set).');
   const browser = await puppeteer.launch({
@@ -874,7 +931,11 @@ async function connectInstagram(instagramUsername, instagramPassword) {
     const page = await browser.newPage();
     if (useMobile) await applyMobileEmulation(page);
     else await page.setViewport({ width: 1280, height: 800 });
-    await login(page, { username: instagramUsername, password: instagramPassword });
+    await login(page, {
+      username: instagramUsername,
+      password: instagramPassword,
+      twoFactorCode: twoFactorCode || undefined,
+    });
     const cookies = await page.cookies();
     return { cookies, username: instagramUsername };
   } finally {
