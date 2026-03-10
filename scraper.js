@@ -232,11 +232,25 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     logger.log('[Scraper] Followers modal opened, extracting...');
     await delay(randomDelay(2500, 5000));
     await page.evaluate(() => {
-      const dialog = document.querySelector('[role="dialog"]');
-      if (dialog) {
-        dialog.focus();
+      const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+      let best = null;
+      let bestCount = 0;
+      for (const d of candidates) {
+        const links = d.querySelectorAll('a[href^="/"]');
+        let count = 0;
+        for (const a of links) {
+          const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+          if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
+        }
+        if (count > bestCount && count >= 5) {
+          bestCount = count;
+          best = d;
+        }
+      }
+      if (best) {
+        best.focus();
         for (let i = 0; i < 3; i++) {
-          dialog.dispatchEvent(new WheelEvent('wheel', { deltaY: 200, bubbles: true }));
+          best.dispatchEvent(new WheelEvent('wheel', { deltaY: 200, bubbles: true }));
         }
       }
     });
@@ -244,18 +258,29 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     const saveLoginDismissed = await page.evaluate(function () {
       const dialogs = document.querySelectorAll('[role="dialog"]');
+      let saveLoginDialog = null;
+      let followersDialog = null;
       for (let i = 0; i < dialogs.length; i++) {
         const d = dialogs[i];
         const txt = (d.textContent || '').toLowerCase();
-        if (txt.indexOf('save your login info') !== -1) {
-          const notNow = Array.from(d.querySelectorAll('span, div[role="button"], button')).find(function (el) {
-            return (el.textContent || '').trim().toLowerCase() === 'not now';
-          });
-          if (notNow) {
-            const btn = notNow.closest('[role="button"]') || notNow.closest('button') || notNow;
-            if (btn) { btn.click(); return true; }
-          }
-          return false;
+        const profileLinks = d.querySelectorAll('a[href^="/"]');
+        const validLinks = Array.from(profileLinks).filter((a) => {
+          const h = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+          return h && h[1].length >= 2 && h[1].length <= 30 && /^[a-z0-9._]+$/.test(h[1].toLowerCase());
+        });
+        if (txt.indexOf('save your login info') !== -1 && txt.indexOf('not now') !== -1) {
+          saveLoginDialog = d;
+        } else if (validLinks.length >= 10) {
+          followersDialog = d;
+        }
+      }
+      if (saveLoginDialog && followersDialog && saveLoginDialog !== followersDialog) {
+        const notNow = Array.from(saveLoginDialog.querySelectorAll('span, div[role="button"], button')).find(function (el) {
+          return (el.textContent || '').trim().toLowerCase() === 'not now';
+        });
+        if (notNow) {
+          const btn = notNow.closest('[role="button"]') || notNow.closest('button') || notNow;
+          if (btn) { btn.click(); return true; }
         }
       }
       return false;
@@ -269,8 +294,22 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     const logScrollDebug = async (label) => {
       const dbg = await page.evaluate(() => {
-        const dialog = document.querySelector('[role="dialog"]');
-        if (!dialog) return { ok: false };
+        const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+        let dialog = null;
+        let bestCount = 0;
+          for (const d of candidates) {
+            const links = d.querySelectorAll('a[href^="/"]');
+            let count = 0;
+            for (const a of links) {
+              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
+            }
+            if (count > bestCount && count >= 5) {
+              bestCount = count;
+              dialog = d;
+            }
+          }
+          if (!dialog) return { ok: false };
         const scrollables = [];
         for (const div of dialog.querySelectorAll('div')) {
           if (div.scrollHeight > div.clientHeight && div.clientHeight > 80) {
@@ -325,8 +364,21 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
       const batchResult = await page.evaluate((debug) => {
         const leads = [];
-        const dialog = document.querySelector('[role="dialog"]');
-        const root = dialog || document.body;
+        let root = document.body;
+        let bestCount = 0;
+        const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+        for (const d of candidates) {
+          const links = d.querySelectorAll('a[href^="/"]');
+          let count = 0;
+          for (const a of links) {
+            const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+            if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
+          }
+          if (count > bestCount && count >= 5) {
+            bestCount = count;
+            root = d;
+          }
+        }
 
         function isInSuggestedRow(el) {
           var p = el.parentElement;
@@ -434,8 +486,22 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         if (scrollCount === 0) {
           try {
             const html = await page.evaluate(function () {
-              const d = document.querySelector('[role="dialog"]');
-              return d ? d.outerHTML : 'no dialog';
+              const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+              let best = null;
+              let bestCount = 0;
+              for (const d of candidates) {
+                const links = d.querySelectorAll('a[href^="/"]');
+                let count = 0;
+                for (const a of links) {
+                  const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+                  if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
+                }
+                if (count > bestCount && count >= 5) {
+                  bestCount = count;
+                  best = d;
+                }
+              }
+              return best ? best.outerHTML : 'no dialog';
             });
             const fs = require('fs');
             const dumpPath = path.join(process.cwd(), 'scraper-modal-debug.html');
@@ -494,7 +560,21 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       scrollCount++;
       const getScrollDebug = () =>
         page.evaluate(() => {
-          const dialog = document.querySelector('[role="dialog"]');
+          const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+          let dialog = null;
+          let bestCount = 0;
+          for (const d of candidates) {
+            const links = d.querySelectorAll('a[href^="/"]');
+            let count = 0;
+            for (const a of links) {
+              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
+            }
+            if (count > bestCount) {
+              bestCount = count;
+              dialog = d;
+            }
+          }
           if (!dialog) return { ok: false, scrollables: [] };
           const scrollables = [];
           for (const div of dialog.querySelectorAll('div')) {
@@ -518,7 +598,21 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
       const scrollIncrementally = () =>
         page.evaluate((chunkPx) => {
-          const dialog = document.querySelector('[role="dialog"]');
+          const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+          let dialog = null;
+          let bestCount = 0;
+          for (const d of candidates) {
+            const links = d.querySelectorAll('a[href^="/"]');
+            let count = 0;
+            for (const a of links) {
+              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
+            }
+            if (count > bestCount && count >= 5) {
+              bestCount = count;
+              dialog = d;
+            }
+          }
           if (!dialog) return { scrolled: false };
           let scrollTarget = null;
           let maxLinks = 0;
@@ -586,7 +680,21 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           });
         }
         const wheelScrolled = await page.evaluate(() => {
-          const dialog = document.querySelector('[role="dialog"]');
+          const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+          let dialog = null;
+          let bestCount = 0;
+          for (const d of candidates) {
+            const links = d.querySelectorAll('a[href^="/"]');
+            let count = 0;
+            for (const a of links) {
+              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
+            }
+            if (count > bestCount && count >= 5) {
+              bestCount = count;
+              dialog = d;
+            }
+          }
           if (!dialog) return false;
           dialog.focus();
           const targets = [dialog, ...dialog.querySelectorAll('div')].filter((el) => el.clientHeight > 80);
@@ -597,7 +705,21 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         });
         if (wheelScrolled) await delay(800);
         await page.evaluate(() => {
-          const dialog = document.querySelector('[role="dialog"]');
+          const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+          let dialog = null;
+          let bestCount = 0;
+          for (const d of candidates) {
+            const links = d.querySelectorAll('a[href^="/"]');
+            let count = 0;
+            for (const a of links) {
+              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
+            }
+            if (count > bestCount && count >= 5) {
+              bestCount = count;
+              dialog = d;
+            }
+          }
           if (dialog) dialog.focus();
         });
         for (let k = 0; k < 4; k++) {
@@ -605,7 +727,21 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           await delay(400);
         }
         const { scrolled: kbdScrolled } = await page.evaluate(() => {
-          const dialog = document.querySelector('[role="dialog"]');
+          const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+          let dialog = null;
+          let bestCount = 0;
+          for (const d of candidates) {
+            const links = d.querySelectorAll('a[href^="/"]');
+            let count = 0;
+            for (const a of links) {
+              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
+            }
+            if (count > bestCount && count >= 5) {
+              bestCount = count;
+              dialog = d;
+            }
+          }
           if (!dialog) return { scrolled: false };
           let anyScroll = false;
           for (const el of [dialog, ...dialog.querySelectorAll('div')]) {
