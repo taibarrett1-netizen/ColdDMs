@@ -232,21 +232,33 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     logger.log('[Scraper] Followers modal opened, extracting...');
     await delay(randomDelay(2500, 5000));
     await page.evaluate(() => {
-      const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+      function countProfileLinks(el) {
+        let c = 0;
+        for (const a of el.querySelectorAll('a[href^="/"]')) {
+          const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+          if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
+        }
+        return c;
+      }
       let best = null;
       let bestCount = 0;
-      for (const d of candidates) {
-        const links = d.querySelectorAll('a[href^="/"]');
-        let count = 0;
-        for (const a of links) {
-          const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-          if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
-        }
+      for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+        const count = countProfileLinks(d);
         if (count > bestCount && count >= 5) {
           bestCount = count;
           best = d;
         }
       }
+          if (bestCount < 5) {
+            for (const d of document.querySelectorAll('div')) {
+              if (d.clientHeight < 80) continue;
+              const count = countProfileLinks(d);
+              if (count > bestCount && count >= 10) {
+                bestCount = count;
+                best = d;
+              }
+            }
+          }
       if (best) {
         best.focus();
         for (let i = 0; i < 3; i++) {
@@ -294,22 +306,34 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     const logScrollDebug = async (label) => {
       const dbg = await page.evaluate(() => {
-        const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+        function countProfileLinks(el) {
+          let c = 0;
+          for (const a of el.querySelectorAll('a[href^="/"]')) {
+            const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+            if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
+          }
+          return c;
+        }
         let dialog = null;
         let bestCount = 0;
-          for (const d of candidates) {
-            const links = d.querySelectorAll('a[href^="/"]');
-            let count = 0;
-            for (const a of links) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
-            }
-            if (count > bestCount && count >= 5) {
+        for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+          const count = countProfileLinks(d);
+          if (count > bestCount && count >= 5) {
+            bestCount = count;
+            dialog = d;
+          }
+        }
+        if (bestCount < 5) {
+          for (const d of document.querySelectorAll('div')) {
+            if (d.clientHeight < 80) continue;
+            const count = countProfileLinks(d);
+            if (count > bestCount && count >= 10) {
               bestCount = count;
               dialog = d;
             }
           }
-          if (!dialog) return { ok: false };
+        }
+        if (!dialog) return { ok: false };
         const scrollables = [];
         for (const div of dialog.querySelectorAll('div')) {
           if (div.scrollHeight > div.clientHeight && div.clientHeight > 80) {
@@ -366,17 +390,30 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         const leads = [];
         let root = document.body;
         let bestCount = 0;
-        const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
-        for (const d of candidates) {
-          const links = d.querySelectorAll('a[href^="/"]');
-          let count = 0;
-          for (const a of links) {
+        function countProfileLinks(el) {
+          let c = 0;
+          for (const a of el.querySelectorAll('a[href^="/"]')) {
             const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-            if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
+            if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
           }
+          return c;
+        }
+        const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]');
+        for (const d of candidates) {
+          const count = countProfileLinks(d);
           if (count > bestCount && count >= 5) {
             bestCount = count;
             root = d;
+          }
+        }
+        if (bestCount < 5) {
+          for (const d of document.querySelectorAll('div')) {
+            if (d.clientHeight < 80) continue;
+            const count = countProfileLinks(d);
+            if (count > bestCount && count >= 10) {
+              bestCount = count;
+              root = d;
+            }
           }
         }
 
@@ -486,22 +523,37 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         if (scrollCount === 0) {
           try {
             const html = await page.evaluate(function () {
-              const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+              function countProfileLinks(el) {
+                let c = 0;
+                for (const a of el.querySelectorAll('a[href^="/"]')) {
+                  const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+                  if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
+                }
+                return c;
+              }
               let best = null;
               let bestCount = 0;
-              for (const d of candidates) {
-                const links = d.querySelectorAll('a[href^="/"]');
-                let count = 0;
-                for (const a of links) {
-                  const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-                  if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
-                }
+              for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+                const count = countProfileLinks(d);
                 if (count > bestCount && count >= 5) {
                   bestCount = count;
                   best = d;
                 }
               }
-              return best ? best.outerHTML : 'no dialog';
+              if (bestCount < 5) {
+                for (const d of document.querySelectorAll('div')) {
+                  if (d.clientHeight < 80) continue;
+                  const count = countProfileLinks(d);
+                  if (count > bestCount && count >= 10) {
+                    bestCount = count;
+                    best = d;
+                  }
+                }
+              }
+              if (best) return best.outerHTML;
+              const firstDialog = document.querySelector('[role="dialog"]');
+              if (firstDialog) return '<!-- first dialog (not followers) -->\n' + firstDialog.outerHTML;
+              return 'no dialog';
             });
             const fs = require('fs');
             const dumpPath = path.join(process.cwd(), 'scraper-modal-debug.html');
@@ -598,19 +650,31 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
       const scrollIncrementally = () =>
         page.evaluate((chunkPx) => {
-          const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+          function countProfileLinks(el) {
+            let c = 0;
+            for (const a of el.querySelectorAll('a[href^="/"]')) {
+              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
+            }
+            return c;
+          }
           let dialog = null;
           let bestCount = 0;
-          for (const d of candidates) {
-            const links = d.querySelectorAll('a[href^="/"]');
-            let count = 0;
-            for (const a of links) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
-            }
+          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+            const count = countProfileLinks(d);
             if (count > bestCount && count >= 5) {
               bestCount = count;
               dialog = d;
+            }
+          }
+          if (bestCount < 5) {
+            for (const d of document.querySelectorAll('div')) {
+              if (d.clientHeight < 80) continue;
+              const count = countProfileLinks(d);
+              if (count > bestCount && count >= 10) {
+                bestCount = count;
+                dialog = d;
+              }
             }
           }
           if (!dialog) return { scrolled: false };
@@ -680,19 +744,31 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           });
         }
         const wheelScrolled = await page.evaluate(() => {
-          const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+          function countProfileLinks(el) {
+            let c = 0;
+            for (const a of el.querySelectorAll('a[href^="/"]')) {
+              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
+            }
+            return c;
+          }
           let dialog = null;
           let bestCount = 0;
-          for (const d of candidates) {
-            const links = d.querySelectorAll('a[href^="/"]');
-            let count = 0;
-            for (const a of links) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
-            }
+          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+            const count = countProfileLinks(d);
             if (count > bestCount && count >= 5) {
               bestCount = count;
               dialog = d;
+            }
+          }
+          if (bestCount < 5) {
+            for (const d of document.querySelectorAll('div')) {
+              if (d.clientHeight < 80) continue;
+              const count = countProfileLinks(d);
+              if (count > bestCount && count >= 10) {
+                bestCount = count;
+                dialog = d;
+              }
             }
           }
           if (!dialog) return false;
@@ -705,19 +781,31 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         });
         if (wheelScrolled) await delay(800);
         await page.evaluate(() => {
-          const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+          function countProfileLinks(el) {
+            let c = 0;
+            for (const a of el.querySelectorAll('a[href^="/"]')) {
+              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
+            }
+            return c;
+          }
           let dialog = null;
           let bestCount = 0;
-          for (const d of candidates) {
-            const links = d.querySelectorAll('a[href^="/"]');
-            let count = 0;
-            for (const a of links) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
-            }
+          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+            const count = countProfileLinks(d);
             if (count > bestCount && count >= 5) {
               bestCount = count;
               dialog = d;
+            }
+          }
+          if (bestCount < 5) {
+            for (const d of document.querySelectorAll('div')) {
+              if (d.clientHeight < 80) continue;
+              const count = countProfileLinks(d);
+              if (count > bestCount && count >= 10) {
+                bestCount = count;
+                dialog = d;
+              }
             }
           }
           if (dialog) dialog.focus();
@@ -727,19 +815,31 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           await delay(400);
         }
         const { scrolled: kbdScrolled } = await page.evaluate(() => {
-          const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
+          function countProfileLinks(el) {
+            let c = 0;
+            for (const a of el.querySelectorAll('a[href^="/"]')) {
+              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
+            }
+            return c;
+          }
           let dialog = null;
           let bestCount = 0;
-          for (const d of candidates) {
-            const links = d.querySelectorAll('a[href^="/"]');
-            let count = 0;
-            for (const a of links) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
-            }
+          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+            const count = countProfileLinks(d);
             if (count > bestCount && count >= 5) {
               bestCount = count;
               dialog = d;
+            }
+          }
+          if (bestCount < 5) {
+            for (const d of document.querySelectorAll('div')) {
+              if (d.clientHeight < 80) continue;
+              const count = countProfileLinks(d);
+              if (count > bestCount && count >= 10) {
+                bestCount = count;
+                dialog = d;
+              }
             }
           }
           if (!dialog) return { scrolled: false };
