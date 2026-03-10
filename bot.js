@@ -442,18 +442,28 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}) {
     for (let i = 0; i < words.length; i++) {
       const w = words[i];
       if (w.length >= 2 && w.length <= 30 && w === w.toLowerCase() && /^[a-z0-9._]+$/.test(w) && !/^https?:\/\//.test(w)) {
-        if (i >= 2) return { first_name: words[i - 2], last_name: words[i - 1] };
-        if (i >= 1) return { first_name: words[i - 1], last_name: '' };
-        return null;
+        const before = words.slice(Math.max(0, i - 10), i);
+        if (before.length === 0) return null;
+        const fullName = before.join(' ');
+        const first = before[0] || '';
+        const last = before.length > 1 ? before.slice(1).join(' ') : '';
+        return { full_name: fullName, first_name: first, last_name: last };
       }
     }
     return null;
   });
 
+  const first = displayNameFromPage?.first_name ?? nameFallback.first_name ?? null;
+  const last = displayNameFromPage?.last_name ?? nameFallback.last_name ?? null;
+  const fullName =
+    displayNameFromPage?.full_name ??
+    (nameFallback.first_name || nameFallback.last_name ? [nameFallback.first_name, nameFallback.last_name].filter(Boolean).join(' ') : null) ??
+    null;
   const leadFromPage = {
     username: u,
-    first_name: displayNameFromPage?.first_name ?? nameFallback.first_name ?? null,
-    last_name: displayNameFromPage?.last_name ?? nameFallback.last_name ?? null,
+    first_name: first,
+    last_name: last,
+    full_name: fullName,
   };
   const msg = substituteVariables(messageTemplate, leadFromPage);
 
@@ -688,7 +698,9 @@ async function runBotMultiTenant() {
       const sleepMs = Math.max(1000, earliestResumeAt.getTime() - Date.now());
       const sleepMin = Math.round(sleepMs / 60000);
       logger.log(`Paused (${resumeReason}). Resuming in ${sleepMin} min at ${earliestResumeAt.toISOString().slice(0, 16)}.`);
-      await delay(sleepMs);
+      const SCHEDULE_RECHECK_MS = 5 * 60 * 1000;
+      const chunkMs = resumeReason === 'outside_schedule' ? Math.min(sleepMs, SCHEDULE_RECHECK_MS) : sleepMs;
+      await delay(chunkMs);
       continue;
     }
     const { clientId, work } = next;

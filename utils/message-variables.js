@@ -13,7 +13,8 @@ function substituteVariables(text, lead = {}) {
     first = parts[0] ? parts[0].charAt(0).toUpperCase() + parts[0].slice(1).toLowerCase() : username;
     last = parts.length > 1 ? parts.slice(1).map((p) => p.charAt(0).toUpperCase() + p.slice(1).toLowerCase()).join(' ') : '';
   }
-  const fullName = [first, last].filter(Boolean).join(' ') || username;
+  const fullName =
+    (lead.full_name || '').trim() || [first, last].filter(Boolean).join(' ') || username;
 
   const vars = {
     username,
