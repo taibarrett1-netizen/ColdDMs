@@ -26,6 +26,8 @@ puppeteer.use(StealthPlugin());
 const SCRAPE_DELAY_MIN_MS = 2000;
 const SCRAPE_DELAY_MAX_MS = 5000;
 const SCROLL_PAUSE_MS = 1500;
+const LOAD_WAIT_MS = 3000;
+const LOAD_WAIT_RETRIES = 3;
 const HEADLESS = process.env.SCRAPER_HEADLESS !== 'false';
 
 function delay(ms) {
@@ -438,34 +440,50 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       }
 
       scrollCount++;
-      const scrolled = await page.evaluate(() => {
-        const dialog = document.querySelector('[role="dialog"]');
-        if (!dialog) return false;
-        const scrollables = dialog.querySelectorAll('div');
-        for (const s of scrollables) {
-          const style = window.getComputedStyle(s);
-          const overflow = style.overflowY || style.overflow || '';
-          const canScroll = s.scrollHeight > s.clientHeight;
-          if ((overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay') && canScroll) {
-            const prev = s.scrollTop;
-            s.scrollTop = s.scrollHeight;
-            return s.scrollTop !== prev || s.scrollHeight > s.clientHeight;
+      const scrollToBottom = () =>
+        page.evaluate(() => {
+          const dialog = document.querySelector('[role="dialog"]');
+          if (!dialog) return false;
+          const scrollables = dialog.querySelectorAll('div');
+          for (const s of scrollables) {
+            const style = window.getComputedStyle(s);
+            const overflow = style.overflowY || style.overflow || '';
+            const canScroll = s.scrollHeight > s.clientHeight;
+            if ((overflow === 'auto' || overflow === 'scroll' || overflow === 'overlay') && canScroll) {
+              const prev = s.scrollTop;
+              s.scrollTop = s.scrollHeight;
+              return s.scrollTop !== prev || s.scrollHeight > s.clientHeight;
+            }
           }
-        }
-        for (const s of scrollables) {
-          if (s.scrollHeight > s.clientHeight && s.clientHeight > 100) {
-            s.scrollTop = s.scrollHeight;
-            return true;
+          for (const s of scrollables) {
+            if (s.scrollHeight > s.clientHeight && s.clientHeight > 100) {
+              s.scrollTop = s.scrollHeight;
+              return true;
+            }
           }
-        }
-        const prev = dialog.scrollTop;
-        dialog.scrollTop = dialog.scrollHeight;
-        return dialog.scrollTop !== prev;
-      });
+          const prev = dialog.scrollTop;
+          dialog.scrollTop = dialog.scrollHeight;
+          return dialog.scrollTop !== prev;
+        });
+
+      let scrolled = await scrollToBottom();
 
       if (!scrolled) {
-        logger.log('[Scraper] No more scrollable content');
-        break;
+        let loadRetries = 0;
+        while (loadRetries < LOAD_WAIT_RETRIES) {
+          logger.log(`[Scraper] At bottom, waiting ${LOAD_WAIT_MS}ms for loading to finish...`);
+          await delay(LOAD_WAIT_MS);
+          scrolled = await scrollToBottom();
+          if (scrolled) {
+            logger.log('[Scraper] More content loaded, continuing scroll');
+            break;
+          }
+          loadRetries++;
+        }
+        if (!scrolled) {
+          logger.log('[Scraper] No more scrollable content');
+          break;
+        }
       }
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
 
