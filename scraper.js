@@ -26,8 +26,8 @@ puppeteer.use(StealthPlugin());
 const SCRAPE_DELAY_MIN_MS = 2000;
 const SCRAPE_DELAY_MAX_MS = 5000;
 const SCROLL_PAUSE_MS = 1500;
-const LOAD_WAIT_MS = 3000;
-const LOAD_WAIT_RETRIES = 3;
+const LOAD_WAIT_MS = 4000;
+const LOAD_WAIT_RETRIES = 8;
 const SCROLL_CHUNK_PX = 300;
 const SCROLL_CHUNKS_PER_ITER = 8;
 const SCROLL_CHUNK_DELAY_MS = 600;
@@ -101,7 +101,13 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     });
     const page = await browser.newPage();
-    await applyMobileEmulation(page);
+    const useDesktop = process.env.SCRAPER_USE_DESKTOP === '1' || process.env.SCRAPER_USE_DESKTOP === 'true';
+    if (useDesktop) {
+      await page.setViewport({ width: 1280, height: 800 });
+      logger.log('[Scraper] Using desktop viewport (SCRAPER_USE_DESKTOP=1)');
+    } else {
+      await applyMobileEmulation(page);
+    }
     await page.setCookie(...session.session_data.cookies);
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(randomDelay(1500, 3500));
@@ -303,6 +309,36 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     }
 
     const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
+    let firstNoScrollTargetDumped = false;
+
+    const getScrollablesDomSummary = () =>
+      page.evaluate(() => {
+        function countProfileLinks(el) {
+          let c = 0;
+          for (const a of el.querySelectorAll('a[href^="/"]')) {
+            const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+            if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
+          }
+          return c;
+        }
+        const scrollables = [];
+        for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+          const count = countProfileLinks(d);
+          if (count < 5) continue;
+          for (const div of d.querySelectorAll('div')) {
+            if (div.clientHeight > 80) {
+              scrollables.push({
+                scrollHeight: div.scrollHeight,
+                clientHeight: div.clientHeight,
+                links: div.querySelectorAll('a[href^="/"]').length,
+                className: (div.className || '').slice(0, 60),
+                hasOverflow: div.scrollHeight > div.clientHeight,
+              });
+            }
+          }
+        }
+        return scrollables.slice(0, 10);
+      });
 
     const logScrollDebug = async (label) => {
       const dbg = await page.evaluate(() => {
@@ -372,7 +408,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     let totalScraped = 0;
     const seenUsernames = new Set();
     let noNewCount = 0;
-    const MAX_NO_NEW = 6;
+    const MAX_NO_NEW = profileFollowerCount != null && profileFollowerCount > 100 ? 12 : 6;
     const BLACKLIST = new Set([
       'explore', 'direct', 'accounts', 'reels', 'stories', 'p', 'tv', 'tags',
       'developer', 'about', 'blog', 'jobs', 'help', 'api', 'privacy', 'terms',
@@ -385,6 +421,10 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         logger.log('[Scraper] Job cancelled');
         break;
       }
+
+      logger.log(
+        `[Scraper] Loop iter: scrollCount=${scrollCount} totalScraped=${totalScraped} noNewCount=${noNewCount} effectiveMax=${effectiveMax != null ? effectiveMax : 'none'}`
+      );
 
       const batchResult = await page.evaluate((debug) => {
         const leads = [];
@@ -588,6 +628,10 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       }
       for (const lead of newLeads) seenUsernames.add(typeof lead === 'string' ? lead : lead.username);
 
+      logger.log(
+        `[Scraper] Batch result: batch.length=${batch.length} newLeads=${newLeads.length} seenUsernames=${seenUsernames.size}`
+      );
+
       if (newLeads.length > 0) {
         await upsertLeadsBatch(clientId, newLeads, source, leadGroupId);
         totalScraped = seenUsernames.size;
@@ -599,17 +643,17 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           break;
         }
       } else {
-        noNewCount++;
-        if (scrollCount < 3) {
-          noNewCount = 0;
-        }
         if (noNewCount >= MAX_NO_NEW) {
-          logger.log(`[Scraper] No new usernames for ${MAX_NO_NEW} iterations. Stopping.`);
+          logger.log(
+            `[Scraper] MAX_NO_NEW exit: noNewCount=${noNewCount} scrollCount=${scrollCount} totalScraped=${totalScraped}`
+          );
           break;
         }
       }
 
+      const hadNoNewThisIter = newLeads.length === 0;
       scrollCount++;
+      let weGotMoreFromWaitRetry = false;
       const getScrollDebug = () =>
         page.evaluate(() => {
           const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
@@ -677,12 +721,26 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
               }
             }
           }
-          if (!dialog) return { scrolled: false };
+          if (!dialog) {
+            return {
+              scrolled: false,
+              debug: {
+                scrollTargetFound: false,
+                scrollHeight: null,
+                clientHeight: null,
+                scrollTop: null,
+                noOverflow: true,
+                targetInfo: null,
+              },
+            };
+          }
           let scrollTarget = null;
           let maxLinks = 0;
           for (const div of dialog.querySelectorAll('div')) {
             const links = div.querySelectorAll('a[href^="/"]');
-            if (links.length > maxLinks && div.scrollHeight > div.clientHeight && div.clientHeight > 80) {
+            const hasOverflow = div.scrollHeight > div.clientHeight;
+            const isTallEnough = div.clientHeight > 80;
+            if (links.length > maxLinks && hasOverflow && isTallEnough) {
               maxLinks = links.length;
               scrollTarget = div;
             }
@@ -696,16 +754,43 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
               }
             }
           }
-          if (!scrollTarget) return { scrolled: false };
+          if (!scrollTarget) {
+            maxLinks = 0;
+            for (const div of dialog.querySelectorAll('div')) {
+              const links = div.querySelectorAll('a[href^="/"]');
+              if (links.length > maxLinks && div.clientHeight > 80) {
+                maxLinks = links.length;
+                scrollTarget = div;
+              }
+            }
+          }
+          if (!scrollTarget) {
+            return {
+              scrolled: false,
+              debug: {
+                scrollTargetFound: false,
+                scrollHeight: null,
+                clientHeight: null,
+                scrollTop: null,
+                noOverflow: true,
+                targetInfo: null,
+              },
+            };
+          }
           const prev = scrollTarget.scrollTop;
-          scrollTarget.scrollTop = Math.min(scrollTarget.scrollTop + chunkPx, scrollTarget.scrollHeight);
+          const newTop = Math.min(scrollTarget.scrollTop + chunkPx, scrollTarget.scrollHeight);
+          scrollTarget.scrollTop = newTop;
+          const didScroll = scrollTarget.scrollTop !== prev;
           return {
-            scrolled: scrollTarget.scrollTop !== prev,
+            scrolled: didScroll,
             debug: {
+              scrollTargetFound: true,
               scrollHeight: scrollTarget.scrollHeight,
               clientHeight: scrollTarget.clientHeight,
               scrollTopBefore: prev,
               scrollTopAfter: scrollTarget.scrollTop,
+              noOverflow: scrollTarget.scrollHeight <= scrollTarget.clientHeight,
+              targetInfo: { tagName: scrollTarget.tagName, className: (scrollTarget.className || '').slice(0, 80), id: scrollTarget.id || null },
             },
           };
         }, SCROLL_CHUNK_PX);
@@ -715,11 +800,28 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         const result = await scrollIncrementally();
         const scrolled = result.scrolled;
         if (scrolled) anyScrollThisIter = true;
+        if (!scrolled && result.debug) {
+          const d = result.debug;
+          logger.log(
+            `[Scraper] Scroll iter ${scrollCount} chunk ${c}: scrolled=false | scrollTargetFound=${d.scrollTargetFound}` +
+              (d.scrollHeight != null ? ` h=${d.scrollHeight} ch=${d.clientHeight}` : '') +
+              (d.noOverflow != null ? ` noOverflow=${d.noOverflow}` : '')
+          );
+          if (SCRAPER_DEBUG && d.targetInfo) {
+            logger.log(`[Scraper]   scrollTarget: tag=${d.targetInfo.tagName} class=${d.targetInfo.className} id=${d.targetInfo.id}`);
+          }
+          if (SCRAPER_DEBUG && !firstNoScrollTargetDumped) {
+            firstNoScrollTargetDumped = true;
+            const summary = await getScrollablesDomSummary();
+            logger.log('[Scraper] DEBUG: DOM summary (scrollable divs): ' + JSON.stringify(summary));
+          }
+        }
         if (SCRAPER_DEBUG && c === 0) {
           const dbg = await getScrollDebug();
+          const topAfter = result.debug?.scrollTopAfter ?? result.debug?.scrollTop;
           logger.log(
             `[Scraper] Scroll iter ${scrollCount} chunk 0: scrolled=${scrolled}` +
-              (result.debug ? ` target h=${result.debug.scrollHeight} ch=${result.debug.clientHeight} top=${result.debug.scrollTopAfter}` : ' no target') +
+              (result.debug ? ` target h=${result.debug.scrollHeight} ch=${result.debug.clientHeight} top=${topAfter}` : ' no target') +
               ` | dialog: ${dbg.ok ? `h=${dbg.dialogScrollHeight} ch=${dbg.dialogClientHeight}` : 'none'}` +
               ` | scrollables: ${dbg.scrollables.length}`
           );
@@ -742,6 +844,47 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           dbg.scrollables.forEach((s, i) => {
             logger.log(`[Scraper]   [${i}] h=${s.scrollHeight} ch=${s.clientHeight} top=${s.scrollTop} links=${s.links}`);
           });
+        }
+        const scrollIntoViewResult = await page.evaluate(() => {
+          function countProfileLinks(el) {
+            let c = 0;
+            for (const a of el.querySelectorAll('a[href^="/"]')) {
+              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
+            }
+            return c;
+          }
+          let root = null;
+          let bestCount = 0;
+          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+            const count = countProfileLinks(d);
+            if (count > bestCount && count >= 5) {
+              bestCount = count;
+              root = d;
+            }
+          }
+          if (bestCount < 5) {
+            for (const d of document.querySelectorAll('div')) {
+              if (d.clientHeight < 80) continue;
+              const count = countProfileLinks(d);
+              if (count > bestCount && count >= 10) {
+                bestCount = count;
+                root = d;
+              }
+            }
+          }
+          if (!root) return false;
+          const links = root.querySelectorAll('a[href^="/"]');
+          const lastLink = links[links.length - 1];
+          if (lastLink) {
+            lastLink.scrollIntoView({ block: 'end', behavior: 'instant' });
+            return true;
+          }
+          return false;
+        });
+        if (scrollIntoViewResult) {
+          logger.log('[Scraper] Scrolled last item into view to trigger lazy-load');
+          await delay(1500);
         }
         const wheelScrolled = await page.evaluate(() => {
           function countProfileLinks(el) {
@@ -854,19 +997,60 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           return { scrolled: anyScroll };
         });
         if (kbdScrolled) anyScrollThisIter = true;
+        if (!anyScrollThisIter) {
+          const touchScrollResult = await page.evaluate(() => {
+            function countProfileLinks(el) {
+              let c = 0;
+              for (const a of el.querySelectorAll('a[href^="/"]')) {
+                const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
+                if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
+              }
+              return c;
+            }
+            let dialog = null;
+            let bestCount = 0;
+            for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+              const count = countProfileLinks(d);
+              if (count > bestCount && count >= 5) {
+                bestCount = count;
+                dialog = d;
+              }
+            }
+            if (!dialog) return null;
+            const rect = dialog.getBoundingClientRect();
+            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+          });
+          if (touchScrollResult) {
+            const { x, y } = touchScrollResult;
+            try {
+              await page.touchscreen.touchStart(x, y);
+              await page.touchscreen.touchMove(x, y - 150);
+              await page.touchscreen.touchEnd();
+              anyScrollThisIter = true;
+              logger.log('[Scraper] Touch scroll fallback triggered');
+            } catch (e) {
+              logger.warn('[Scraper] Touch scroll failed: ' + e.message);
+            }
+            if (anyScrollThisIter) await delay(800);
+          }
+        }
       }
 
       if (!anyScrollThisIter) {
         let loadRetries = 0;
         while (loadRetries < LOAD_WAIT_RETRIES) {
-          logger.log(`[Scraper] At bottom, waiting ${LOAD_WAIT_MS}ms for loading to finish...`);
+          logger.log(
+            `[Scraper] At bottom, waiting ${LOAD_WAIT_MS}ms for Instagram to load more... (retry ${loadRetries + 1}/${LOAD_WAIT_RETRIES})`
+          );
           await delay(LOAD_WAIT_MS);
           for (let c = 0; c < SCROLL_CHUNKS_PER_ITER; c++) {
             const { scrolled } = await scrollIncrementally();
             if (scrolled) anyScrollThisIter = true;
             await delay(SCROLL_CHUNK_DELAY_MS);
           }
+          logger.log(`[Scraper] Load retry ${loadRetries + 1}: anyScrollThisIter=${anyScrollThisIter}`);
           if (anyScrollThisIter) {
+            weGotMoreFromWaitRetry = true;
             logger.log('[Scraper] More content loaded, continuing scroll');
             break;
           }
@@ -879,9 +1063,21 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
               `Dialog: h=${finalDbg.ok ? finalDbg.dialogScrollHeight : '?'} ch=${finalDbg.ok ? finalDbg.dialogClientHeight : '?'}. ` +
               `Scrollables: ${finalDbg.scrollables.length}`
           );
+          if (hadNoNewThisIter) noNewCount++;
           break;
         }
       }
+
+      if (hadNoNewThisIter && !weGotMoreFromWaitRetry && scrollCount >= 3) {
+        noNewCount++;
+      }
+      if (noNewCount >= MAX_NO_NEW) {
+        logger.log(
+          `[Scraper] MAX_NO_NEW exit: noNewCount=${noNewCount} scrollCount=${scrollCount} totalScraped=${totalScraped}`
+        );
+        break;
+      }
+
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
     }
 
