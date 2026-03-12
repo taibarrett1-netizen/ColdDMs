@@ -401,6 +401,22 @@ async function setControl(clientId, pause) {
 }
 
 /**
+ * Pause all clients on worker startup. Ensures that after pm2 restart (or any worker restart),
+ * no client sends until the user explicitly clicks Start on a campaign in the dashboard.
+ */
+async function pauseAllClientsOnWorkerStart() {
+  const sb = getSupabase();
+  if (!sb) return;
+  try {
+    const { error } = await sb.from('cold_dm_control').update({ pause: 1, updated_at: new Date().toISOString() });
+    if (error) throw error;
+    console.log('[Supabase] Paused all clients on worker start (user must click Start on campaign to resume).');
+  } catch (e) {
+    console.warn('[Supabase] pauseAllClientsOnWorkerStart failed:', e?.message || e);
+  }
+}
+
+/**
  * Set a human-readable status message for this client (e.g. "Sending…", "Hourly limit reached. Next send in ~60 min.").
  * Dashboard can display this for running campaigns.
  */
@@ -606,7 +622,12 @@ async function getSentUsernames(clientId) {
     .select('username')
     .eq('client_id', clientId);
   if (error) throw error;
-  return new Set((data || []).map((r) => normalizeUsername(r.username)));
+  const set = new Set();
+  for (const row of data || []) {
+    const u = normalizeUsername(row.username).toLowerCase();
+    if (u) set.add(u);
+  }
+  return set;
 }
 
 async function clearFailedAttempts(clientId) {
@@ -873,6 +894,27 @@ async function cancelScrapeJob(clientId, jobId) {
     return true;
   }
   return false;
+}
+
+/** Returns Set of normalised usernames in cold_dm_scrape_blocklist (do not scrape as leads). */
+async function getScrapeBlocklistUsernames(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return new Set();
+  try {
+    const { data, error } = await sb
+      .from('cold_dm_scrape_blocklist')
+      .select('username')
+      .eq('client_id', clientId);
+    if (error) return new Set();
+    const set = new Set();
+    for (const row of data || []) {
+      const u = (row.username || '').trim().replace(/^@/, '').toLowerCase();
+      if (u) set.add(u);
+    }
+    return set;
+  } catch (e) {
+    return new Set();
+  }
 }
 
 /** Returns Set of normalised usernames that have active conversations (do not scrape as leads). */
@@ -1197,6 +1239,8 @@ module.exports = {
   recordScraperActions,
   savePlatformScraperSession,
   getConversationParticipantUsernames,
+  getScrapeBlocklistUsernames,
+  getSentUsernames,
   createScrapeJob,
   updateScrapeJob,
   getScrapeJob,

@@ -15,6 +15,8 @@ const {
   getScrapeJob,
   upsertLeadsBatch,
   getConversationParticipantUsernames,
+  getSentUsernames,
+  getScrapeBlocklistUsernames,
   getPlatformScraperSessionById,
   recordScraperActions,
 } = require('./database/supabase');
@@ -302,121 +304,15 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       await delay(randomDelay(1000, 2000));
     }
 
-    const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
-    let firstNoScrollTargetDumped = false;
-    let firstAtBottomScreenshot = false;
-
-    const saveDebugScreenshot = async (label) => {
-      if (!SCRAPER_DEBUG) return;
-      try {
-        const fs = require('fs');
-        const screenshotPath = path.join(process.cwd(), `scraper-debug-${label}.png`);
-        await page.screenshot({ path: screenshotPath, fullPage: false });
-        logger.log(`[Scraper] DEBUG: Screenshot saved to ${screenshotPath}`);
-      } catch (e) {
-        logger.warn('[Scraper] DEBUG: Could not save screenshot: ' + e.message);
-      }
-    };
-
-    const getScrollablesDomSummary = () =>
-      page.evaluate(() => {
-        function countProfileLinks(el) {
-          let c = 0;
-          for (const a of el.querySelectorAll('a[href^="/"]')) {
-            const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-            if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-          }
-          return c;
-        }
-        const scrollables = [];
-        for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-          const count = countProfileLinks(d);
-          if (count < 5) continue;
-          for (const div of d.querySelectorAll('div')) {
-            if (div.clientHeight > 80) {
-              scrollables.push({
-                scrollHeight: div.scrollHeight,
-                clientHeight: div.clientHeight,
-                links: div.querySelectorAll('a[href^="/"]').length,
-                className: (div.className || '').slice(0, 60),
-                hasOverflow: div.scrollHeight > div.clientHeight,
-              });
-            }
-          }
-        }
-        return scrollables.slice(0, 10);
-      });
-
-    const logScrollDebug = async (label) => {
-      const dbg = await page.evaluate(() => {
-        function countProfileLinks(el) {
-          let c = 0;
-          for (const a of el.querySelectorAll('a[href^="/"]')) {
-            const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-            if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-          }
-          return c;
-        }
-        let dialog = null;
-        let bestCount = 0;
-        for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-          const count = countProfileLinks(d);
-          if (count > bestCount && count >= 5) {
-            bestCount = count;
-            dialog = d;
-          }
-        }
-        if (bestCount < 5) {
-          for (const d of document.querySelectorAll('div')) {
-            if (d.clientHeight < 80) continue;
-            const count = countProfileLinks(d);
-            if (count > bestCount && count >= 10) {
-              bestCount = count;
-              dialog = d;
-            }
-          }
-        }
-        if (!dialog) return { ok: false };
-        const scrollables = [];
-        for (const div of dialog.querySelectorAll('div')) {
-          if (div.scrollHeight > div.clientHeight && div.clientHeight > 80) {
-            scrollables.push({
-              scrollHeight: div.scrollHeight,
-              clientHeight: div.clientHeight,
-              scrollTop: div.scrollTop,
-              links: div.querySelectorAll('a[href^="/"]').length,
-            });
-          }
-        }
-        return {
-          ok: true,
-          dialogScrollHeight: dialog.scrollHeight,
-          dialogClientHeight: dialog.clientHeight,
-          dialogScrollTop: dialog.scrollTop,
-          scrollables,
-        };
-      });
-      if (!dbg.ok) {
-        logger.log(`[Scraper] ${label}: no dialog`);
-        return;
-      }
-      logger.log(
-        `[Scraper] ${label}: dialog h=${dbg.dialogScrollHeight} ch=${dbg.dialogClientHeight} top=${dbg.dialogScrollTop} | scrollables=${dbg.scrollables.length}`
-      );
-      if (SCRAPER_DEBUG && dbg.scrollables.length > 0) {
-        dbg.scrollables.slice(0, 5).forEach((s, i) => {
-          logger.log(`[Scraper]   [${i}] h=${s.scrollHeight} ch=${s.clientHeight} top=${s.scrollTop} links=${s.links}`);
-        });
-      }
-    };
-
-    await logScrollDebug('Initial modal state');
-    await saveDebugScreenshot('01-modal-opened');
-
     let totalScraped = 0;
     const seenUsernames = new Set();
     let noNewCount = 0;
     const MAX_NO_NEW = profileFollowerCount != null && profileFollowerCount > 100 ? 12 : 6;
+    const [inConvos, sentUsernames, blocklistUsernames] = await Promise.all([
+      getConversationParticipantUsernames(clientId),
+      getSentUsernames(clientId),
+      getScrapeBlocklistUsernames(clientId),
+    ]);
     const BLACKLIST = new Set([
       'explore', 'direct', 'accounts', 'reels', 'stories', 'p', 'tv', 'tags',
       'developer', 'about', 'blog', 'jobs', 'help', 'api', 'privacy', 'terms',
@@ -430,11 +326,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         break;
       }
 
-      logger.log(
-        `[Scraper] Loop iter: scrollCount=${scrollCount} totalScraped=${totalScraped} noNewCount=${noNewCount} effectiveMax=${effectiveMax != null ? effectiveMax : 'none'}`
-      );
-
-      const batchResult = await page.evaluate((debug) => {
+      const batchResult = await page.evaluate(() => {
         const leads = [];
         let root = document.body;
         let bestCount = 0;
@@ -513,21 +405,16 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         }
 
         var anchors = root.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]');
-        var debugData = debug ? { total: anchors.length, fromSpans: 0, included: [], excluded: [], excludedReasons: [] } : null;
 
         for (var i = 0; i < anchors.length; i++) {
           var a = anchors[i];
           var u = parseUsernameFromHref(a.getAttribute('href'));
           if (!u) continue;
 
-          if (isInSuggestedRow(a)) {
-            if (debugData) debugData.excluded.push(u);
-            continue;
-          }
+          if (isInSuggestedRow(a)) continue;
 
           var displayName = getDisplayNameFromAnchor(a, u);
           leads.push({ username: u, display_name: displayName });
-          if (debugData && debugData.included.length < 20) debugData.included.push(u);
         }
 
         if (leads.length === 0) {
@@ -542,7 +429,6 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
             var u = txt.toLowerCase();
             var displayName = parentLink ? getDisplayNameFromAnchor(parentLink, u) : null;
             leads.push({ username: u, display_name: displayName });
-            if (debugData) debugData.fromSpans++;
           }
         }
 
@@ -555,74 +441,21 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
             deduped.push(L);
           }
         }
-        if (debugData) {
-          debugData.total = anchors.length;
-          return { leads: deduped, debug: debugData };
-        }
         return { leads: deduped };
-      }, SCRAPER_DEBUG);
+      });
 
       const batch = batchResult.leads || [];
-      if (SCRAPER_DEBUG && batchResult.debug) {
-        const d = batchResult.debug;
-        logger.log('[Scraper] DEBUG: profile links=' + d.total + ', included=' + d.included.length + ', excluded=' + d.excluded.length + (d.fromSpans ? ', fromSpans=' + d.fromSpans : ''));
-        if (d.included.length) logger.log('[Scraper] DEBUG included: ' + d.included.join(', '));
-        if (d.excluded.length) logger.log('[Scraper] DEBUG excluded: ' + d.excluded.join(', '));
-        if (scrollCount === 0) {
-          try {
-            const html = await page.evaluate(function () {
-              function countProfileLinks(el) {
-                let c = 0;
-                for (const a of el.querySelectorAll('a[href^="/"]')) {
-                  const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-                  if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-                }
-                return c;
-              }
-              let best = null;
-              let bestCount = 0;
-              for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-                const count = countProfileLinks(d);
-                if (count > bestCount && count >= 5) {
-                  bestCount = count;
-                  best = d;
-                }
-              }
-              if (bestCount < 5) {
-                for (const d of document.querySelectorAll('div')) {
-                  if (d.clientHeight < 80) continue;
-                  const count = countProfileLinks(d);
-                  if (count > bestCount && count >= 10) {
-                    bestCount = count;
-                    best = d;
-                  }
-                }
-              }
-              if (best) return best.outerHTML;
-              const firstDialog = document.querySelector('[role="dialog"]');
-              if (firstDialog) return '<!-- first dialog (not followers) -->\n' + firstDialog.outerHTML;
-              return 'no dialog';
-            });
-            const fs = require('fs');
-            const dumpPath = path.join(process.cwd(), 'scraper-modal-debug.html');
-            fs.writeFileSync(dumpPath, html, 'utf8');
-            logger.log('[Scraper] DEBUG: dumped modal HTML to ' + dumpPath);
-          } catch (e) {
-            logger.warn('[Scraper] DEBUG: could not dump HTML: ' + e.message);
-          }
-        }
-      }
 
-      let newLeads = batch.filter(
-        (lead) => {
-          const u = typeof lead === 'string' ? lead : lead.username;
-          return !seenUsernames.has(u) && !BLACKLIST.has(u) && u !== cleanTarget;
-        }
-      );
-      const inConvos = await getConversationParticipantUsernames(clientId);
-      newLeads = newLeads.filter((lead) => {
-        const u = typeof lead === 'string' ? lead : lead.username;
-        return !inConvos.has(u);
+      let newLeads = batch.filter((lead) => {
+        const u = (typeof lead === 'string' ? lead : lead.username).trim().replace(/^@/, '').toLowerCase();
+        return (
+          !seenUsernames.has(u) &&
+          !BLACKLIST.has(u) &&
+          u !== cleanTarget &&
+          !inConvos.has(u) &&
+          !sentUsernames.has(u) &&
+          !blocklistUsernames.has(u)
+        );
       });
       const seenBatch = new Set();
       newLeads = newLeads.filter((lead) => {
@@ -634,11 +467,10 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       if (effectiveMax && totalScraped + newLeads.length > effectiveMax) {
         newLeads = newLeads.slice(0, effectiveMax - totalScraped);
       }
-      for (const lead of newLeads) seenUsernames.add(typeof lead === 'string' ? lead : lead.username);
-
-      logger.log(
-        `[Scraper] Batch result: batch.length=${batch.length} newLeads=${newLeads.length} seenUsernames=${seenUsernames.size}`
-      );
+      for (const lead of newLeads) {
+        const u = (typeof lead === 'string' ? lead : lead.username).trim().replace(/^@/, '').toLowerCase();
+        seenUsernames.add(u);
+      }
 
       if (newLeads.length > 0) {
         await upsertLeadsBatch(clientId, newLeads, source, leadGroupId);
@@ -662,43 +494,6 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       const hadNoNewThisIter = newLeads.length === 0;
       scrollCount++;
       let weGotMoreFromWaitRetry = false;
-      const getScrollDebug = () =>
-        page.evaluate(() => {
-          const candidates = document.querySelectorAll('[role="dialog"], div[role="presentation"]');
-          let dialog = null;
-          let bestCount = 0;
-          for (const d of candidates) {
-            const links = d.querySelectorAll('a[href^="/"]');
-            let count = 0;
-            for (const a of links) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) count++;
-            }
-            if (count > bestCount) {
-              bestCount = count;
-              dialog = d;
-            }
-          }
-          if (!dialog) return { ok: false, scrollables: [] };
-          const scrollables = [];
-          for (const div of dialog.querySelectorAll('div')) {
-            if (div.scrollHeight > div.clientHeight && div.clientHeight > 80) {
-              scrollables.push({
-                scrollHeight: div.scrollHeight,
-                clientHeight: div.clientHeight,
-                scrollTop: div.scrollTop,
-                links: div.querySelectorAll('a[href^="/"]').length,
-              });
-            }
-          }
-          return {
-            ok: true,
-            dialogScrollHeight: dialog.scrollHeight,
-            dialogClientHeight: dialog.clientHeight,
-            dialogScrollTop: dialog.scrollTop,
-            scrollables,
-          };
-        });
 
       const scrollIncrementally = () =>
         page.evaluate((chunkPx) => {
@@ -729,19 +524,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
               }
             }
           }
-          if (!dialog) {
-            return {
-              scrolled: false,
-              debug: {
-                scrollTargetFound: false,
-                scrollHeight: null,
-                clientHeight: null,
-                scrollTop: null,
-                noOverflow: true,
-                targetInfo: null,
-              },
-            };
-          }
+          if (!dialog) return { scrolled: false };
           let scrollTarget = null;
           let maxLinks = 0;
           for (const div of dialog.querySelectorAll('div')) {
@@ -780,13 +563,12 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
             }
           }
           let didScroll = false;
-          let debugTarget = scrollTarget;
           for (const el of scrollables) {
+            if (!el) continue;
             const prev = el.scrollTop;
             el.scrollBy(0, chunkPx);
             if (el.scrollTop !== prev) {
               didScroll = true;
-              debugTarget = el;
               break;
             }
           }
@@ -796,117 +578,17 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
             scrollTarget.dispatchEvent(new WheelEvent('wheel', { deltaY: chunkPx, bubbles: true, cancelable: true }));
             if (scrollTarget.scrollTop !== prevTop) didScroll = true;
           }
-          if (!debugTarget) debugTarget = scrollTarget;
-          return {
-            scrolled: didScroll,
-            debug: {
-              scrollTargetFound: !!scrollTarget,
-              scrollHeight: debugTarget ? debugTarget.scrollHeight : null,
-              clientHeight: debugTarget ? debugTarget.clientHeight : null,
-              scrollTopBefore: null,
-              scrollTopAfter: debugTarget ? debugTarget.scrollTop : null,
-              noOverflow: debugTarget ? debugTarget.scrollHeight <= debugTarget.clientHeight : true,
-              targetInfo: debugTarget ? { tagName: debugTarget.tagName, className: (debugTarget.className || '').slice(0, 80), id: debugTarget.id || null } : null,
-            },
-          };
+          return { scrolled: didScroll };
         }, SCROLL_CHUNK_PX);
 
       let anyScrollThisIter = false;
-      const scrollLastIntoView = async () => {
-        const rect = await page.evaluate(() => {
-          function countProfileLinks(el) {
-            let c = 0;
-            for (const a of el.querySelectorAll('a[href^="/"]')) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-            }
-            return c;
-          }
-          let root = null;
-          let bestCount = 0;
-          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-            const count = countProfileLinks(d);
-            if (count > bestCount && count >= 5) {
-              bestCount = count;
-              root = d;
-            }
-          }
-          if (bestCount < 5) return null;
-          const links = root.querySelectorAll('a[href^="/"]');
-          const lastLink = links[links.length - 1];
-          if (!lastLink) return null;
-          lastLink.scrollIntoView({ block: 'end', behavior: 'instant' });
-          const r = lastLink.getBoundingClientRect();
-          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-        });
-        return rect;
-      };
       for (let c = 0; c < SCROLL_CHUNKS_PER_ITER; c++) {
-        const lastRect = await scrollLastIntoView();
-        if (lastRect) {
-          await delay(200);
-          try {
-            await page.mouse.move(lastRect.x, lastRect.y);
-            for (let w = 0; w < 3; w++) {
-              await page.mouse.wheel({ deltaY: 300 });
-              await delay(100);
-            }
-            anyScrollThisIter = true;
-          } catch (e) {
-          }
-        }
         const result = await scrollIncrementally();
-        const scrolled = result.scrolled;
-        if (scrolled) anyScrollThisIter = true;
-        if (!scrolled && result.debug) {
-          const d = result.debug;
-          logger.log(
-            `[Scraper] Scroll iter ${scrollCount} chunk ${c}: scrolled=false | scrollTargetFound=${d.scrollTargetFound}` +
-              (d.scrollHeight != null ? ` h=${d.scrollHeight} ch=${d.clientHeight}` : '') +
-              (d.noOverflow != null ? ` noOverflow=${d.noOverflow}` : '')
-          );
-          if (SCRAPER_DEBUG && d.targetInfo) {
-            logger.log(`[Scraper]   scrollTarget: tag=${d.targetInfo.tagName} class=${d.targetInfo.className} id=${d.targetInfo.id}`);
-          }
-          if (SCRAPER_DEBUG && !firstNoScrollTargetDumped) {
-            firstNoScrollTargetDumped = true;
-            const summary = await getScrollablesDomSummary();
-            logger.log('[Scraper] DEBUG: DOM summary (scrollable divs): ' + JSON.stringify(summary));
-          }
-        }
-        if (SCRAPER_DEBUG && c === 0) {
-          const dbg = await getScrollDebug();
-          const topAfter = result.debug?.scrollTopAfter ?? result.debug?.scrollTop;
-          logger.log(
-            `[Scraper] Scroll iter ${scrollCount} chunk 0: scrolled=${scrolled}` +
-              (result.debug ? ` target h=${result.debug.scrollHeight} ch=${result.debug.clientHeight} top=${topAfter}` : ' no target') +
-              ` | dialog: ${dbg.ok ? `h=${dbg.dialogScrollHeight} ch=${dbg.dialogClientHeight}` : 'none'}` +
-              ` | scrollables: ${dbg.scrollables.length}`
-          );
-          if (dbg.scrollables.length > 0 && dbg.scrollables.length <= 5) {
-            dbg.scrollables.forEach((s, i) => {
-              logger.log(`[Scraper]   scrollable[${i}]: h=${s.scrollHeight} ch=${s.clientHeight} top=${s.scrollTop} links=${s.links}`);
-            });
-          }
-        }
+        if (result.scrolled) anyScrollThisIter = true;
         await delay(SCROLL_CHUNK_DELAY_MS);
       }
 
       if (!anyScrollThisIter) {
-        if (SCRAPER_DEBUG && !firstAtBottomScreenshot) {
-          firstAtBottomScreenshot = true;
-          await saveDebugScreenshot('02-at-bottom');
-        }
-        const dbg = await getScrollDebug();
-          logger.log(
-            `[Scraper] At bottom (iter ${scrollCount}): dialog h=${dbg.ok ? dbg.dialogScrollHeight : '?'} ch=${dbg.ok ? dbg.dialogClientHeight : '?'}` +
-              ` | scrollables: ${dbg.scrollables.length}`
-          );
-        if (SCRAPER_DEBUG && dbg.scrollables.length > 0) {
-          dbg.scrollables.forEach((s, i) => {
-            logger.log(`[Scraper]   [${i}] h=${s.scrollHeight} ch=${s.clientHeight} top=${s.scrollTop} links=${s.links}`);
-          });
-        }
         const scrollIntoViewResult = await page.evaluate(() => {
           function countProfileLinks(el) {
             let c = 0;
@@ -944,10 +626,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           }
           return false;
         });
-        if (scrollIntoViewResult) {
-          logger.log('[Scraper] Scrolled last item into view to trigger lazy-load');
-          await delay(1500);
-        }
+        if (scrollIntoViewResult) await delay(1500);
         const wheelScrolled = await page.evaluate(() => {
           function countProfileLinks(el) {
             let c = 0;
@@ -1059,74 +738,25 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           return { scrolled: anyScroll };
         });
         if (kbdScrolled) anyScrollThisIter = true;
-        if (!anyScrollThisIter) {
-          const touchScrollResult = await page.evaluate(() => {
-            function countProfileLinks(el) {
-              let c = 0;
-              for (const a of el.querySelectorAll('a[href^="/"]')) {
-                const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-                if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-              }
-              return c;
-            }
-            let dialog = null;
-            let bestCount = 0;
-            for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 5) {
-                bestCount = count;
-                dialog = d;
-              }
-            }
-            if (!dialog) return null;
-            const rect = dialog.getBoundingClientRect();
-            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-          });
-          if (touchScrollResult) {
-            const { x, y } = touchScrollResult;
-            try {
-              await page.touchscreen.touchStart(x, y);
-              await page.touchscreen.touchMove(x, y - 150);
-              await page.touchscreen.touchEnd();
-              anyScrollThisIter = true;
-              logger.log('[Scraper] Touch scroll fallback triggered');
-            } catch (e) {
-              logger.warn('[Scraper] Touch scroll failed: ' + e.message);
-            }
-            if (anyScrollThisIter) await delay(800);
-          }
-        }
       }
 
       if (!anyScrollThisIter) {
         let loadRetries = 0;
         while (loadRetries < LOAD_WAIT_RETRIES) {
-          logger.log(
-            `[Scraper] At bottom, waiting ${LOAD_WAIT_MS}ms for Instagram to load more... (retry ${loadRetries + 1}/${LOAD_WAIT_RETRIES})`
-          );
           await delay(LOAD_WAIT_MS);
           for (let c = 0; c < SCROLL_CHUNKS_PER_ITER; c++) {
             const { scrolled } = await scrollIncrementally();
             if (scrolled) anyScrollThisIter = true;
             await delay(SCROLL_CHUNK_DELAY_MS);
           }
-          logger.log(`[Scraper] Load retry ${loadRetries + 1}: anyScrollThisIter=${anyScrollThisIter}`);
           if (anyScrollThisIter) {
             weGotMoreFromWaitRetry = true;
-            logger.log('[Scraper] More content loaded, continuing scroll');
             break;
           }
           loadRetries++;
         }
         if (!anyScrollThisIter) {
-          await saveDebugScreenshot('03-exhausted-retries');
-          const finalDbg = await getScrollDebug();
-          logger.log(
-            `[Scraper] No more scrollable content after ${LOAD_WAIT_RETRIES} retries. ` +
-              `Dialog: h=${finalDbg.ok ? finalDbg.dialogScrollHeight : '?'} ch=${finalDbg.ok ? finalDbg.dialogClientHeight : '?'}. ` +
-              `Scrollables: ${finalDbg.scrollables.length}. ` +
-              `Tip: Try SCRAPER_USE_DESKTOP=1 if mobile scroll keeps failing.`
-          );
+          logger.log(`[Scraper] No more scrollable content after ${LOAD_WAIT_RETRIES} retries.`);
           if (hadNoNewThisIter) noNewCount++;
           break;
         }
@@ -1250,7 +880,11 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     logger.log('[Scraper] Comment scrape: ' + postUrls.length + ' post(s)');
     let totalScraped = 0;
     const seenUsernames = new Set();
-    const inConvos = await getConversationParticipantUsernames(clientId);
+    const [inConvos, sentUsernames, blocklistUsernames] = await Promise.all([
+      getConversationParticipantUsernames(clientId),
+      getSentUsernames(clientId),
+      getScrapeBlocklistUsernames(clientId),
+    ]);
     const scraperUsername = (session?.instagram_username || '').trim().replace(/^@/, '').toLowerCase();
     if (scraperUsername) seenUsernames.add(scraperUsername);
 
@@ -1366,6 +1000,8 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
             if (seenUsernames.has(u)) return u + ':seen';
             if (BLACKLIST.has(u)) return u + ':blacklist';
             if (inConvos.has(u)) return u + ':inConvos';
+            if (sentUsernames.has(u)) return u + ':sent';
+            if (blocklistUsernames.has(u)) return u + ':blocklist';
             if (postAuthor && u === postAuthor) return u + ':postAuthor';
             return u + ':new';
           });
@@ -1373,7 +1009,13 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         }
 
         let newUsernames = usernames.filter(
-          (u) => !seenUsernames.has(u) && !BLACKLIST.has(u) && !inConvos.has(u) && (!postAuthor || u !== postAuthor)
+          (u) =>
+            !seenUsernames.has(u) &&
+            !BLACKLIST.has(u) &&
+            !inConvos.has(u) &&
+            !sentUsernames.has(u) &&
+            !blocklistUsernames.has(u) &&
+            (!postAuthor || u !== postAuthor)
         );
         newUsernames = [...new Set(newUsernames)];
         if (maxLeads && totalScraped + newUsernames.length > maxLeads) {
