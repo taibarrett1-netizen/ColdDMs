@@ -1225,6 +1225,7 @@ module.exports = {
   getHourlySent,
   getControl,
   setControl,
+  pauseAllClientsOnWorkerStart,
   setClientStatusMessage,
   getClientStatusMessage,
   getRecentSent,

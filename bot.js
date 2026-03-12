@@ -629,6 +629,7 @@ async function buildAdapterForClient(clientId) {
  */
 async function runBotMultiTenant() {
   logger.log('Starting multi-tenant sender loop (always-on).');
+  await sb.pauseAllClientsOnWorkerStart();
   const launchOpts = {
     headless: HEADLESS,
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
