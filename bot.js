@@ -732,6 +732,7 @@ async function runBotMultiTenant() {
   }
 
   for (;;) {
+    // Fresh DB read every iteration (no cache). After PM2 restart, first run sees current cold_dm_control, cold_dm_campaigns.status, and cold_dm_campaign_leads.
     const next = await sb.getNextPendingWorkAnyClient();
     if (!next) {
       const clientIds = await sb.getClientIdsWithPauseZero();

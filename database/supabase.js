@@ -473,7 +473,8 @@ async function getClientIdsWithPauseZero() {
 
 /**
  * Returns next pending work from any client with pause = 0.
- * Tries clients in order; returns first client that has a pending campaign lead.
+ * Fresh read every call (no cache). Only campaigns with status = 'active' are considered;
+ * then cold_dm_campaign_leads with status = 'pending', schedule/timezone/limits applied.
  * @returns {Promise<{ clientId: string, work: object } | null>}
  */
 async function getNextPendingWorkAnyClient() {
