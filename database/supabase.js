@@ -1032,6 +1032,37 @@ async function getActiveCampaigns(clientId) {
 }
 
 /**
+ * Returns a short hint for why there is no sendable work for this client (e.g. no active campaigns, or campaigns are stopped).
+ */
+async function getNoWorkHint(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return '';
+  const { data: campaigns } = await sb
+    .from('cold_dm_campaigns')
+    .select('id, name, status')
+    .eq('client_id', clientId);
+  if (!campaigns?.length) return 'No campaigns.';
+  const active = campaigns.filter((c) => c.status === 'active');
+  if (active.length > 0) return '';
+  const withPending = await Promise.all(
+    campaigns.map(async (c) => {
+      const { count } = await sb
+        .from('cold_dm_campaign_leads')
+        .select('*', { count: 'exact', head: true })
+        .eq('campaign_id', c.id)
+        .eq('status', 'pending');
+      return { name: c.name, status: c.status, pending: count ?? 0 };
+    })
+  );
+  const stoppedWithPending = withPending.filter((c) => c.pending > 0 && c.status !== 'active');
+  if (stoppedWithPending.length > 0) {
+    const names = stoppedWithPending.map((c) => `"${c.name}" (${c.status})`).join(', ');
+    return `Campaign(s) have pending leads but status is not active: ${names}. Set campaign to Active in the dashboard.`;
+  }
+  return 'No campaigns with status=active and pending leads.';
+}
+
+/**
  * Schedule window uses campaign timezone (cold_dm_campaigns.timezone). Not cold_dm_settings.timezone.
  * @param {string} [timezone] - IANA timezone from campaign row (e.g. America/New_York). If omitted/null, uses UTC.
  */
@@ -1271,5 +1302,6 @@ module.exports = {
   getClientOutsideScheduleStatus,
   getClientNoWorkReason,
   getClientNoWorkResumeAt,
+  getNoWorkHint,
   getFirstNameBlocklist,
 };

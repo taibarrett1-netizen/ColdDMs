@@ -740,6 +740,10 @@ async function runBotMultiTenant() {
         }
       }
       if (!earliestResumeAt) {
+        for (const cid of clientIds) {
+          const hint = await sb.getNoWorkHint(cid).catch(() => '');
+          if (hint) logger.log('No work: ' + hint);
+        }
         logger.log('No work. Exiting. Start again from the dashboard when you have a campaign to run.');
         await browser.close().catch(() => {});
         process.exit(0);
