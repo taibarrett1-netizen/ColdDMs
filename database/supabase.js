@@ -187,6 +187,18 @@ async function getSettings(clientId) {
   return data;
 }
 
+/** Returns list of first names (lowercase) that should be treated as empty in message templates. */
+async function getFirstNameBlocklist(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return [];
+  const { data, error } = await sb
+    .from('cold_dm_first_name_blocklist')
+    .select('first_name_lower')
+    .eq('client_id', clientId);
+  if (error) throw error;
+  return (data || []).map((r) => (r.first_name_lower || '').toLowerCase()).filter(Boolean);
+}
+
 async function getMessageTemplates(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return [];
@@ -1260,4 +1272,5 @@ module.exports = {
   getClientOutsideScheduleStatus,
   getClientNoWorkReason,
   getClientNoWorkResumeAt,
+  getFirstNameBlocklist,
 };

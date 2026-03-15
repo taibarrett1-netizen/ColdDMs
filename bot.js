@@ -309,7 +309,7 @@ async function login(page, credentials) {
 
 const MAX_SEND_RETRIES = 3;
 
-async function sendDMOnce(page, u, messageTemplate, nameFallback = {}) {
+async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts = {}) {
   await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
   await humanDelay();
 
@@ -349,7 +349,15 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}) {
     return false;
   }, u);
   if (!userClicked) {
-    return { ok: false, reason: 'user_not_found' };
+    const failureHint = await page.evaluate(() => {
+      const body = (document.body && document.body.innerText) ? document.body.innerText : '';
+      const lower = body.toLowerCase();
+      if (lower.includes('this account is private') || lower.includes('account is private') || lower.includes('private account')) return 'account_private';
+      if (lower.includes("couldn't find") || lower.includes('could not find') || lower.includes('no results') || lower.includes('no users found')) return 'user_not_found';
+      if (lower.includes('try again later') || lower.includes('too many')) return 'rate_limited';
+      return 'user_not_found';
+    }).catch(() => 'user_not_found');
+    return { ok: false, reason: failureHint };
   }
   await delay(1500);
 
@@ -426,12 +434,16 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}) {
   const composeSelector = 'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]';
   logger.log('Waiting for compose area...');
   let composeFound = false;
+  let noComposeReason = 'no_compose';
   try {
     await page.waitForSelector(composeSelector, { timeout: 20000 });
     composeFound = true;
   } catch (e) {
     const diag = await composeDiagnostic().catch(() => ({}));
-    logger.warn('Compose wait failed ' + e.message);
+    const bodySnippet = (diag.bodySnippet || '').toLowerCase();
+    if (bodySnippet.includes('this account is private') || bodySnippet.includes('account is private') || bodySnippet.includes("can't message")) noComposeReason = 'account_private';
+    else if (bodySnippet.includes('couldn\'t find') || bodySnippet.includes('no results')) noComposeReason = 'user_not_found';
+    logger.warn('Compose wait failed ' + e.message + (noComposeReason !== 'no_compose' ? ' (page suggests: ' + noComposeReason + ')' : ''));
     logger.log('Compose diagnostic: ' + JSON.stringify(diag));
   }
 
@@ -441,11 +453,12 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}) {
     last_name: nameFallback.last_name ?? null,
     display_name: nameFallback.display_name ?? null,
   };
-  const msg = substituteVariables(messageTemplate, leadFromPage);
+  const msg = substituteVariables(messageTemplate, leadFromPage, { firstNameBlocklist: sendOpts.firstNameBlocklist || new Set() });
 
   if (composeFound) {
     const diag = await composeDiagnostic().catch(() => ({}));
     logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+    noComposeReason = null;
 
     const composeEl = await page.evaluateHandle(() => {
       const byPlaceholder = (el) => {
@@ -496,7 +509,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}) {
     return { ok: true, finalMessage: msg };
   }
 
-  return { ok: false, reason: 'no_compose' };
+  return { ok: false, reason: noComposeReason || 'no_compose' };
 }
 
 async function sendDM(page, username, adapter, options = {}) {
@@ -532,9 +545,14 @@ async function sendDM(page, username, adapter, options = {}) {
     last_name: options.last_name,
     display_name: options.display_name,
   };
+  let firstNameBlocklist = new Set();
+  if (options.clientId && sb.getFirstNameBlocklist) {
+    const list = await sb.getFirstNameBlocklist(options.clientId).catch(() => []);
+    list.forEach((n) => firstNameBlocklist.add(n.toLowerCase()));
+  }
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
-      const result = await sendDMOnce(page, u, messageTemplate, nameFallback);
+      const result = await sendDMOnce(page, u, messageTemplate, nameFallback, { firstNameBlocklist });
       if (result.ok) {
         const finalMessage = result.finalMessage != null ? result.finalMessage : messageTemplate;
         await Promise.resolve(logSent('success', finalMessage));
@@ -542,7 +560,8 @@ async function sendDM(page, username, adapter, options = {}) {
         logger.log(`Sent to @${u}: ${(finalMessage || messageTemplate).slice(0, 30)}...`);
         return { ok: true };
       }
-      if (result.reason === 'user_not_found' || result.reason === 'no_compose') {
+      const terminalReasons = ['user_not_found', 'no_compose', 'account_private', 'rate_limited'];
+      if (terminalReasons.includes(result.reason)) {
         await Promise.resolve(logSent('failed', result.finalMessage));
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed').catch(() => {});
         logger.warn(`Send failed for @${u}: ${result.reason}`);
@@ -718,6 +737,7 @@ async function runBotMultiTenant() {
     }
 
     const options = {
+      clientId,
       messageOverride: work.messageText,
       campaignId: work.campaignId,
       campaignLeadId: work.campaignLeadId,
