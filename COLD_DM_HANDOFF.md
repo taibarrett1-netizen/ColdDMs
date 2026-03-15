@@ -157,9 +157,10 @@ If `first_name` / `last_name` are not stored for a lead, the VPS derives them fr
 | `sent_at` | string (ISO) | No | When the message was sent; default = now. |
 | `message_group_id` | UUID | No | `cold_dm_message_groups.id` for the group that was used. |
 | `message_group_message_id` | UUID | No | `cold_dm_message_group_messages.id` of the specific message sent (for outreach routing). |
+| `display_name` | string | No | Recipient's Instagram display/full name (e.g. "AI Setter Test 8"). When present, the dashboard should store it as the conversation's `participant_name` so GHL Contact Created can match by contact full_name. If omitted, matching falls back to username. |
 | `ghl_contact_id` | string | No | If the VPS ever has the GHL contact ID at send time, pass it and the dashboard will store it in the mapping table as well. |
 
-**Behaviour:** The function gets or creates a conversation for `(client_id, instagram_thread_id)` with `tags = ['cold-outreach']`, resolves `outreach_message_id` from the message group when provided, and backfills the first "us" message if missing. If `ghl_contact_id` is passed, it also upserts into `cold_dm_ghl_contact_mapping`. When the lead replies, the Instagram webhook removes the `cold-outreach` tag so the conversation becomes a normal one.
+**Behaviour:** The function gets or creates a conversation for `(client_id, instagram_thread_id)` with `tags = ['cold-outreach']`, resolves `outreach_message_id` from the message group when provided, and backfills the first "us" message if missing. When `display_name` is provided, set the conversation's participant name to it so GHL Contact Created (which sends the contact's full_name) can match reliably. If `ghl_contact_id` is passed, it also upserts into `cold_dm_ghl_contact_mapping`. When the lead replies, the Instagram webhook removes the `cold-outreach` tag so the conversation becomes a normal one.
 
 **Response:** `200` with `{ "ok": true, "conversation_id": "<uuid>", "created": true|false }`. On error, `4xx/5xx` with `{ "error": "..." }`.
 

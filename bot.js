@@ -573,7 +573,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       await page.keyboard.press('Enter');
       await delay(1500);
       const threadId = getInstagramThreadIdFromUrl(page.url());
-      return { ok: true, finalMessage: msg, instagramThreadId: threadId };
+      return { ok: true, finalMessage: msg, instagramThreadId: threadId, display_name: leadFromPage.display_name || undefined };
     }
     await composeEl.dispose();
     logger.warn('Compose element not found after selector matched');
@@ -593,7 +593,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     await page.keyboard.press('Enter');
     await delay(1500);
     const threadId = getInstagramThreadIdFromUrl(page.url());
-    return { ok: true, finalMessage: msg, instagramThreadId: threadId };
+    return { ok: true, finalMessage: msg, instagramThreadId: threadId, display_name: leadFromPage.display_name || undefined };
   }
 
   return { ok: false, reason: noComposeReason || 'no_compose' };
@@ -646,7 +646,7 @@ async function sendDM(page, username, adapter, options = {}) {
         await Promise.resolve(logSent('success', finalMessage));
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent').catch(() => {});
         if (options.clientId && result.instagramThreadId) {
-          coldDmOnSend({
+          const payload = {
             client_id: options.clientId,
             instagram_thread_id: result.instagramThreadId,
             username: u,
@@ -654,7 +654,9 @@ async function sendDM(page, username, adapter, options = {}) {
             sent_at: new Date().toISOString(),
             message_group_id: messageGroupId || undefined,
             message_group_message_id: messageGroupMessageId || undefined,
-          }).catch(() => {});
+          };
+          if (result.display_name) payload.display_name = result.display_name;
+          coldDmOnSend(payload).catch(() => {});
         }
         logger.log(`Sent to @${u}: ${(finalMessage || messageTemplate).slice(0, 30)}...`);
         return { ok: true };
