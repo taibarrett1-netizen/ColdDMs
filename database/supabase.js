@@ -44,6 +44,19 @@ function getToday() {
   return new Date().toISOString().slice(0, 10);
 }
 
+/**
+ * Normalize schedule time to HH:mm:ss. Handles DB TIME (e.g. "03:00:00") and ISO timestamps (e.g. "2026-01-01T03:00:00.000Z").
+ */
+function normalizeScheduleTime(value) {
+  if (value == null || value === '') return null;
+  const s = String(value).trim();
+  if (s.includes('T')) {
+    const timePart = s.split('T')[1];
+    return timePart ? timePart.replace(/\.\d+Z?$/i, '').slice(0, 8) : null;
+  }
+  return s.slice(0, 8) || null;
+}
+
 /** Returns YYYY-MM-DD in the given IANA timezone; falls back to UTC if invalid/missing. */
 function getTodayInTimezone(timezone) {
   if (!timezone || typeof timezone !== 'string') return getToday();
@@ -120,8 +133,8 @@ function getNextHourStartInTimezone(timezone) {
 
 /** Returns the UTC Date for the next time the schedule window opens (scheduleStart today or tomorrow in TZ). */
 function getNextScheduleStartInTimezone(scheduleStartTime, timezone) {
-  if (!scheduleStartTime) return null;
-  const startStr = String(scheduleStartTime).slice(0, 8);
+  const startStr = normalizeScheduleTime(scheduleStartTime);
+  if (!startStr) return null;
   const [sh, sm] = startStr.split(':').map(Number);
   const startTime = `${String(sh).padStart(2, '0')}:${String(sm || 0).padStart(2, '0')}`;
   if (!timezone || typeof timezone !== 'string') {
@@ -466,7 +479,8 @@ async function getNextPendingWorkAnyClient() {
 async function getClientOutsideScheduleStatus(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return null;
-  const campaigns = await getActiveCampaigns(clientId);
+  const [campaigns, settings] = await Promise.all([getActiveCampaigns(clientId), getSettings(clientId)]);
+  const settingsTz = settings?.timezone ?? null;
   let firstWindow = null;
   let tzLabel = 'UTC';
   let hasPending = false;
@@ -479,15 +493,15 @@ async function getClientOutsideScheduleStatus(clientId) {
       .eq('status', 'pending');
     if (err || (count ?? 0) === 0) continue;
     hasPending = true;
-    const campaignTz = camp.timezone ?? null;
+    const campaignTz = camp.timezone ?? settingsTz ?? null;
     const inSchedule = isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz);
     if (inSchedule) {
       allOutside = false;
       break;
     }
     if (!firstWindow && (camp.schedule_start_time || camp.schedule_end_time)) {
-      const start = camp.schedule_start_time ? String(camp.schedule_start_time).slice(0, 5) : '00:00';
-      const end = camp.schedule_end_time ? String(camp.schedule_end_time).slice(0, 5) : '24:00';
+      const start = (normalizeScheduleTime(camp.schedule_start_time) || '00:00:00').slice(0, 5);
+      const end = (normalizeScheduleTime(camp.schedule_end_time) || '24:00:00').slice(0, 5);
       firstWindow = `${start}–${end}`;
       tzLabel = campaignTz || 'UTC';
     }
@@ -528,6 +542,7 @@ async function getClientNoWorkResumeAt(clientId) {
       : { count: 0 };
   if ((pendingCount ?? 0) === 0) return { message: null, reason: 'no_pending', resumeAt: null };
 
+  const settingsTz = settings?.timezone ?? null;
   let earliestScheduleResume = null;
   let firstWindow = null;
   let tzLabel = 'UTC';
@@ -539,15 +554,15 @@ async function getClientNoWorkResumeAt(clientId) {
       .eq('campaign_id', camp.id)
       .eq('status', 'pending');
     if ((campPending ?? 0) === 0) continue;
-    const campaignTz = camp.timezone ?? null;
+    const campaignTz = camp.timezone ?? settingsTz ?? null;
     const inSchedule = isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz);
     if (inSchedule) {
       allOutside = false;
       break;
     }
     if (!firstWindow && (camp.schedule_start_time || camp.schedule_end_time)) {
-      const start = camp.schedule_start_time ? String(camp.schedule_start_time).slice(0, 5) : '00:00';
-      const end = camp.schedule_end_time ? String(camp.schedule_end_time).slice(0, 5) : '24:00';
+      const start = (normalizeScheduleTime(camp.schedule_start_time) || '00:00:00').slice(0, 5);
+      const end = (normalizeScheduleTime(camp.schedule_end_time) || '24:00:00').slice(0, 5);
       firstWindow = `${start}–${end}`;
       tzLabel = campaignTz || 'UTC';
     }
@@ -1023,8 +1038,8 @@ function isWithinSchedule(scheduleStart, scheduleEnd, timezone) {
   } else {
     current = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
   }
-  const start = scheduleStart ? String(scheduleStart).slice(0, 8) : '00:00:00';
-  const end = scheduleEnd ? String(scheduleEnd).slice(0, 8) : '23:59:59';
+  const start = normalizeScheduleTime(scheduleStart) || '00:00:00';
+  const end = normalizeScheduleTime(scheduleEnd) || '23:59:59';
   if (start <= end) return current >= start && current <= end;
   return current >= start || current <= end;
 }
@@ -1059,8 +1074,9 @@ async function getNextPendingCampaignLead(clientId) {
   if (!sb || !clientId) return null;
   const settings = await getSettings(clientId);
   const campaigns = await getActiveCampaigns(clientId);
+  const settingsTz = settings?.timezone ?? null;
   for (const camp of campaigns) {
-    const campaignTz = camp.timezone ?? null;
+    const campaignTz = camp.timezone ?? settingsTz ?? null;
     if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz)) continue;
     let messageText = null;
     let messageGroupMessageId = null;
