@@ -322,7 +322,7 @@ async function alreadySent(clientId, username) {
   return !!data;
 }
 
-async function logSentMessage(clientId, username, message, status = 'success', campaignId = null, messageGroupId = null, messageGroupMessageId = null) {
+async function logSentMessage(clientId, username, message, status = 'success', campaignId = null, messageGroupId = null, messageGroupMessageId = null, failureReason = null) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
   const u = normalizeUsername(username);
@@ -336,6 +336,7 @@ async function logSentMessage(clientId, username, message, status = 'success', c
   if (campaignId) insertPayload.campaign_id = campaignId;
   if (messageGroupId) insertPayload.message_group_id = messageGroupId;
   if (messageGroupMessageId) insertPayload.message_group_message_id = messageGroupMessageId;
+  if (status === 'failed' && failureReason) insertPayload.failure_reason = failureReason;
   const { error: insertErr } = await sb.from('cold_dm_sent_messages').insert(insertPayload);
   if (insertErr) throw insertErr;
 
@@ -1189,7 +1190,7 @@ async function getNextPendingCampaignLead(clientId) {
   return null;
 }
 
-async function updateCampaignLeadStatus(campaignLeadId, status) {
+async function updateCampaignLeadStatus(campaignLeadId, status, failureReason = null) {
   const sb = getSupabase();
   if (!sb || !campaignLeadId) throw new Error('Supabase or campaignLeadId missing');
   const { data: row } = await sb
@@ -1199,6 +1200,7 @@ async function updateCampaignLeadStatus(campaignLeadId, status) {
     .maybeSingle();
   const payload = { status };
   if (status === 'sent' || status === 'failed') payload.sent_at = new Date().toISOString();
+  if (status === 'failed' && failureReason) payload.failure_reason = failureReason;
   const { error } = await sb.from('cold_dm_campaign_leads').update(payload).eq('id', campaignLeadId);
   if (error) throw error;
 

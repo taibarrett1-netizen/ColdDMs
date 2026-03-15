@@ -363,7 +363,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   await searchEl.type(u, { delay: 100 });
   await searchEl.dispose();
   await searchInput.dispose();
-  await delay(1500);
+  await delay(2800);
 
   const userClicked = await page.evaluate((username) => {
     const needle = username.toLowerCase().replace(/^@/, '');
@@ -380,15 +380,20 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     return false;
   }, u);
   if (!userClicked) {
-    const failureHint = await page.evaluate(() => {
+    const { hint, pageSnippet, searchPreview } = await page.evaluate(() => {
       const body = (document.body && document.body.innerText) ? document.body.innerText : '';
       const lower = body.toLowerCase();
-      if (lower.includes('this account is private') || lower.includes('account is private') || lower.includes('private account')) return 'account_private';
-      if (lower.includes("couldn't find") || lower.includes('could not find') || lower.includes('no results') || lower.includes('no users found')) return 'user_not_found';
-      if (lower.includes('try again later') || lower.includes('too many')) return 'rate_limited';
-      return 'user_not_found';
-    }).catch(() => 'user_not_found');
-    return { ok: false, reason: failureHint };
+      let hint = 'user_not_found';
+      if (lower.includes('this account is private') || lower.includes('account is private') || lower.includes('private account')) hint = 'account_private';
+      else if (lower.includes("couldn't find") || lower.includes('could not find') || lower.includes('no results') || lower.includes('no users found')) hint = 'user_not_found';
+      else if (lower.includes('try again later') || lower.includes('too many')) hint = 'rate_limited';
+      const snippet = body.replace(/\s+/g, ' ').trim().slice(0, 120);
+      const buttons = Array.from(document.querySelectorAll('div[role="button"]')).filter((b) => !(b.textContent || '').toLowerCase().includes('more accounts'));
+      const preview = buttons.slice(0, 4).map((b) => (b.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)).filter(Boolean);
+      return { hint, pageSnippet: snippet || '(empty)', searchPreview: preview.length ? preview.join(' | ') : '' };
+    }).catch(() => ({ hint: 'user_not_found', pageSnippet: '(unable to read page)', searchPreview: '' }));
+    const extra = searchPreview ? ' First results: ' + searchPreview : '';
+    return { ok: false, reason: hint, pageSnippet: (pageSnippet || '') + extra };
   }
   await delay(1500);
 
@@ -472,7 +477,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   } catch (e) {
     const diag = await composeDiagnostic().catch(() => ({}));
     const bodySnippet = (diag.bodySnippet || '').toLowerCase();
-    if (bodySnippet.includes('this account is private') || bodySnippet.includes('account is private') || bodySnippet.includes("can't message")) noComposeReason = 'account_private';
+    if (bodySnippet.includes('this account is private') || bodySnippet.includes('account is private')) noComposeReason = 'account_private';
+    else if (bodySnippet.includes("can't message") || bodySnippet.includes("can't send") || bodySnippet.includes('message request') || bodySnippet.includes("don't accept")) noComposeReason = 'messages_restricted';
     else if (bodySnippet.includes('couldn\'t find') || bodySnippet.includes('no results')) noComposeReason = 'user_not_found';
     logger.warn('Compose wait failed ' + e.message + (noComposeReason !== 'no_compose' ? ' (page suggests: ' + noComposeReason + ')' : ''));
     logger.log('Compose diagnostic: ' + JSON.stringify(diag));
@@ -570,7 +576,8 @@ async function sendDM(page, username, adapter, options = {}) {
   }
 
   const messageTemplate = messageOverride || adapter.getRandomMessage();
-  const logSent = (status, finalMsg) => adapter.logSentMessage(u, finalMsg != null ? finalMsg : messageTemplate, status, campaignId, messageGroupId, messageGroupMessageId);
+  const logSent = (status, finalMsg, failureReason = null) =>
+    adapter.logSentMessage(u, finalMsg != null ? finalMsg : messageTemplate, status, campaignId, messageGroupId, messageGroupMessageId, failureReason);
 
   let lastError;
   const nameFallback = {
@@ -604,11 +611,12 @@ async function sendDM(page, username, adapter, options = {}) {
         logger.log(`Sent to @${u}: ${(finalMessage || messageTemplate).slice(0, 30)}...`);
         return { ok: true };
       }
-      const terminalReasons = ['user_not_found', 'no_compose', 'account_private', 'rate_limited'];
+      const terminalReasons = ['user_not_found', 'no_compose', 'account_private', 'rate_limited', 'messages_restricted'];
       if (terminalReasons.includes(result.reason)) {
-        await Promise.resolve(logSent('failed', result.finalMessage));
-        if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed').catch(() => {});
-        logger.warn(`Send failed for @${u}: ${result.reason}`);
+        await Promise.resolve(logSent('failed', result.finalMessage, result.reason));
+        if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', result.reason).catch(() => {});
+        const snippet = result.pageSnippet ? '. Search result: ' + result.pageSnippet : '';
+        logger.warn(`Send failed for @${u}: ${result.reason}${snippet}`);
         return result;
       }
       lastError = new Error(result.reason);
@@ -652,8 +660,8 @@ async function buildAdapterForClient(clientId) {
     dailyLimit: Math.min(settings?.daily_send_limit ?? 100, 200),
     maxPerHour: settings?.max_sends_per_hour ?? 20,
     alreadySent: (u) => sb.alreadySent(clientId, u),
-    logSentMessage: (u, msg, status, campaignId, messageGroupId, messageGroupMessageId) =>
-      sb.logSentMessage(clientId, u, msg, status, campaignId, messageGroupId, messageGroupMessageId),
+    logSentMessage: (u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason) =>
+      sb.logSentMessage(clientId, u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason),
     getDailyStats: () => sb.getDailyStats(clientId),
     getHourlySent: () => sb.getHourlySent(clientId),
     getControl: () => sb.getControl(clientId),
