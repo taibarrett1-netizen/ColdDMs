@@ -18,25 +18,37 @@ function normalizeName(str) {
 /**
  * @param {string} text - Message template with {{variable}} placeholders.
  * @param {object} lead - { username, first_name?, last_name?, display_name? }.
- * @param {{ firstNameBlocklist?: Set<string> }} [opts] - Optional. If first_name (resolved) is in blocklist (lowercase), it is cleared.
+ * @param {{ firstNameBlocklist?: Set<string>, onFirstNameEmpty?: (reason: string) => void }} [opts] - Optional. If first_name (resolved) is in blocklist (lowercase), it is cleared. onFirstNameEmpty(reason) called when template uses {{first_name}}/{{full_name}} but first_name is empty.
  */
 function substituteVariables(text, lead = {}, opts = {}) {
   if (!text || typeof text !== 'string') return text;
   const username = (lead.username || '').trim().replace(/^@/, '') || '';
+  const templateUsesFirstName = /\{\{\s*(first_name|full_name)\s*\}\}/i.test(text);
 
   let first = '';
+  let firstEmptyReason = null;
   let last = (lead.last_name || '').trim();
   if (lead.display_name && typeof lead.display_name === 'string') {
     const firstWord = lead.display_name.trim().split(/\s+/)[0] || '';
     first = normalizeName(firstWord);
+    if (!first && firstWord) firstEmptyReason = 'display_name first word normalized to empty (e.g. emoji/symbols only)';
   }
   if (!first && (lead.first_name || '').trim()) {
     first = normalizeName((lead.first_name || '').trim());
   }
+  if (!first && !firstEmptyReason) {
+    firstEmptyReason = 'no display_name or first_name on lead';
+  }
   if (last) last = normalizeName(last);
 
   if (opts.firstNameBlocklist && first && opts.firstNameBlocklist.has(first.toLowerCase())) {
+    const blocked = first;
     first = '';
+    firstEmptyReason = `first_name blocklisted ("${blocked}")`;
+  }
+
+  if (first === '' && templateUsesFirstName && typeof opts.onFirstNameEmpty === 'function' && firstEmptyReason) {
+    opts.onFirstNameEmpty(firstEmptyReason);
   }
 
   const fullName = [first, last].filter(Boolean).join(' ');

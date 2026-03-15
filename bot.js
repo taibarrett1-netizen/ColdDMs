@@ -56,7 +56,11 @@ async function coldDmOnSend(payload) {
     });
     if (!res.ok) {
       const errText = await res.text();
-      logger.warn('cold-dm-on-send failed: ' + res.status + ' ' + errText);
+      if (res.status === 404) {
+        logger.warn('cold-dm-on-send 404: Edge Function not deployed. Deploy "cold-dm-on-send" in your Supabase project so the dashboard can create cold-outreach conversations and match GHL contacts. See COLD_DM_HANDOFF.md §2a.');
+      } else {
+        logger.warn('cold-dm-on-send failed: ' + res.status + ' ' + errText);
+      }
     }
   } catch (e) {
     logger.warn('cold-dm-on-send request error: ' + e.message);
@@ -490,7 +494,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     last_name: nameFallback.last_name ?? null,
     display_name: nameFallback.display_name ?? null,
   };
-  const msg = substituteVariables(messageTemplate, leadFromPage, { firstNameBlocklist: sendOpts.firstNameBlocklist || new Set() });
+  const msg = substituteVariables(messageTemplate, leadFromPage, {
+    firstNameBlocklist: sendOpts.firstNameBlocklist || new Set(),
+    onFirstNameEmpty: (reason) => logger.warn(`First name empty for @${u}: ${reason}`),
+  });
 
   if (composeFound) {
     const diag = await composeDiagnostic().catch(() => ({}));
