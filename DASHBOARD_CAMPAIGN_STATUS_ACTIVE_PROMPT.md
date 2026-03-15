@@ -25,3 +25,5 @@ When there’s no work, the bot now logs a hint if campaigns have pending leads 
 `No work: Campaign(s) have pending leads but status is not active: "Testing GHL" (stopped). Set campaign to Active in the dashboard.`
 
 Use that message in the dashboard (e.g. tooltip or help text) so users know they must set the campaign to Active to send.
+
+**Fix dashboard showing "Sending" when bot says no work:** The VPS now updates the client status message when it exits with no work (e.g. "Campaign(s) have pending leads but status is not active…"). The dashboard should display this status from the API as the main status text, not infer "Sending" from pause=0 + pending leads. Only show "Sending" when the status message is literally "Sending…" or "Waiting. Next send in X min."
