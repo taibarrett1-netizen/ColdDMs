@@ -626,7 +626,7 @@ app.post('/api/scraper/start', async (req, res) => {
     });
     child.stderr.on('data', (chunk) => {
       const line = trimChunk(chunk);
-      if (line) console.error(`[ScraperWorker ${jobId} ERROR]`, line);
+      if (line) console.log(`[ScraperWorker ${jobId}]`, line);
     });
     child.on('error', async (err) => {
       console.error('[API] Failed to start Python scraper worker', err);

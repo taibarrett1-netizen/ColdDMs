@@ -125,13 +125,6 @@ def scrape_followers(conn, job: dict):
   )
   logger.info("Client ready, resolving user_id for @%s", target_username)
 
-  max_leads = job.get("max_leads") or None
-  if max_leads is not None:
-    try:
-      max_leads = int(max_leads)
-    except (TypeError, ValueError):
-      max_leads = None
-
   lead_group_id = job.get("lead_group_id")
   source = f"followers:{target_username}"
 
@@ -143,6 +136,21 @@ def scrape_followers(conn, job: dict):
   ) = load_filter_sets(conn, client_id)
 
   scraped_new = int(job.get("scraped_count") or 0)
+
+  max_leads = job.get("max_leads") or None
+  if max_leads is not None:
+    try:
+      max_leads = int(max_leads)
+    except (TypeError, ValueError):
+      max_leads = None
+  if max_leads is not None:
+    logger.info(
+      "Job has max_leads=%s (already scraped=%d). Will stop when new leads reach this count.",
+      max_leads,
+      scraped_new,
+    )
+  else:
+    logger.info("Job has no max_leads; will scrape all available followers.")
 
   _sleep_before_first()
   try:
@@ -392,7 +400,7 @@ def main(argv: List[str]) -> int:
     stream=sys.stderr,
   )
   # Silence noisy third-party loggers (instagrapi/urllib3 dump URLs and sometimes response bodies)
-  for name in ("instagrapi", "urllib3", "requests", "instagrapi.mixins.private", "private_request"):
+  for name in ("instagrapi", "urllib3", "requests", "instagrapi.mixins.private", "private_request", "public_request"):
     logging.getLogger(name).setLevel(logging.WARNING)
 
   logger.info("Starting job_id=%s scrape_type=%s", args.job_id, args.scrape_type)
