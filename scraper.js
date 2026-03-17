@@ -156,6 +156,44 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     });
     await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
 
+    // Handle "Review and Agree" / privacy policy dialogs that can block the page.
+    try {
+      const handledReview = await page.evaluate(() => {
+        const bodyText = (document.body && document.body.innerText) || '';
+        if (!/review and agree/i.test(bodyText) && !/changes to how we manage data/i.test(bodyText)) {
+          return false;
+        }
+        const labels = ['Agree', 'Next', 'OK', 'Accept'];
+        const buttons = Array.from(document.querySelectorAll('button, div[role="button"], [role="button"]'));
+        for (const label of labels) {
+          const btn = buttons.find((el) => (el.textContent || '').trim().toLowerCase() === label.toLowerCase());
+          if (btn && btn.offsetParent) {
+            btn.click();
+            return true;
+          }
+        }
+        // Fallback: click the primary blue button in the dialog.
+        const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
+        for (const d of dialogs) {
+          const primary = Array.from(d.querySelectorAll('button, div[role="button"], [role="button"]')).find((el) => {
+            const style = window.getComputedStyle(el);
+            return style.backgroundColor && /rgb\(0,\s*149,\s*246\)/.test(style.backgroundColor); // Instagram blue-ish
+          });
+          if (primary && primary.offsetParent) {
+            primary.click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (handledReview) {
+        logger.log('[Scraper] Dismissed Review and Agree dialog before follower scrape');
+        await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
+      }
+    } catch (e) {
+      logger.warn('[Scraper] Failed to handle Review and Agree dialog: ' + e.message);
+    }
+
     const jobCheck = await getScrapeJob(jobId);
     if (jobCheck?.status === 'cancelled') return;
 
