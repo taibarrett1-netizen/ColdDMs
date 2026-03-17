@@ -1,9 +1,13 @@
+import logging
 import os
 from typing import Any, Dict, Optional
 
 from instagrapi import Client
 from instagrapi.exceptions import ClientError
 from requests.cookies import create_cookie
+from requests.exceptions import RetryError
+
+logger = logging.getLogger("instagram_client")
 
 
 def build_client_from_session(session_data: Dict[str, Any], instagram_username: Optional[str] = None) -> Client:
@@ -25,6 +29,7 @@ def build_client_from_session(session_data: Dict[str, Any], instagram_username: 
   cookies = (session_data or {}).get("cookies") or []
   if not cookies:
     raise RuntimeError("No cookies found in session_data for scraper session.")
+  logger.info("Loading session: %d cookies", len(cookies))
 
   # Find the requests session's cookie jar. Instagrapi 2.x uses different internal
   # structure (e.g. private.session) so try several possible paths.
@@ -63,6 +68,7 @@ def build_client_from_session(session_data: Dict[str, Any], instagram_username: 
     jars.append(other)
 
   # Map basic cookies into the underlying requests session(s).
+  set_count = 0
   for c in cookies:
     name = c.get("name")
     value = c.get("value")
@@ -72,18 +78,28 @@ def build_client_from_session(session_data: Dict[str, Any], instagram_username: 
     cookie = create_cookie(name=name, value=value, domain=domain)
     for j in jars:
       j.set_cookie(cookie)
+    set_count += 1
+  logger.info("Set %d cookies on client", set_count)
 
-  # Lightweight validation – ensure session is still valid.
+  # Validation: use private API only (account_info) to avoid public web_profile_info which is heavily rate-limited (429).
+  # Set SKIP_SESSION_VALIDATION=1 to skip this and go straight to scrape (session checked on first real request).
+  if os.getenv("SKIP_SESSION_VALIDATION", "").strip().lower() in ("1", "true", "yes"):
+    logger.info("Skipping session validation (SKIP_SESSION_VALIDATION=1)")
+    return cl
+
   try:
-    if instagram_username:
-      cl.user_info_by_username(instagram_username)
-    else:
-      # Fallback: fetch current user info; may fail if session is invalid.
-      cl.account_info()
+    logger.info("Validating session via account_info() (private API)")
+    cl.account_info()
+    logger.info("Session validated successfully")
   except ClientError as e:
     raise RuntimeError(
       f"Instagram session invalid or expired for scraper account. "
       f"Reconnect via /api/scraper/connect. Underlying error: {e}"
+    ) from e
+  except RetryError as e:
+    logger.warning("Session validation hit rate limit (429)")
+    raise RuntimeError(
+      "Instagram rate limit (429). Wait 15–60 minutes and retry, or set SCRAPER_PROXY_URL to use a proxy."
     ) from e
 
   return cl

@@ -1,11 +1,14 @@
 import argparse
 import json
+import logging
 import random
 import sys
 import time
 from typing import Iterable, List
 
 from instagrapi.exceptions import ClientError
+
+logger = logging.getLogger("scraper_worker")
 
 from .db import (
   get_connection,
@@ -34,14 +37,18 @@ def scrape_followers(conn, job: dict):
   if not target_username:
     raise RuntimeError("target_username missing on scrape job.")
 
+  logger.info("Follower scrape started: target=@%s job_id=%s", target_username, job.get("id"))
+
   platform_session_id = job.get("platform_scraper_session_id")
   session_row = fetch_scraper_session(conn, client_id, platform_session_id)
   if not session_row or not (session_row.get("session_data") or {}).get("cookies"):
     raise RuntimeError("Scraper session not found or expired for this job.")
 
+  logger.info("Session loaded (platform_session_id=%s), building instagrapi client", platform_session_id)
   cl = build_client_from_session(
     session_row["session_data"], session_row.get("instagram_username")
   )
+  logger.info("Client ready, resolving user_id for @%s", target_username)
 
   max_leads = job.get("max_leads") or None
   if max_leads is not None:
@@ -69,6 +76,7 @@ def scrape_followers(conn, job: dict):
 
   followers_dict = cl.user_followers(user_id, amount=0)
   followers = list(followers_dict.values())
+  logger.info("Fetched %d followers for @%s", len(followers), target_username)
 
   batch_new = 0
   for idx, user in enumerate(followers, start=1):
@@ -92,16 +100,20 @@ def scrape_followers(conn, job: dict):
       batch_new += 1
 
     if max_leads is not None and scraped_new >= max_leads:
+      logger.info("Reached max_leads=%s, completing job. Total new leads: %d", max_leads, scraped_new)
       update_scrape_job(conn, job["id"], status="completed", scraped_count=scraped_new)
       return
 
     if idx % 50 == 0:
       update_scrape_job(conn, job["id"], scraped_count=scraped_new)
+      logger.info("Progress: %d/%d followers processed, %d new leads so far", idx, len(followers), scraped_new)
       if _should_cancel(conn, job["id"]):
+        logger.info("Job cancelled, stopping. Scraped %d new leads", scraped_new)
         update_scrape_job(conn, job["id"], status="cancelled", scraped_count=scraped_new)
         return
       _sleep_between_batches()
 
+  logger.info("Follower scrape completed: %d new leads for @%s", scraped_new, target_username)
   update_scrape_job(conn, job["id"], status="completed", scraped_count=scraped_new)
 
 
@@ -135,11 +147,14 @@ def scrape_comments(conn, job: dict):
   if not isinstance(post_urls, list) or not post_urls:
     raise RuntimeError("post_urls must be a non-empty array on comment scrape jobs.")
 
+  logger.info("Comment scrape started: %d post(s) job_id=%s", len(post_urls), job.get("id"))
+
   platform_session_id = job.get("platform_scraper_session_id")
   session_row = fetch_scraper_session(conn, client_id, platform_session_id)
   if not session_row or not (session_row.get("session_data") or {}).get("cookies"):
     raise RuntimeError("Scraper session not found or expired for this job.")
 
+  logger.info("Session loaded, building instagrapi client")
   cl = build_client_from_session(
     session_row["session_data"], session_row.get("instagram_username")
   )
@@ -173,6 +188,7 @@ def scrape_comments(conn, job: dict):
     if not url:
       continue
     shortcode = _extract_shortcode_from_url(url)
+    logger.info("Processing post: %s", url[:60] + "..." if len(url) > 60 else url)
     try:
       media_pk = cl.media_pk_from_url(url)
     except Exception:
@@ -189,6 +205,7 @@ def scrape_comments(conn, job: dict):
     except ClientError as e:
       raise RuntimeError(f"Failed to fetch comments for media {media_pk}: {e}") from e
 
+    logger.info("Fetched %d comments for media %s", len(comments), media_pk)
     source = f"comments:{shortcode or media_pk}"
 
     for idx, comment in enumerate(comments, start=1):
@@ -210,18 +227,21 @@ def scrape_comments(conn, job: dict):
         scraped_new += 1
 
       if max_leads is not None and scraped_new >= max_leads:
+        logger.info("Reached max_leads=%s, completing job. Total new leads: %d", max_leads, scraped_new)
         update_scrape_job(conn, job["id"], status="completed", scraped_count=scraped_new)
         return
 
       if idx % 50 == 0:
         update_scrape_job(conn, job["id"], scraped_count=scraped_new)
         if _should_cancel(conn, job["id"]):
+          logger.info("Job cancelled, stopping. Scraped %d new leads", scraped_new)
           update_scrape_job(
             conn, job["id"], status="cancelled", scraped_count=scraped_new
           )
           return
         _sleep_between_batches()
 
+  logger.info("Comment scrape completed: %d new leads", scraped_new)
   update_scrape_job(conn, job["id"], status="completed", scraped_count=scraped_new)
 
 
@@ -258,10 +278,17 @@ def main(argv: List[str]) -> int:
 
   args = parser.parse_args(argv)
 
+  logging.basicConfig(
+    level=logging.INFO,
+    format="[%(name)s] %(levelname)s: %(message)s",
+    stream=sys.stderr,
+  )
+
+  logger.info("Starting job_id=%s scrape_type=%s", args.job_id, args.scrape_type)
   with get_connection() as conn:
     job = fetch_scrape_job(conn, args.job_id)
     if not job:
-      print(f"[scraper_worker] Job {args.job_id} not found.", file=sys.stderr)
+      logger.error("Job %s not found", args.job_id)
       return 1
 
     # Allow CLI overrides to fill in missing job data, but do not change DB schema here.
@@ -282,18 +309,15 @@ def main(argv: List[str]) -> int:
         scrape_followers(conn, job)
       else:
         scrape_comments(conn, job)
+      logger.info("Job %s finished successfully", job["id"])
       return 0
     except Exception as e:
-      # On any exception, mark job failed with error_message.
       msg = str(e)
-      print(f"[scraper_worker] Job {job['id']} failed: {msg}", file=sys.stderr)
+      logger.exception("Job %s failed: %s", job["id"], msg)
       try:
         update_scrape_job(conn, job["id"], status="failed", error_message=msg[:500])
       except Exception as update_err:
-        print(
-          f"[scraper_worker] Failed to update job status after error: {update_err}",
-          file=sys.stderr,
-        )
+        logger.error("Failed to update job status after error: %s", update_err)
       return 1
 
 

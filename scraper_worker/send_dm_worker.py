@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import sys
 from typing import Any, Dict, List
 
@@ -12,6 +13,8 @@ from instagrapi.exceptions import (
 
 from .db import get_connection
 from .instagram_client import build_client_from_session
+
+logger = logging.getLogger("send_dm_worker")
 
 
 def _load_sender_session(conn, session_id: int) -> Dict[str, Any]:
@@ -64,25 +67,32 @@ def _map_error(e: Exception) -> Dict[str, Any]:
 
 
 def send_dm(conn, client_id: str, session_id: int, username: str, message: str) -> Dict[str, Any]:
+  logger.info("Loading session_id=%s for send to @%s", session_id, username)
   session_row = _load_sender_session(conn, session_id)
   session_data = session_row["session_data"]
   instagram_username = session_row.get("instagram_username")
 
+  logger.info("Building client for sender @%s", instagram_username or "?")
   cl = build_client_from_session(session_data, instagram_username)
 
   clean_username = (username or "").strip().lstrip("@")
   if not clean_username:
     raise RuntimeError("username is required")
 
+  logger.info("Resolving user_id for @%s", clean_username)
   try:
     user_id = cl.user_id_from_username(clean_username)
   except Exception as e:
+    logger.warning("Resolve @%s failed: %s", clean_username, e)
     return _map_error(e)
 
+  logger.info("Sending DM to @%s (user_id=%s)", clean_username, user_id)
   try:
     dm = cl.direct_send(text=message, user_ids=[user_id])
   except Exception as e:
+    logger.warning("direct_send to @%s failed: %s", clean_username, e)
     return _map_error(e)
+  logger.info("DM sent to @%s thread_id=%s", clean_username, getattr(dm, "thread_id", None))
 
   payload: Dict[str, Any] = {
     "success": True,
@@ -107,6 +117,13 @@ def main(argv: List[str]) -> int:
 
   args = parser.parse_args(argv)
 
+  logging.basicConfig(
+    level=logging.INFO,
+    format="[%(name)s] %(levelname)s: %(message)s",
+    stream=sys.stderr,
+  )
+
+  logger.info("Send DM: client_id=%s session_id=%s username=@%s", args.client_id, args.session_id, args.username)
   with get_connection() as conn:
     try:
       result = send_dm(conn, args.client_id, args.session_id, args.username, args.message)
