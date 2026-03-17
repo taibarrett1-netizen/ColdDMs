@@ -574,7 +574,38 @@ app.post('/api/scraper/start', async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Scraper not connected. Connect a scraper or add platform scraper accounts.' });
     }
 
+    const pickedUsername = picked.session?.instagram_username || null;
+    const pickedSource = picked.source || 'unknown';
+    console.log(
+      '[Scraper] Starting job with scraper account:',
+      pickedUsername || '(no username)',
+      'source=',
+      pickedSource
+    );
+
     const targetForJob = scrapeType === 'followers' ? target_username.trim().replace(/^@/, '') : '_comment_scrape';
+
+    // Per-account max leads cap (front-end max_leads can be higher; this clamps what one account does in a single job).
+    const requestedMaxLeads = max_leads != null && max_leads > 0 ? max_leads : null;
+    const perAccountCapEnv = process.env.SCRAPER_MAX_LEADS_PER_ACCOUNT;
+    const perAccountCap =
+      perAccountCapEnv != null && perAccountCapEnv !== ''
+        ? Math.max(1, parseInt(perAccountCapEnv, 10) || 0)
+        : null;
+    const effectiveMaxLeads =
+      requestedMaxLeads && perAccountCap
+        ? Math.min(requestedMaxLeads, perAccountCap)
+        : (requestedMaxLeads || perAccountCap || null);
+
+    if (requestedMaxLeads && effectiveMaxLeads && effectiveMaxLeads < requestedMaxLeads) {
+      console.log(
+        '[Scraper] Clamping requested max_leads',
+        requestedMaxLeads,
+        'to per-account cap',
+        effectiveMaxLeads
+      );
+    }
+
     const jobId = await createScrapeJob(
       clientId,
       targetForJob,
@@ -582,7 +613,7 @@ app.post('/api/scraper/start', async (req, res) => {
       scrapeType,
       scrapeType === 'comments' ? post_urls : null,
       picked.platformSessionId || null,
-      max_leads != null && max_leads > 0 ? max_leads : null
+      effectiveMaxLeads != null && effectiveMaxLeads > 0 ? effectiveMaxLeads : null
     );
 
     const args = [
@@ -600,8 +631,8 @@ app.post('/api/scraper/start', async (req, res) => {
     } else if (scrapeType === 'comments') {
       args.push('--post-urls', JSON.stringify(post_urls || []));
     }
-    if (max_leads != null && max_leads > 0) {
-      args.push('--max-leads', String(max_leads));
+    if (effectiveMaxLeads != null && effectiveMaxLeads > 0) {
+      args.push('--max-leads', String(effectiveMaxLeads));
     }
     if (lead_group_id) {
       args.push('--lead-group-id', String(lead_group_id));
