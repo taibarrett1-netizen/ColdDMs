@@ -156,28 +156,40 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     });
     await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
 
-    // Handle "Review and Agree" / privacy policy dialogs that can block the page.
-    try {
-      const handledReview = await page.evaluate(() => {
+    // Handle "Review and Agree" / terms/privacy dialogs that can block the page.
+    async function dismissReviewDialogs(page) {
+      return page.evaluate(() => {
         const bodyText = (document.body && document.body.innerText) || '';
-        if (!/review and agree/i.test(bodyText) && !/changes to how we manage data/i.test(bodyText)) {
+        if (
+          !/review and agree/i.test(bodyText) &&
+          !/changes to how we manage data/i.test(bodyText) &&
+          !/updates to our terms/i.test(bodyText)
+        ) {
           return false;
         }
-        const labels = ['Agree', 'Next', 'OK', 'Accept'];
-        const buttons = Array.from(document.querySelectorAll('button, div[role="button"], [role="button"]'));
+        const labels = ['Agree to Terms', 'Agree', 'Next', 'OK', 'Accept', 'Continue'];
+        const buttons = Array.from(
+          document.querySelectorAll('button, div[role="button"], [role="button"]')
+        );
         for (const label of labels) {
-          const btn = buttons.find((el) => (el.textContent || '').trim().toLowerCase() === label.toLowerCase());
+          const btn = buttons.find(
+            (el) => (el.textContent || '').trim().toLowerCase() === label.toLowerCase()
+          );
           if (btn && btn.offsetParent) {
             btn.click();
             return true;
           }
         }
-        // Fallback: click the primary blue button in the dialog.
+        // Fallback: click the primary button in any dialog.
         const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
         for (const d of dialogs) {
-          const primary = Array.from(d.querySelectorAll('button, div[role="button"], [role="button"]')).find((el) => {
+          const primary = Array.from(
+            d.querySelectorAll('button, div[role="button"], [role="button"]')
+          ).find((el) => {
             const style = window.getComputedStyle(el);
-            return style.backgroundColor && /rgb\(0,\s*149,\s*246\)/.test(style.backgroundColor); // Instagram blue-ish
+            const bg = style.backgroundColor || '';
+            // Heuristic: bright/blue or main CTA.
+            return /rgb\(0,\s*149,\s*246\)/.test(bg) || /rgb\(0,\s*55,\s*107\)/.test(bg);
           });
           if (primary && primary.offsetParent) {
             primary.click();
@@ -186,12 +198,18 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         }
         return false;
       });
-      if (handledReview) {
-        logger.log('[Scraper] Dismissed Review and Agree dialog before follower scrape');
+    }
+
+    try {
+      // Some accounts see multiple stacked dialogs; loop a few times.
+      for (let i = 0; i < 3; i++) {
+        const handled = await dismissReviewDialogs(page);
+        if (!handled) break;
+        logger.log('[Scraper] Dismissed Review/Terms dialog (%d)', i + 1);
         await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
       }
     } catch (e) {
-      logger.warn('[Scraper] Failed to handle Review and Agree dialog: ' + e.message);
+      logger.warn('[Scraper] Failed to handle Review/Terms dialog: ' + e.message);
     }
 
     const jobCheck = await getScrapeJob(jobId);
@@ -238,47 +256,72 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       logger.log('[Scraper] Could not parse follower count from profile; using max_leads only');
     }
 
-    const followersLinkClicked = await page.evaluate((target) => {
-      const lower = (s) => (s || '').toLowerCase();
+    async function tryOpenFollowers(page, target) {
+      return page.evaluate((targetUsername) => {
+        const lower = (s) => (s || '').toLowerCase();
 
-      // 1) Original href-based logic.
-      const links = Array.from(document.querySelectorAll('a[href*="/followers"], a[href*="/following"]'));
-      const followersLink = links.find((a) => {
-        const href = lower(a.getAttribute('href') || '');
-        return href.includes(`/${target}/followers`) || (href.includes('/followers') && !href.includes('/following'));
-      });
-      if (followersLink) {
-        followersLink.click();
-        return true;
-      }
-
-      // 2) Fallback: stats row text (e.g. "1,128 followers").
-      const candidates = Array.from(document.querySelectorAll('a, span, div, button, [role="button"]'));
-      const statsLike = candidates.find((el) => {
-        const text = (el.textContent || '').trim();
-        const l = lower(text);
-        return l.includes('followers') && /\d/.test(text);
-      });
-      if (statsLike) {
-        const clickable = statsLike.closest('a, button, [role="button"]') || statsLike;
-        if (clickable && clickable instanceof HTMLElement) {
-          clickable.click();
+        // 1) Original href-based logic.
+        const links = Array.from(document.querySelectorAll('a[href*="/followers"], a[href*="/following"]'));
+        const followersLink = links.find((a) => {
+          const href = lower(a.getAttribute('href') || '');
+          return (
+            href.includes(`/${targetUsername}/followers`) ||
+            (href.includes('/followers') && !href.includes('/following'))
+          );
+        });
+        if (followersLink) {
+          followersLink.click();
           return true;
         }
-      }
 
-      // 3) Last resort: any button-like element that mentions followers.
-      const roleButtons = Array.from(document.querySelectorAll('[role="button"], button, a'));
-      for (const btn of roleButtons) {
-        const t = lower(btn.textContent || '');
-        if (t.includes('followers') || /\d+\s*followers/.test(t)) {
-          btn.click();
-          return true;
+        // 2) Fallback: stats row text (e.g. "1,128 followers").
+        const candidates = Array.from(
+          document.querySelectorAll('a, span, div, button, [role="button"]')
+        );
+        const statsLike = candidates.find((el) => {
+          const text = (el.textContent || '').trim();
+          const l = lower(text);
+          return l.includes('followers') && /\d/.test(text);
+        });
+        if (statsLike) {
+          const clickable =
+            statsLike.closest('a, button, [role="button"]') || statsLike;
+          if (clickable && clickable instanceof HTMLElement) {
+            clickable.click();
+            return true;
+          }
         }
-      }
 
-      return false;
-    }, cleanTarget);
+        // 3) Last resort: any button-like element that mentions followers.
+        const roleButtons = Array.from(
+          document.querySelectorAll('[role="button"], button, a')
+        );
+        for (const btn of roleButtons) {
+          const t = lower(btn.textContent || '');
+          if (t.includes('followers') || /\d+\s*followers/.test(t)) {
+            btn.click();
+            return true;
+          }
+        }
+
+        return false;
+      }, target);
+    }
+
+    let followersLinkClicked = await tryOpenFollowers(page, cleanTarget);
+    if (!followersLinkClicked) {
+      // If first attempt fails, try to clear any remaining dialogs and retry once.
+      try {
+        const handled = await dismissReviewDialogs(page);
+        if (handled) {
+          logger.log('[Scraper] Dismissed additional Review/Terms dialog before retrying followers modal');
+          await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
+        }
+      } catch (e) {
+        logger.warn('[Scraper] Failed to handle Review/Terms dialog on retry: ' + e.message);
+      }
+      followersLinkClicked = await tryOpenFollowers(page, cleanTarget);
+    }
 
     if (!followersLinkClicked) {
       // Capture a screenshot to debug new layouts/popups blocking the followers modal.
