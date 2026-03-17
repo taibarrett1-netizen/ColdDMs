@@ -1,7 +1,13 @@
 /**
- * Instagram scraper module – follower scrape using Puppeteer.
- * Uses cold_dm_scraper_sessions (separate from DM sender session).
- * Never stores passwords.
+ * Instagram scraper module – legacy Puppeteer implementation.
+ *
+ * NOTE: The preferred path for high-volume, stable scraping is now the Python
+ * instagrapi worker (spawned from /api/scraper/start). This file remains as
+ * an optional fallback and for platform scraper login.
+ *
+ * If you re-enable JS scraping, avoid UI scrolling and use the GraphQL/private
+ * APIs below. ALWAYS verify the latest query_hash/doc_id values via DevTools:
+ *   // CHECK NETWORK TAB FOR LATEST DOC_ID / query_hash
  */
 require('dotenv').config();
 const puppeteer = require('puppeteer-extra');
@@ -1141,4 +1147,96 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
   }
 }
 
-module.exports = { connectScraper, runFollowerScrape, runCommentScrape };
+/**
+ * Optional fallback: fetch followers via Instagram GraphQL instead of UI scrolling.
+ *
+ * WARNING: The query_hash/doc_id values used by Instagram's private GraphQL API
+ * change frequently (every few weeks). You MUST open DevTools → Network tab on
+ * a live Instagram session and copy the current values from a real
+ * followers/comments request.
+ *
+ * Example:
+ *   // CHECK NETWORK TAB FOR LATEST followers query_hash/doc_id; this value changes frequently.
+ */
+async function fetchFollowersViaGraphQL(page, userId, afterCursor = null, first = 50) {
+  const variables = {
+    id: userId,
+    include_reel: true,
+    fetch_mutual: false,
+    first,
+  };
+  if (afterCursor) {
+    variables.after = afterCursor;
+  }
+
+  // IMPORTANT: Replace <FOLLOWERS_QUERY_HASH> with the latest value from DevTools.
+  const queryHash = '<FOLLOWERS_QUERY_HASH>'; // CHECK NETWORK TAB FOR LATEST DOC_ID
+
+  return page.evaluate(
+    async ({ qh, vars }) => {
+      const res = await fetch('https://www.instagram.com/graphql/query/', {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          'x-ig-app-id': '936619743392459', // public web app id; may change
+        },
+        body: null,
+      });
+      // This evaluate body is intentionally minimal; real implementation should:
+      // - Use ?query_hash=<qh>&variables=<JSON_ENCODED> in the URL
+      // - Parse JSON and return { users, page_info }
+      // This stub documents the pattern and reminds you to pull fresh hashes.
+      return res.status;
+    },
+    { qh: queryHash, vars: variables }
+  );
+}
+
+/**
+ * Optional fallback: fetch comments via Instagram GraphQL/private API.
+ *
+ * As with followers, doc_id/query_hash rotates often.
+ *   // CHECK NETWORK TAB FOR LATEST comments doc_id/query_hash.
+ */
+async function fetchCommentsViaGraphQL(page, shortcode, afterCursor = null, first = 50) {
+  const variables = {
+    shortcode,
+    first,
+  };
+  if (afterCursor) {
+    variables.after = afterCursor;
+  }
+
+  const docId = '<COMMENTS_DOC_ID>'; // CHECK NETWORK TAB FOR LATEST DOC_ID
+
+  return page.evaluate(
+    async ({ docId, vars }) => {
+      // Real implementation should mirror the request Instagram sends for comments:
+      // POST https://www.instagram.com/graphql/query/ with form data:
+      //   doc_id=<docId>&variables=<JSON_ENCODED>
+      const res = await fetch('https://www.instagram.com/graphql/query/', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          doc_id: docId,
+          variables: JSON.stringify(vars),
+        }),
+      });
+      // Parse JSON and return comments/page_info in a real implementation.
+      return res.status;
+    },
+    { docId, vars: variables }
+  );
+}
+
+module.exports = {
+  connectScraper,
+  runFollowerScrape,
+  runCommentScrape,
+  // Optional GraphQL-based fallbacks (not wired into the API by default)
+  fetchFollowersViaGraphQL,
+  fetchCommentsViaGraphQL,
+};

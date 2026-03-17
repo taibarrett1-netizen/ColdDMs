@@ -824,7 +824,15 @@ async function savePlatformScraperSession(sessionData, instagramUsername, dailyA
 }
 
 // --- Scrape jobs ---
-async function createScrapeJob(clientId, targetUsername, leadGroupId = null, scrapeType = 'followers', postUrls = null, platformScraperSessionId = null) {
+async function createScrapeJob(
+  clientId,
+  targetUsername,
+  leadGroupId = null,
+  scrapeType = 'followers',
+  postUrls = null,
+  platformScraperSessionId = null,
+  maxLeads = null
+) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
   const payload = {
@@ -838,6 +846,10 @@ async function createScrapeJob(clientId, targetUsername, leadGroupId = null, scr
   if (scrapeType) payload.scrape_type = scrapeType;
   if (postUrls && Array.isArray(postUrls) && postUrls.length) payload.post_urls = postUrls;
   if (platformScraperSessionId) payload.platform_scraper_session_id = platformScraperSessionId;
+   // max_leads is an optional column on cold_dm_scrape_jobs used by the Python worker
+  if (maxLeads != null && !Number.isNaN(Number(maxLeads))) {
+    payload.max_leads = Number(maxLeads);
+  }
   const { data, error } = await sb
     .from('cold_dm_scrape_jobs')
     .insert(payload)

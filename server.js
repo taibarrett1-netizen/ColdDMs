@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 const multer = require('multer');
 const { getDailyStats, getRecentSent, getControl, setControl, alreadySent, clearFailedAttempts } = require('./database/db');
 const {
@@ -22,6 +22,7 @@ const {
   saveScraperSession,
   getLatestScrapeJob,
   createScrapeJob,
+  updateScrapeJob,
   cancelScrapeJob,
   pickScraperSessionForJob,
   savePlatformScraperSession,
@@ -580,22 +581,56 @@ app.post('/api/scraper/start', async (req, res) => {
       lead_group_id || null,
       scrapeType,
       scrapeType === 'comments' ? post_urls : null,
-      picked.platformSessionId || null
+      picked.platformSessionId || null,
+      max_leads != null && max_leads > 0 ? max_leads : null
     );
 
-    const scrapeOptions = {};
-    if (max_leads != null && max_leads > 0) scrapeOptions.maxLeads = max_leads;
-    if (lead_group_id) scrapeOptions.leadGroupId = lead_group_id;
-
-    if (scrapeType === 'comments') {
-      runCommentScrape(clientId, jobId, post_urls, scrapeOptions).catch((err) => {
-        console.error('[API] Comment scrape error', err);
-      });
-    } else {
-      runFollowerScrape(clientId, jobId, target_username, scrapeOptions).catch((err) => {
-        console.error('[API] Follower scrape error', err);
-      });
+    const pythonScript = path.join(projectRoot, 'scraper_worker', 'scraper_worker.py');
+    const args = [
+      pythonScript,
+      '--job-id',
+      String(jobId),
+      '--client-id',
+      String(clientId),
+      '--scrape-type',
+      scrapeType,
+    ];
+    if (scrapeType === 'followers') {
+      args.push('--target-username', String(targetForJob));
+    } else if (scrapeType === 'comments') {
+      args.push('--post-urls', JSON.stringify(post_urls || []));
     }
+    if (max_leads != null && max_leads > 0) {
+      args.push('--max-leads', String(max_leads));
+    }
+    if (lead_group_id) {
+      args.push('--lead-group-id', String(lead_group_id));
+    }
+
+    // Spawn Python worker; it will handle scraping via instagrapi and update the job row directly.
+    const child = spawn('python3', args, {
+      cwd: projectRoot,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    child.stdout.on('data', (chunk) => {
+      console.log(`[ScraperWorker ${jobId}]`, chunk.toString().trim());
+    });
+    child.stderr.on('data', (chunk) => {
+      console.error(`[ScraperWorker ${jobId} ERROR]`, chunk.toString().trim());
+    });
+    child.on('error', async (err) => {
+      console.error('[API] Failed to start Python scraper worker', err);
+      try {
+        await updateScrapeJob(jobId, {
+          status: 'failed',
+          error_message: `Python worker failed to start: ${err.message || String(err)}`,
+        });
+      } catch (e) {
+        console.error('[API] Failed to mark scrape job as failed after worker start error', e);
+      }
+    });
+
     res.json({ ok: true, jobId });
   } catch (e) {
     console.error('[API] Scraper start error', e);
