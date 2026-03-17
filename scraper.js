@@ -200,38 +200,44 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     }
 
     const followersLinkClicked = await page.evaluate((target) => {
+      const lower = (s) => (s || '').toLowerCase();
+
+      // 1) Original href-based logic.
       const links = Array.from(document.querySelectorAll('a[href*="/followers"], a[href*="/following"]'));
       const followersLink = links.find((a) => {
-        const href = (a.getAttribute('href') || '').toLowerCase();
+        const href = lower(a.getAttribute('href') || '');
         return href.includes(`/${target}/followers`) || (href.includes('/followers') && !href.includes('/following'));
       });
       if (followersLink) {
         followersLink.click();
         return true;
       }
-      const spans = Array.from(document.querySelectorAll('span'));
-      const followersSpan = spans.find((s) => {
-        const text = (s.textContent || '').trim();
-        return /^\d+[\d,.]*(k|m)?$/.test(text) || text === 'followers';
+
+      // 2) Fallback: stats row text (e.g. "1,128 followers").
+      const candidates = Array.from(document.querySelectorAll('a, span, div, button, [role="button"]'));
+      const statsLike = candidates.find((el) => {
+        const text = (el.textContent || '').trim();
+        const l = lower(text);
+        return l.includes('followers') && /\d/.test(text);
       });
-      if (followersSpan) {
-        let parent = followersSpan.parentElement;
-        for (let i = 0; i < 5 && parent; i++) {
-          if (parent.tagName === 'A') {
-            parent.click();
-            return true;
-          }
-          parent = parent.parentElement;
+      if (statsLike) {
+        const clickable = statsLike.closest('a, button, [role="button"]') || statsLike;
+        if (clickable && clickable instanceof HTMLElement) {
+          clickable.click();
+          return true;
         }
       }
-      const roleButtons = Array.from(document.querySelectorAll('[role="button"]'));
+
+      // 3) Last resort: any button-like element that mentions followers.
+      const roleButtons = Array.from(document.querySelectorAll('[role="button"], button, a'));
       for (const btn of roleButtons) {
-        const t = (btn.textContent || '').toLowerCase();
+        const t = lower(btn.textContent || '');
         if (t.includes('followers') || /\d+\s*followers/.test(t)) {
           btn.click();
           return true;
         }
       }
+
       return false;
     }, cleanTarget);
 
