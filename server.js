@@ -585,9 +585,9 @@ app.post('/api/scraper/start', async (req, res) => {
       max_leads != null && max_leads > 0 ? max_leads : null
     );
 
-    const pythonScript = path.join(projectRoot, 'scraper_worker', 'scraper_worker.py');
     const args = [
-      pythonScript,
+      '-m',
+      'scraper_worker.scraper_worker',
       '--job-id',
       String(jobId),
       '--client-id',
