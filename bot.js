@@ -352,25 +352,145 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
   await humanDelay();
 
-  const searchInput = await page.evaluateHandle(() => {
-    const inputs = Array.from(document.querySelectorAll('input'));
-    const visible = inputs.filter((el) => el.offsetParent !== null && el.type !== 'hidden');
-    const search = visible.find(
-      (el) =>
-        el.placeholder && (el.placeholder.toLowerCase().includes('search') || el.placeholder.toLowerCase().includes('to:'))
-    );
-    if (search) return search;
-    const firstText = visible.find((el) => el.type === 'text' || el.type === '' || !el.type);
-    return firstText || null;
-  });
-  const searchEl = searchInput.asElement();
-  if (!searchEl) {
-    await searchInput.dispose();
-    throw new Error('Search input not found on direct/new page');
+  // Instagram sometimes shows "Not now"/notifications prompts even after login.
+  // If an overlay is present, our search element may not be "visible" yet, so we retry a bit.
+  for (let i = 0; i < 3; i++) {
+    const dismissed = await page.evaluate(function () {
+      const dialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]');
+      for (let d = 0; d < dialogs.length; d++) {
+        const txt = (dialogs[d].textContent || '').toLowerCase();
+        if (txt.indexOf('save your login') !== -1 || txt.indexOf('not now') !== -1 || txt.indexOf('turn on notifications') !== -1) {
+          const notNow = Array.from(dialogs[d].querySelectorAll('span, button, div[role="button"]')).find(function (el) {
+            return (el.textContent || '').trim().toLowerCase() === 'not now';
+          });
+          if (notNow) {
+            const btn = notNow.closest('[role="button"]') || notNow.closest('button') || notNow;
+            if (btn) {
+              btn.click();
+              return true;
+            }
+          }
+        }
+      }
+      return false;
+    });
+    if (dismissed) {
+      logger.log('Dismissed direct/new prompt');
+      await delay(1500);
+    } else {
+      break;
+    }
   }
-  await searchEl.type(u, { delay: 100 });
+
+  // Wait for the direct/new search UI to render (may be an input, textarea, or contenteditable element).
+  await page
+    .waitForFunction(
+      () => {
+        const els = document.querySelectorAll('input, textarea, [contenteditable="true"]');
+        return Array.from(els).some((el) => {
+          try {
+            if (!el || el.disabled) return false;
+            return (el.getClientRects && el.getClientRects().length > 0) || el.offsetParent !== null;
+          } catch {
+            return false;
+          }
+        });
+      },
+      { timeout: 8000 }
+    )
+    .catch(() => {});
+
+  const searchHandle = await page.evaluateHandle(() => {
+    const normalize = (s) => (s || '').toString().toLowerCase();
+    const candidates = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]')).filter((el) => {
+      try {
+        if (!el || el.disabled) return false;
+        if (el.type === 'hidden') return false;
+        if (el.getClientRects && el.getClientRects().length > 0) return true;
+        if (el.offsetParent !== null) return true;
+        return false;
+      } catch {
+        return false;
+      }
+    });
+
+    const findWithHints = (predicates) => {
+      for (const pred of predicates) {
+        const hit = candidates.find((el) => pred(el));
+        if (hit) return hit;
+      }
+      return null;
+    };
+
+    const searchOrTo = (el) => {
+      const ph = normalize(el.placeholder);
+      const aria = normalize(el.getAttribute && el.getAttribute('aria-label'));
+      return ph.includes('search') || ph.includes('to:') || aria.includes('search') || aria.includes('to:');
+    };
+
+    const comboboxRole = (el) => {
+      const role = normalize(el.getAttribute && el.getAttribute('role'));
+      return role === 'combobox' || role === 'textbox';
+    };
+
+    const textInput = (el) => {
+      if (!('tagName' in el)) return false;
+      if (el.tagName === 'INPUT') return !el.type || el.type === 'text';
+      if (el.tagName === 'TEXTAREA') return true;
+      return !!el.isContentEditable;
+    };
+
+    const hit =
+      findWithHints([searchOrTo, comboboxRole]) ||
+      findWithHints([textInput]) ||
+      candidates[0] ||
+      null;
+
+    return hit;
+  });
+
+  const searchEl = searchHandle.asElement();
+  if (!searchEl) {
+    const diag = await page
+      .evaluate(() => {
+        const normalize = (s) => (s || '').toString().toLowerCase();
+        const els = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]'));
+        const visible = els.filter((el) => {
+          try {
+            if (!el || el.disabled) return false;
+            if (el.type === 'hidden') return false;
+            return (el.getClientRects && el.getClientRects().length > 0) || el.offsetParent !== null;
+          } catch {
+            return false;
+          }
+        });
+        const sample = visible.slice(0, 5).map((el) => ({
+          tag: el.tagName,
+          type: el.type || '',
+          placeholder: el.placeholder || '',
+          aria: normalize(el.getAttribute && el.getAttribute('aria-label')),
+          contentEditable: !!el.isContentEditable,
+        }));
+        return { url: location.href, visibleCount: visible.length, sample };
+      })
+      .catch(() => null);
+    await searchHandle.dispose().catch(() => {});
+    throw new Error(`Search input not found on direct/new page (url=${diag?.url || 'unknown'} visible=${diag?.visibleCount ?? 'n/a'})`);
+  }
+
+  const searchMeta = await page.evaluate((el) => ({ tag: el.tagName, type: el.type || '', isCE: !!el.isContentEditable }), searchEl).catch(() => ({}));
+  await searchEl.click({ delay: 50 }).catch(() => {});
+
+  if (searchMeta.tag === 'INPUT' || searchMeta.tag === 'TEXTAREA') {
+    await searchEl.type(u, { delay: 90 });
+  } else {
+    // contenteditable element: use keyboard typing so React/Instagram gets the right events
+    await delay(100);
+    await page.keyboard.type(u, { delay: 90 });
+  }
+
   await searchEl.dispose();
-  await searchInput.dispose();
+  await searchHandle.dispose();
   await delay(2800);
 
   const userClicked = await page.evaluate((username) => {
