@@ -108,16 +108,8 @@ function buildMicFinderScript() {
       }
     }
 
-    const hit = candidates.find(matchesMic);
-    if (hit) {
-      if (hit.tagName === 'SVG' || (hit.tagName && hit.tagName.toLowerCase() === 'svg')) {
-        const clickable = hit.closest('button, [role="button"], a') || hit.parentElement;
-        return clickable && rectVisible(clickable) ? clickable : hit;
-      }
-      return hit;
-    }
-
-    /** Desktop Web: mic is often icon-only (no aria-label). Right cluster is [mic][gallery][heart]. */
+    /** Desktop Web: [mic][gallery photo][sticker/heart] to the RIGHT of the "Message..." field only.
+     *  Mic = leftmost of those three (NOT the emoji inside the bar on the left). */
     function findMicByComposerLayout() {
       const inputs = Array.from(
         document.querySelectorAll('textarea[placeholder], [contenteditable="true"], [role="textbox"]')
@@ -127,7 +119,11 @@ function buildMicFinderScript() {
         const al = lower(el.getAttribute('aria-label') || '');
         return ph.includes('message') || al.includes('message');
       });
-      const bottomY = window.innerHeight - 140;
+      if (!compose) return null;
+
+      const cr = compose.getBoundingClientRect();
+      const bottomMinY = window.innerHeight - 180;
+
       const row = Array.from(document.querySelectorAll('button, div[role="button"], span[role="button"]'))
         .filter((el) => {
           if (!el.querySelector || !el.querySelector('svg')) return false;
@@ -135,34 +131,40 @@ function buildMicFinderScript() {
           const hint = textHints(el);
           if (hint && isEmojiStickerNoise(hint)) return false;
           const r = el.getBoundingClientRect();
-          if (r.top < bottomY) return false;
+          if (r.top < bottomMinY) return false;
           if (r.width < 8 || r.height < 8) return false;
+          /** Must be to the right of the text field — excludes emoji on the left (small slop for IG layout) */
+          if (r.left < cr.right - 12) return false;
           return true;
         })
         .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left);
 
-      if (compose) {
-        const cr = compose.getBoundingClientRect();
-        const rightStrip = row.filter((el) => {
-          const r = el.getBoundingClientRect();
-          return r.left >= cr.left + Math.min(40, cr.width * 0.15);
-        });
-        if (rightStrip.length >= 3) {
-          const trio = rightStrip.slice(-3);
-          const micCandidate = trio[0];
-          if (micCandidate && rectVisible(micCandidate)) return micCandidate;
-        }
-      }
-
-      if (row.length >= 3) {
-        const trio = row.slice(-3);
-        const micCandidate = trio[0];
-        if (micCandidate && rectVisible(micCandidate)) return micCandidate;
-      }
+      if (row.length < 3) return null;
+      const trio = row.slice(-3);
+      const micCandidate = trio[0];
+      if (micCandidate && rectVisible(micCandidate)) return micCandidate;
       return null;
     }
 
-    return findMicByComposerLayout();
+    const byLayout = findMicByComposerLayout();
+    if (byLayout) return byLayout;
+
+    const hit = candidates.find((el) => {
+      if (!matchesMic(el)) return false;
+      const r = el.getBoundingClientRect();
+      if (r.top < window.innerHeight - 200) return false;
+      if (r.left < window.innerWidth * 0.4) return false;
+      return true;
+    });
+    if (hit) {
+      if (hit.tagName === 'SVG' || (hit.tagName && hit.tagName.toLowerCase() === 'svg')) {
+        const clickable = hit.closest('button, [role="button"], a') || hit.parentElement;
+        return clickable && rectVisible(clickable) ? clickable : hit;
+      }
+      return hit;
+    }
+
+    return null;
   };
 }
 
