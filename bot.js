@@ -863,6 +863,118 @@ function buildFollowUpLaunchOptions() {
   return opts;
 }
 
+/** Only one manual debug browser at a time (prevents duplicate Chromium on the same DISPLAY). */
+let manualDebugFollowUpBrowserActive = false;
+
+/**
+ * Opens headed Chromium with stored IG session cookies, then idles for manual testing (VNC).
+ * Does not send DMs or voice. Queued via scheduleDebugFollowUpBrowser.
+ *
+ * Env: HEADLESS_MODE=false + DISPLAY (e.g. :98) to see the window.
+ * FOLLOW_UP_DEBUG_BROWSER_MS — if set and > 0, auto-close after N ms; otherwise hold until PM2 restart.
+ */
+async function debugOpenFollowUpBrowserForManualTest(body) {
+  const clientId = (body.clientId || '').trim();
+  const instagramSessionId = (body.instagramSessionId || '').trim();
+  const recipientUsername = (body.recipientUsername || '').trim().replace(/^@/, '');
+  if (!clientId || !instagramSessionId) {
+    logger.warn('[debug] follow-up/browser: missing clientId or instagramSessionId');
+    manualDebugFollowUpBrowserActive = false;
+    return { ok: false, error: 'clientId and instagramSessionId required' };
+  }
+
+  let browser;
+  let infiniteHold = false;
+  try {
+    const session = await sb.getInstagramSessionByIdForClient(clientId, instagramSessionId);
+    if (!session) {
+      logger.warn('[debug] follow-up/browser: session not found');
+      manualDebugFollowUpBrowserActive = false;
+      return { ok: false, error: 'Instagram session not found' };
+    }
+    const cookies = session.session_data?.cookies;
+    if (!cookies?.length) {
+      logger.warn('[debug] follow-up/browser: session has no cookies');
+      manualDebugFollowUpBrowserActive = false;
+      return { ok: false, error: 'Session has no cookies; reconnect Instagram' };
+    }
+
+    const launchOpts = buildFollowUpLaunchOptions();
+    browser = await puppeteer.launch(launchOpts);
+    const page = await browser.newPage();
+    await grantMicrophoneForInstagram(page);
+    await applyDesktopEmulation(page);
+    await page.setCookie(...cookies);
+    await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+    await delay(2000);
+    await dismissInstagramHomeModals(page, logger);
+    await delay(500);
+    if (page.url().includes('/accounts/login')) {
+      logger.warn('[debug] follow-up/browser: landed on login — session expired');
+      await browser.close().catch(() => {});
+      browser = null;
+      manualDebugFollowUpBrowserActive = false;
+      return { ok: false, error: 'Instagram session expired' };
+    }
+
+    if (recipientUsername) {
+      const u = normalizeUsername(recipientUsername);
+      const nav = await navigateToDmThread(page, u);
+      if (!nav.ok) {
+        logger.warn(
+          `[debug] follow-up/browser: could not open DM @${u} (${nav.reason || 'unknown'}) — staying on current page`
+        );
+      }
+    }
+
+    const holdMs = parseInt(process.env.FOLLOW_UP_DEBUG_BROWSER_MS, 10);
+    const hasTimedHold = Number.isFinite(holdMs) && holdMs > 0;
+
+    logger.log(
+      `[debug] follow-up/browser: Chromium open for manual test (user=${session.instagram_username || 'n/a'}). ` +
+        `DISPLAY=${process.env.DISPLAY || '(unset)'}. ` +
+        (hasTimedHold
+          ? `Auto-close after FOLLOW_UP_DEBUG_BROWSER_MS=${holdMs}ms.`
+          : 'Holding until PM2 restart (or set FOLLOW_UP_DEBUG_BROWSER_MS).')
+    );
+
+    if (hasTimedHold) {
+      await delay(holdMs);
+    } else {
+      infiniteHold = true;
+      await new Promise(() => {});
+    }
+  } catch (e) {
+    logger.error('[debug] follow-up/browser exception', e);
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+    if (!infiniteHold) manualDebugFollowUpBrowserActive = false;
+  }
+  return { ok: true };
+}
+
+/**
+ * Queue a manual debug browser session (non-blocking HTTP). Returns immediately.
+ * @returns {{ ok: boolean, error?: string }}
+ */
+function scheduleDebugFollowUpBrowser(body) {
+  if (manualDebugFollowUpBrowserActive) {
+    return {
+      ok: false,
+      error:
+        'A debug browser session is already running. Restart PM2 or wait for FOLLOW_UP_DEBUG_BROWSER_MS to expire.',
+    };
+  }
+  manualDebugFollowUpBrowserActive = true;
+  setImmediate(() => {
+    debugOpenFollowUpBrowserForManualTest(body || {}).catch((e) => {
+      logger.error('[debug] follow-up/browser async error', e);
+      manualDebugFollowUpBrowserActive = false;
+    });
+  });
+  return { ok: true };
+}
+
 function followUpReasonToError(reason, pageSnippet) {
   const map = {
     user_not_found: 'Recipient not found in Instagram search',
@@ -1711,4 +1823,14 @@ async function completeInstagram2FA(page, browser, twoFactorCode, instagramUsern
   return { cookies, username: instagramUsername };
 }
 
-module.exports = { runBot, getDailyStats, loadLeadsFromCSV, sendDM, sendFollowUp, login, connectInstagram, completeInstagram2FA };
+module.exports = {
+  runBot,
+  getDailyStats,
+  loadLeadsFromCSV,
+  sendDM,
+  sendFollowUp,
+  login,
+  connectInstagram,
+  completeInstagram2FA,
+  scheduleDebugFollowUpBrowser,
+};

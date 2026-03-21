@@ -60,6 +60,17 @@ Optional: **`FOLLOW_UP_SCREENSHOTS_FULL_PAGE=true`** for full-page PNGs.
 
 See **`DEPLOYMENT.md`** → *Watching the browser on a VPS*. Set `HEADLESS_MODE=false`, `DISPLAY=:99` (or your Xvfb display), run `x11vnc`, tunnel with SSH, connect VNC to `localhost:5900`. Use **`PUPPETEER_SLOW_MO_MS=80`** so actions are easier to follow.
 
+### Manual browser only (no send) — `POST /api/debug/follow-up/browser`
+
+For VNC testing (e.g. voice mic, permissions) without sending a follow-up:
+
+- **Path:** `POST /api/debug/follow-up/browser`  
+- **Body (JSON):** `clientId`, `instagramSessionId`, optional `recipientUsername` (opens that DM thread if navigation succeeds).  
+- **Auth:** Same as other `/api` routes — Bearer `COLD_DM_API_KEY` when set.  
+- **Response:** **202** immediately; Chromium launches **in the background** on the server’s **`DISPLAY`** (must match Xvfb, e.g. `:98`).  
+- **Behaviour:** Injects session cookies, opens Instagram, dismisses common home modals, optionally opens the DM — **no text/voice is sent.**  
+- **Env:** **`HEADLESS_MODE=false`** and **`DISPLAY`** required to see the window. Optional **`FOLLOW_UP_DEBUG_BROWSER_MS`** (e.g. `1800000` = 30 min) to auto-close; if unset, the window stays until **PM2 restart**. Only **one** debug session at a time (409 if another is active).
+
 ### Recording UI gate (desktop)
 
 Detection is **scoped to the composer dock** (the “Message…” row and strip just above it), so **blue outgoing bubbles** in the thread are **not** treated as recording UI.

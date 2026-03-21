@@ -28,7 +28,13 @@ const {
   savePlatformScraperSession,
   addCampaignLeadsFromGroups,
 } = require('./database/supabase');
-const { loadLeadsFromCSV, connectInstagram, completeInstagram2FA, sendFollowUp } = require('./bot');
+const {
+  loadLeadsFromCSV,
+  connectInstagram,
+  completeInstagram2FA,
+  sendFollowUp,
+  scheduleDebugFollowUpBrowser,
+} = require('./bot');
 const { connectScraper, runFollowerScrape, runCommentScrape } = require('./scraper');
 const { MESSAGES } = require('./config/messages');
 const logger = require('./utils/logger');
@@ -185,6 +191,7 @@ const ENV_KEYS = [
   'VOICE_NOTE_PULSE_SOURCE',
   'FOLLOW_UP_DEBUG_SCREENSHOTS',
   'FOLLOW_UP_SCREENSHOTS_FULL_PAGE',
+  'FOLLOW_UP_DEBUG_BROWSER_MS',
 ];
 
 function readEnv() {
@@ -329,6 +336,40 @@ app.post('/api/follow-up/send', async (req, res) => {
     logger.error('[API] follow-up/send exception', e);
     return res.status(500).json({ ok: false, error: e.message || 'Internal error' });
   }
+});
+
+/**
+ * Open headed Chromium with session cookies for manual testing (VNC) — does not send messages or voice.
+ * Body: { clientId, instagramSessionId, recipientUsername? }
+ * Server needs HEADLESS_MODE=false and DISPLAY (e.g. :98 with Xvfb). Returns 202 immediately; browser starts in background.
+ */
+app.post('/api/debug/follow-up/browser', (req, res) => {
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
+  }
+  const body = req.body || {};
+  const cid = (body.clientId || '').trim();
+  const sid = (body.instagramSessionId || '').trim();
+  if (!cid || !sid) {
+    return res.status(400).json({ ok: false, error: 'clientId and instagramSessionId are required' });
+  }
+  const scheduled = scheduleDebugFollowUpBrowser(body);
+  if (!scheduled.ok) {
+    return res.status(409).json({ ok: false, error: scheduled.error || 'Could not start debug browser' });
+  }
+  const recip = (body.recipientUsername || '').trim().replace(/^@/, '') || '-';
+  logger.log(`[API] debug/follow-up/browser queued clientId=${cid} sessionId=${sid} recipient=@${recip}`);
+  return res.status(202).json({
+    ok: true,
+    accepted: true,
+    hint: 'Use VNC on the same DISPLAY as this process. Chromium should appear in a few seconds. No DMs are sent.',
+    env: {
+      HEADLESS_MODE: process.env.HEADLESS_MODE || '(unset)',
+      DISPLAY: process.env.DISPLAY || '(unset)',
+      FOLLOW_UP_DEBUG_BROWSER_MS:
+        process.env.FOLLOW_UP_DEBUG_BROWSER_MS || '(unset — window stays until PM2 restart)',
+    },
+  });
 });
 
 /** List PNGs from follow-up debug runs (requires Bearer COLD_DM_API_KEY when set). */
