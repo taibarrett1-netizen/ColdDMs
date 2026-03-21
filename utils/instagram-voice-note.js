@@ -271,10 +271,25 @@ function detectInstagramVoiceRecordingUiScript() {
     }
 
     const compose = findComposerForDock();
-    if (!compose) {
-      return { ok: false, why: 'no_composer' };
+    /**
+     * When recording starts, IG often **hides** the Message field (or swaps the node). We still must
+     * detect the blue strip / timer in the composer dock — otherwise we false-fail with lastWhy=no_composer
+     * while screenshots clearly show recording UI (see dockedCount / correlation screenshots).
+     */
+    let cr;
+    let composerFallback = false;
+    if (compose) {
+      cr = compose.getBoundingClientRect();
+    } else {
+      composerFallback = true;
+      const w = window.innerWidth;
+      const h = window.innerHeight;
+      const left = Math.max(Math.floor(w * 0.3), 260);
+      const top = Math.max(Math.floor(h * 0.58), 120);
+      const width = Math.max(200, w - left - 10);
+      const height = Math.max(80, h - top - 6);
+      cr = { top, left, width, height, bottom: top + height, right: left + width };
     }
-    const cr = compose.getBoundingClientRect();
 
     /** Vertical: from just above the composer pill to bottom of viewport (not mid-thread bubbles). */
     const dockTop = Math.max(cr.top - 120, window.innerHeight * 0.62);
@@ -310,6 +325,8 @@ function detectInstagramVoiceRecordingUiScript() {
       const t = `${al} ${ti}`;
       if (t.includes('pause') && (t.includes('record') || t.includes('recording'))) return { ok: true, why: 'aria_pause' };
       if (t.includes('delete') && (t.includes('clip') || t.includes('record'))) return { ok: true, why: 'aria_delete' };
+      if (t.includes('stop') && (t.includes('record') || t.includes('recording') || t.includes('clip')))
+        return { ok: true, why: 'aria_stop' };
     }
 
     /** Recording timer 0:xx / 1:xx — small text, in dock only (not header clock). */
@@ -322,7 +339,7 @@ function detectInstagramVoiceRecordingUiScript() {
       }
       if (!centerInDock(r) || r.height <= 0 || r.height > 56) continue;
       const text = (el.textContent || '').trim();
-      if (text.length > 6) continue;
+      if (text.length > 8) continue;
       if (/^0:[0-5]\d$/.test(text)) return { ok: true, why: 'timer_0mm' };
       if (/^1:[0-5]\d$/.test(text)) return { ok: true, why: 'timer_1mm' };
     }
@@ -339,22 +356,30 @@ function detectInstagramVoiceRecordingUiScript() {
         continue;
       }
       if (!centerInDock(r)) continue;
-      if (r.width < 180 || r.height < 10 || r.height > 36) continue;
-      if (r.width < r.height * 3) continue;
-      /** Bottom edge of strip sits at/just above the message field top (not a bubble higher in the thread). */
-      if (r.bottom > cr.top + 14 || r.top < cr.top - 52) continue;
+      if (r.width < 160 || r.height < 8 || r.height > 52) continue;
+      if (r.width < r.height * 2.5) continue;
+      /**
+       * When we have a real composer, tie strip to its top seam. With **composerFallback**, only require
+       * the bar in the lower dock band (IG preview strip can sit slightly above a hidden textarea).
+       */
+      if (!composerFallback) {
+        if (r.bottom > cr.top + 22 || r.top < cr.top - 64) continue;
+      } else {
+        if (r.top < window.innerHeight * 0.52 || r.bottom > window.innerHeight + 2) continue;
+      }
       const bg = window.getComputedStyle(el).backgroundColor;
       const mm = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
       if (!mm) continue;
       const R = +mm[1];
       const G = +mm[2];
       const B = +mm[3];
-      if (B > 200 && R < 100 && G > 85) {
+      /** IG blue + slightly teal variants; gradient fallback uses averaged solid in some builds */
+      if (B > 155 && R < 130 && G > 70 && B > R + 20 && B > G) {
         return { ok: true, why: 'blue_strip_dock' };
       }
     }
 
-    return { ok: false, why: 'none' };
+    return { ok: false, why: composerFallback ? 'none_fallback_dock' : 'none' };
   };
 }
 
