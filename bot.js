@@ -45,6 +45,11 @@ function getPuppeteerSlowMo() {
  * bookmarks) is outside the page. If they match, the composer / right column look "cut off" even
  * when Xvfb is big enough.
  */
+function getChromeWindowPositionArg() {
+  const raw = (process.env.CHROME_WINDOW_POSITION || '0,0').trim();
+  return /^\d+,\d+$/.test(raw) ? raw : '0,0';
+}
+
 function applyHeadedChromeWindowToLaunchOpts(launchOpts) {
   if (HEADLESS || !launchOpts || !Array.isArray(launchOpts.args)) return;
   const vp = buildDesktopViewport();
@@ -53,6 +58,9 @@ function applyHeadedChromeWindowToLaunchOpts(launchOpts) {
   const outerH = vp.height + padY;
   if (!launchOpts.args.some((a) => typeof a === 'string' && a.startsWith('--window-size='))) {
     launchOpts.args.push(`--window-size=${outerW},${outerH}`);
+  }
+  if (!launchOpts.args.some((a) => typeof a === 'string' && a.startsWith('--window-position='))) {
+    launchOpts.args.push(`--window-position=${getChromeWindowPositionArg()}`);
   }
   launchOpts.defaultViewport = {
     width: vp.width,

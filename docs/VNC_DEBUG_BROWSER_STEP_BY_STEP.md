@@ -64,12 +64,30 @@ Verify: `DISPLAY=:98 xdpyinfo | grep dimensions` → should show **1920x1440** (
 
 If you already had `1280x800`, **stop** that Xvfb (`pkill Xvfb` — note: kills all Xvfb) and start again with a large mode, then restart `fluxbox` / `x11vnc` on `:98`.
 
-### B3. Optional but recommended: window manager
+### B3. Window manager (**skip for cleanest VNC + Chrome**)
+
+**Problem you may see:** With **fluxbox**, the bottom **taskbar** steals height and windows sometimes **cascade** (not at `0,0`). Then the **tabs / URL bar** look “cut off” at the top even when VNC is scrolled to the top, and TigerVNC **scrollbars** appear because the total desktop is taller than Chrome alone.
+
+**Recommended for Instagram / mic debugging — no fluxbox:**
+
+- Do **not** start `fluxbox`. Use only **Xvfb + x11vnc**; Chromium is launched with **`--window-position=0,0`** (default in current `bot.js`) so the window hugs the top-left.
+- Size **Xvfb** to fit **only** the Chromium outer window (no extra panel):
+
+  `Xvfb_height ≥ DESKTOP_VIEWPORT_HEIGHT + DESKTOP_WINDOW_PAD_Y + ~30` (small slack)
+
+  Example with **`DESKTOP_VIEWPORT_WIDTH=1512`**, **`HEIGHT=982`**, **`DESKTOP_WINDOW_PAD_Y=220`**:
+
+  - Outer Chrome ≈ **1512 × 1202**
+  - Use: `Xvfb :98 -screen 0 1512x1240x24` (a little slack)
+
+**If you still want fluxbox** (other tools on the same display):
 
 ```bash
 DISPLAY=:98 fluxbox &
 sleep 1
 ```
+
+Then add **extra Xvfb height** for the toolbar (~**40–80px**) and expect to **scroll** in TigerVNC unless the viewer is huge.
 
 ---
 
@@ -134,19 +152,27 @@ Connect to:
 **You should see the grey `xterm` from Part D.**  
 If VNC connects but is **still** all black, go back to Part B/C/D — do **not** continue until `xterm` is visible.
 
-### E2b — See the **whole** Chrome window (no VNC panning)
+### E2b — **No TigerVNC scrollbars** + see **tabs / URL bar**
 
-The remote screen is a **fixed** Xvfb size. If it’s bigger than your TigerVNC window, you scroll/pan. Two approaches:
+TigerVNC shows **scrollbars** when the **remote framebuffer** (Xvfb) is **larger in pixels** than the **TigerVNC window’s inner area** on your Mac. That is independent of Instagram — you are panning the whole virtual monitor.
 
-1. **Match your Mac (1:1, no scroll)**  
-   - On Mac: **System Settings → Displays** — note resolution (e.g. **1512×982** or **1728×1117**).  
-   - In VPS `.env`: set `DESKTOP_VIEWPORT_WIDTH` / `DESKTOP_VIEWPORT_HEIGHT` to that (or slightly smaller). Keep `DESKTOP_WINDOW_PAD_Y` (~220) so `--window-size` is **taller** than the viewport.  
-   - **Xvfb** width = viewport width; height ≥ viewport height + `DESKTOP_WINDOW_PAD_Y` + ~40 (slack). Example: viewport **1512×982**, pad 220 → `Xvfb :98 -screen 0 1512x1242x24`.  
-   - Restart Xvfb / fluxbox / x11vnc / PM2, open debug browser again. The remote desktop should fit your Mac viewer without horizontal/vertical pan.
+Do **all** of these for a 1:1, no-scroll setup:
 
-2. **Scale to fit (blurrier)**  
-   - TigerVNC: try **Full screen** (menu **View**, or shortcut depending on build) so the whole framebuffer is visible on your Mac.  
-   - Or enlarge the TigerVNC window to your screen; some builds have **zoom / fit to window**.
+1. **Shrink the remote desktop to “just Chrome”**  
+   - Prefer **no fluxbox** (Part **B3**).  
+   - Set `.env` viewport + pad, then Xvfb only **slightly** larger than Chromium’s outer size (see **B3** example: **1512×1240** for 1512×982 + 220 pad).
+
+2. **Make the TigerVNC window physically big enough**  
+   - **Full-screen** TigerVNC on the Mac (green button) or drag the window so its **content area** is at least **remote_width × remote_height** pixels.  
+   - On **Retina**, “1512pt” wide can be **3024** physical pixels — VNC often maps **1 remote pixel ↔ 1 viewer pixel**, so a small floating window will always scroll. **Maximize / full screen** the viewer.
+
+3. **If you still must scroll — scale the whole remote image**  
+   - Depends on build: **View →** look for **Scaling**, **Zoom**, or **Fit to window**; or **TigerVNC → Preferences / Options → Display**. Goal: **downscale** the remote framebuffer so the **entire** Xvfb fits inside your window (may look softer).
+
+4. **Tabs / URL bar “missing” at the top**  
+   - Deploy latest `bot.js`: headed launch adds **`--window-position=0,0`** (override with **`CHROME_WINDOW_POSITION`** in `.env` if needed).  
+   - **Remove fluxbox** or hide its toolbar so nothing shifts the window.  
+   - Confirm Xvfb height ≥ outer window height (viewport + `DESKTOP_WINDOW_PAD_Y` + slack).
 
 ### E3. If TigerVNC says “no matching security types”
 
@@ -260,6 +286,8 @@ If **no** chromium process:
 | No `chromium` in `pgrep` | `pm2 logs`, session/login errors, or timed `FOLLOW_UP_DEBUG_BROWSER_MS`. |
 | `x11vnc` “unrecognized `-securitytypes`” | Remove that flag; use Part C or E3. |
 | Two `x11vnc` / bind errors | `pkill x11vnc`, start a single instance (Part C). |
+| TigerVNC **scrollbars** / must pan | Remote Xvfb is **bigger** than the viewer window — full-screen TigerVNC, or **smaller Xvfb** (Part B3), or **viewer scaling** (Part E2b). |
+| **Top of Chrome** (tabs) missing | **`--window-position=0,0`**, **no fluxbox** (Part B3), enough **Xvfb height** for outer `--window-size`. |
 
 ---
 
