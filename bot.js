@@ -12,7 +12,7 @@ const logger = require('./utils/logger');
 const { applyMobileEmulation, applyDesktopEmulation } = require('./utils/mobile-viewport');
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
 const { startVoiceNotePlayback, isFfmpegAvailable } = require('./utils/voice-note-audio');
-const { sendVoiceNoteInThread } = require('./utils/instagram-voice-note');
+const { sendVoiceNoteInThread, prepareVoiceNoteUi, grantMicrophoneForInstagram } = require('./utils/instagram-voice-note');
 const { navigateToDmThread, sendPlainTextInThread } = require('./utils/open-dm-thread');
 puppeteer.use(StealthPlugin());
 
@@ -716,6 +716,12 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     let resolved = null;
     try {
       resolved = await resolveVoiceNotePath(voiceCfg.voiceNotePath);
+      const prep = await prepareVoiceNoteUi(page, { logger });
+      if (!prep.ok) {
+        voiceFailure = prep.reason || 'voice_mic_not_found';
+        logger.warn(`Voice note UI not ready for @${u}: ${voiceFailure}`);
+        return;
+      }
       playback = startVoiceNotePlayback(resolved.localPath, VOICE_NOTE_SINK, logger);
       const holdMs = Math.round(playback.durationSec * 1000 + 700);
       const voiceResult = await sendVoiceNoteInThread(page, { holdMs, logger });
@@ -945,6 +951,7 @@ async function sendFollowUp(body) {
   try {
     browser = await puppeteer.launch(launchOpts);
     const page = await browser.newPage();
+    if (hasAudio) await grantMicrophoneForInstagram(page);
     await page.setCookie(...cookies);
     if (hasAudio) await applyDesktopEmulation(page);
     else await applyMobileEmulation(page);
@@ -997,6 +1004,16 @@ async function sendFollowUp(body) {
         resolved = await resolveVoiceNotePath(audioUrlRaw);
         if (!resolved.localPath) {
           return logFollowUpFailure(clientId, instagramSessionId, recipientUsername, 'Could not download audio file', 400);
+        }
+        const prep = await prepareVoiceNoteUi(page, { logger });
+        if (!prep.ok) {
+          return logFollowUpFailure(
+            clientId,
+            instagramSessionId,
+            recipientUsername,
+            followUpReasonToError(prep.reason || 'voice_mic_not_found'),
+            400
+          );
         }
         playback = startVoiceNotePlayback(resolved.localPath, VOICE_NOTE_SINK, logger);
         const holdMs = Math.round(playback.durationSec * 1000 + 700);
@@ -1226,6 +1243,7 @@ async function runBotMultiTenant() {
 
   try {
     page = await browser.newPage();
+    await grantMicrophoneForInstagram(page);
     if (VOICE_NOTE_FILE) await applyDesktopEmulation(page);
     else await applyMobileEmulation(page);
   } catch (err) {
@@ -1447,6 +1465,7 @@ async function runBot() {
 
   try {
     page = await browser.newPage();
+    await grantMicrophoneForInstagram(page);
     if (VOICE_NOTE_FILE) await applyDesktopEmulation(page);
     else await applyMobileEmulation(page);
     if (useSessionCookies) {

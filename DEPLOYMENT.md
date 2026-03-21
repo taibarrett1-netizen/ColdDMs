@@ -57,6 +57,10 @@ Set these in `.env`:
 - `VOICE_NOTE_SINK=ColdDMsVoice`
 - `VOICE_NOTE_PULSE_SOURCE=ColdDMsVoice.monitor` (optional but recommended)
 
+**Microphone permission (VPS):** Instagram still calls `getUserMedia` for voice notes. The “microphone” Chrome captures is usually your **PulseAudio** device (e.g. `ColdDMsVoice.monitor` → ffmpeg), not a physical mic. The worker grants `microphone` permission via Puppeteer (`overridePermissions`) and launch flags (`--use-fake-ui-for-media-stream`) so you don’t get a blocking prompt. **Safari on Mac** shows a system dialog; use **Chromium on the VPS** for automation.
+
+**If logs say `Could not find voice recorder control`:** the DM composer must show the mic (desktop layout). The worker focuses the message box, matches aria-labels when present, and falls back to the bottom-right icon row `[mic][gallery][heart]`. If it persists, run with `HEADLESS_MODE=false` temporarily to confirm the UI.
+
 ## 5. Get the project onto the server
 
 Repo name is **ColdDMs**; on your Mac the folder may be **Cold DMs V1**. On the server, `cd` into whatever the folder is actually called there.
