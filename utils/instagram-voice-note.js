@@ -7,6 +7,8 @@
  * no OS dialog blocks automation (Safari dialogs are not in the page DOM).
  */
 
+const { closeDmComposerOverlays } = require('./instagram-modals');
+
 /** Puppeteer removed `page.waitForTimeout`; use this instead. */
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -59,10 +61,18 @@ function buildMicFinderScript() {
       return parts.map((p) => lower(p)).join(' ');
     };
 
+    const isEmojiStickerNoise = (t) =>
+      t.includes('emoji') ||
+      t.includes('sticker') ||
+      t.includes('gif') ||
+      t.includes('expression') ||
+      t.includes('smile');
+
     const matchesMic = (el) => {
       if (!rectVisible(el)) return false;
       const t = textHints(el);
       if (!t) return false;
+      if (isEmojiStickerNoise(t)) return false;
       return (
         t.includes('microphone') ||
         t.includes('voice') ||
@@ -122,6 +132,8 @@ function buildMicFinderScript() {
         .filter((el) => {
           if (!el.querySelector || !el.querySelector('svg')) return false;
           if (!rectVisible(el)) return false;
+          const hint = textHints(el);
+          if (hint && isEmojiStickerNoise(hint)) return false;
           const r = el.getBoundingClientRect();
           if (r.top < bottomY) return false;
           if (r.width < 8 || r.height < 8) return false;
@@ -205,6 +217,7 @@ async function prepareVoiceNoteUi(page, opts = {}) {
   const { logger = null, timeoutMs = 18000 } = opts;
   const finder = buildMicFinderScript();
 
+  await closeDmComposerOverlays(page);
   await focusThreadComposer(page).catch(() => {});
   await delay(350);
 
@@ -238,27 +251,53 @@ function clickSendAfterRecordingScript() {
         return false;
       }
     };
+    const inStickerNoise = (el) => {
+      let p = el;
+      for (let i = 0; i < 8 && p; i++) {
+        const t = (p.textContent || '').toLowerCase();
+        if (t.includes('gif') && t.includes('sticker')) return true;
+        p = p.parentElement;
+      }
+      return false;
+    };
     const clickables = Array.from(
       document.querySelectorAll('button, div[role="button"], span[role="button"], a[role="button"]')
     );
+    const voiceSend = clickables.find((el) => {
+      if (!visible(el) || inStickerNoise(el)) return false;
+      const label = lower(el.getAttribute('aria-label'));
+      const title = lower(el.getAttribute('title'));
+      return (
+        (label.includes('voice') && label.includes('send')) ||
+        (title.includes('voice') && title.includes('send')) ||
+        label === 'send' ||
+        label.includes('send voice')
+      );
+    });
+    if (voiceSend) {
+      voiceSend.click();
+      return true;
+    }
     const send = clickables.find((el) => {
-      if (!visible(el)) return false;
+      if (!visible(el) || inStickerNoise(el)) return false;
       const label = lower(el.getAttribute('aria-label'));
       const title = lower(el.getAttribute('title'));
       const txt = lower((el.textContent || '').trim());
+      if (label.includes('sticker') || label.includes('gif') || label.includes('emoji')) return false;
       if (label.includes('send') || title.includes('send') || txt === 'send') return true;
-      if (label.includes('send') && (label.includes('voice') || label.includes('message'))) return true;
       return false;
     });
     if (send) {
       send.click();
       return true;
     }
-    const bottom = window.innerHeight - 160;
+    const bottom = window.innerHeight - 180;
     const planes = clickables
       .filter((el) => {
-        if (!visible(el)) return false;
+        if (!visible(el) || inStickerNoise(el)) return false;
         if (!el.querySelector('svg')) return false;
+        const label = lower(el.getAttribute('aria-label'));
+        if (label.includes('sticker') || label.includes('gif') || label.includes('emoji')) return false;
         const r = el.getBoundingClientRect();
         return r.top >= bottom;
       })
@@ -277,6 +316,8 @@ function clickSendAfterRecordingScript() {
  */
 async function sendVoiceNoteInThread(page, opts = {}) {
   const { holdMs = 7000, logger = null, beforeSendClick = null } = opts;
+
+  await closeDmComposerOverlays(page);
 
   const finder = buildMicFinderScript();
   const viewport = page.viewport();
@@ -316,6 +357,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
   await micHandle.dispose().catch(() => {});
 
   await delay(800);
+  await closeDmComposerOverlays(page);
   if (typeof beforeSendClick === 'function') {
     try {
       await beforeSendClick(page);

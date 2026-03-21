@@ -63,6 +63,11 @@ If you see **duplicate opener-style text** in the thread:
 - Check no **second** job (cold DM campaign, another follow-up) ran for the same user.
 - This worker does not re-run “saved reply” or campaign templates on follow-up unless you sent `text` / `messages` / `caption`.
 
+## What the debug screenshots showed (common issues)
+
+- **Home (`01-home`):** If a **“Turn on Notifications”** modal is visible, it blocks the rest of the session until dismissed. The worker now clicks **Not Now** on that (and similar) modals **before** the `01-home` screenshot.
+- **Composer (`04`):** A **sticker / GIF panel** over the thread steals clicks from the real mic/send. The worker now sends **Escape** several times before voice actions and **excludes emoji/sticker/GIF controls** when resolving the mic. The send step prefers **voice send** controls and avoids sticker regions.
+
 ## VPS requirements (voice)
 
 - **`ffmpeg` and `ffprobe`** must be installed (`sudo apt install ffmpeg`). Without them the dashboard process can crash with `spawn ffmpeg ENOENT` when sending voice.

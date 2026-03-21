@@ -14,6 +14,7 @@ const { substituteVariables, normalizeName } = require('./utils/message-variable
 const { startVoiceNotePlayback, isFfmpegAvailable } = require('./utils/voice-note-audio');
 const { sendVoiceNoteInThread, prepareVoiceNoteUi, grantMicrophoneForInstagram } = require('./utils/instagram-voice-note');
 const { captureFollowUpScreenshot, isFollowUpScreenshotsEnabled } = require('./utils/follow-up-screenshots');
+const { dismissInstagramHomeModals } = require('./utils/instagram-modals');
 const { navigateToDmThread, sendPlainTextInThread } = require('./utils/open-dm-thread');
 puppeteer.use(StealthPlugin());
 
@@ -954,6 +955,8 @@ async function sendFollowUp(body) {
 
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(2000);
+    await dismissInstagramHomeModals(page, logger);
+    await delay(500);
     await shot(page, '01-home');
     if (page.url().includes('/accounts/login')) {
       return fail('Instagram session expired', 401);
