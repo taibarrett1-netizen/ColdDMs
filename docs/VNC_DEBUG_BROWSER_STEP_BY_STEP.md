@@ -263,9 +263,13 @@ If **no** chromium process:
 
 ### G1b — Manual mic in DMs (“nothing happens” / popup at top)
 
-- **Desktop Instagram** usually expects **press and hold** on the mic (~**0.5–1 s**), not a single click. Release after the recording UI (timer / blue bar) appears.  
-- The bot re-runs **`overridePermissions(microphone)`** after Instagram loads and after opening a thread — check **`pm2 logs`** for **`[voice] Microphone permission granted`**. If you see **overridePermissions failed**, Chrome may show an **infobar above the page** (easy to miss if the window is clipped). **Scroll the VNC view to y=0** or look at the **very top** of the Chrome window (above instagram.com).  
-- Real audio capture on the VPS needs **PulseAudio** / `PULSE_SOURCE` etc.; for UI-only checks, `--use-fake-ui-for-media-stream` is already enabled in launch args.
+- **Not because of “Chromium”** — Puppeteer uses **Chrome for Testing** (normal Chromium). Same WebRTC stack as Chrome.  
+- **Permission “Allow” ≠ a working device.** On a bare VPS there is often **no real capture device**. `getUserMedia({ audio: true })` can **fail** even when site permissions say Allow; Instagram may then do **nothing** on mic click.  
+- **Fix for manual / VNC testing:** set **`CHROMIUM_USE_FAKE_MEDIA_DEVICE=true`** in `.env`, **`pm2 restart`**, open the debug browser again. That adds **`--use-fake-device-for-media-stream`** (silent fake mic) so capture succeeds and the **recording UI** can appear. **Turn this off** when sending real voice notes with PulseAudio / `PULSE_SOURCE`.  
+- **Desktop Instagram** usually expects **press and hold** on the mic (~**0.5–1 s**), not a single click.  
+- The bot re-runs **`overridePermissions(microphone)`** after load — check **`pm2 logs`** for **`[voice] Microphone permission granted`**.  
+- To confirm errors: **DevTools → Console** (right‑click → Inspect) and click the mic; look for `getUserMedia` / `NotFoundError` / `NotReadableError`.  
+- Real sends: PulseAudio null sink + monitor + `PULSE_SOURCE` (see **`docs/FOLLOW_UP_SEND.md`**).
 
 ### G2. How long the window stays open
 
