@@ -8,6 +8,7 @@
  */
 
 const { closeDmComposerOverlays } = require('./instagram-modals');
+const { captureFollowUpScreenshot, isFollowUpScreenshotsEnabled } = require('./follow-up-screenshots');
 
 /** Puppeteer removed `page.waitForTimeout`; use this instead. */
 function delay(ms) {
@@ -308,6 +309,23 @@ function clickSendAfterRecordingScript() {
       planes[0].click();
       return true;
     }
+    /** Recording bar: Send is usually the rightmost circular control above the composer. */
+    const bottomY = window.innerHeight - 240;
+    const row = clickables
+      .filter((el) => {
+        if (!visible(el) || inStickerNoise(el)) return false;
+        if (!el.querySelector('svg')) return false;
+        const r = el.getBoundingClientRect();
+        if (r.top < bottomY) return false;
+        const label = lower(el.getAttribute('aria-label'));
+        if (label.includes('microphone') || label.includes('voice message') || label.includes('gallery')) return false;
+        return r.width > 16 && r.height > 16;
+      })
+      .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+    if (row.length) {
+      row[0].click();
+      return true;
+    }
     return false;
   };
 }
@@ -317,7 +335,8 @@ function clickSendAfterRecordingScript() {
  * Mobile web: press-and-hold on mic for holdMs, then Send.
  */
 async function sendVoiceNoteInThread(page, opts = {}) {
-  const { holdMs = 7000, logger = null, beforeSendClick = null } = opts;
+  const { holdMs = 7000, logger = null, correlationId = '' } = opts;
+  const shotMeta = { correlationId, logger };
 
   await closeDmComposerOverlays(page);
 
@@ -346,6 +365,9 @@ async function sendVoiceNoteInThread(page, opts = {}) {
   if (desktopFlow) {
     if (logger) logger.log(`Voice (desktop): click mic, record ${Math.round(holdMs)} ms, then send`);
     await page.mouse.click(cx, cy, { delay: 40 });
+    if (isFollowUpScreenshotsEnabled()) {
+      await captureFollowUpScreenshot(page, 'voice-after-mic-click', shotMeta);
+    }
     await delay(holdMs);
   } else {
     if (logger) logger.log(`Voice (press-hold): ${Math.round(holdMs)} ms`);
@@ -358,20 +380,14 @@ async function sendVoiceNoteInThread(page, opts = {}) {
   await micEl.dispose().catch(() => {});
   await micHandle.dispose().catch(() => {});
 
-  await delay(800);
-  await closeDmComposerOverlays(page);
-  if (typeof beforeSendClick === 'function') {
-    try {
-      await beforeSendClick(page);
-    } catch (e) {
-      if (logger) logger.warn(`[follow-up] beforeSendClick hook: ${e.message}`);
-    }
-  }
+  /** Do NOT send Escape here — it dismisses Instagram's voice recording UI before Send. */
+  await delay(1200);
   const clickSend = clickSendAfterRecordingScript();
-  let sent = await page.evaluate(clickSend).catch(() => false);
-  if (!sent) {
-    await delay(600);
+  let sent = false;
+  for (let attempt = 0; attempt < 15; attempt++) {
     sent = await page.evaluate(clickSend).catch(() => false);
+    if (sent) break;
+    await delay(450);
   }
   if (!sent) return { ok: false, reason: 'voice_send_button_not_found' };
 

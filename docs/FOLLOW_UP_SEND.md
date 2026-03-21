@@ -29,20 +29,16 @@ Exactly **one** of:
 | `messages` | Array of text DMs (sequential) |
 | `audioUrl` | Voice follow-up (`caption` optional text before voice) |
 
-## Debug screenshots (logs say success but nothing on IG)
+## Debug screenshots (optional)
 
 1. Set **`FOLLOW_UP_DEBUG_SCREENSHOTS=true`** in `.env` on the VPS and restart PM2.
-2. Run a follow-up again (pass **`correlationId`** so filenames match your Edge logs).
-3. PNGs are written to **`follow-up-screenshots/`** in the project root. Each run logs e.g.  
-   `[follow-up] debug screenshot saved follow-up-screenshots/2026-03-21T10-05-46_xxx_04-voice-after-record-before-send-click.png`
-4. **Download via HTTP** (same auth as other `/api` routes when `COLD_DM_API_KEY` is set):
-   - `GET /api/debug/follow-up-screenshots` — JSON list of files (`name`, `size`, `mtime`)
-   - `GET /api/debug/follow-up-screenshots/file?name=FILENAME.png` — PNG image  
-   Example: `curl -H "Authorization: Bearer $COLD_DM_API_KEY" "http://YOUR_VPS:3000/api/debug/follow-up-screenshots/file?name=..."`
+2. For **voice** follow-ups, **one** PNG is saved **right after the mic is clicked** (recording UI should appear):  
+   `follow-up-screenshots/*_voice-after-mic-click.png` (includes `correlationId` in the filename when sent).
+3. **Download via HTTP** (Bearer `COLD_DM_API_KEY` when set): `GET /api/debug/follow-up-screenshots` and `GET /api/debug/follow-up-screenshots/file?name=...`
 
-Steps in filenames: `01-home`, `02-thread`, `03-voice-composer-ready`, `04-voice-after-record-before-send-click`, `05-voice-after-send-click`. Compare **`04`** vs **`05`** to see if the recording UI and send control look correct.
+Optional: **`FOLLOW_UP_SCREENSHOTS_FULL_PAGE=true`** for full-page PNGs.
 
-Optional: **`FOLLOW_UP_SCREENSHOTS_FULL_PAGE=true`** for taller captures (larger files).
+**Note:** Sending **Escape** after recording was closing Instagram’s voice UI before “Send” — that is no longer done between record and send.
 
 ## Correlation (Supabase ↔ VPS logs)
 
