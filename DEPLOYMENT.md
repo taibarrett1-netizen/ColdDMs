@@ -63,6 +63,8 @@ Set these in `.env`:
 
 ### Watching the browser on a VPS (Xvfb + VNC)
 
+**Full reset / black-screen walkthrough:** see **[`docs/VNC_DEBUG_BROWSER_STEP_BY_STEP.md`](./docs/VNC_DEBUG_BROWSER_STEP_BY_STEP.md)** (ordered checks: Xvfb → x11vnc → `xterm` proof → PM2 `DISPLAY` → debug API).
+
 `HEADLESS_MODE=false` on Linux still needs a **display**. Use a virtual framebuffer and optionally VNC so you can see the same session Puppeteer drives.
 
 1. **Install:** `sudo apt install -y xvfb x11vnc fluxbox`
@@ -75,8 +77,10 @@ Set these in `.env`:
    **Option A — no VNC password** (fine **only** with SSH tunnel):
 
    ```bash
-   x11vnc -display :99 -forever -shared -nopw -listen 127.0.0.1 -rfbport 5900 -securitytypes none &
+   x11vnc -display :99 -forever -shared -nopw -listen 127.0.0.1 -rfbport 5900 &
    ```
+
+   **Note:** Do **not** add `-securitytypes none` on many Ubuntu packages — `x11vnc` will print `unrecognized option(s) -securitytypes` and exit. `-nopw` alone is enough when you only listen on `127.0.0.1` and use an SSH tunnel.
 
    **Option B — VNC password** (works with picky clients; RealVNC often needs this):
 
@@ -90,9 +94,12 @@ Set these in `.env`:
 
    **SSH tunnel:** `ssh -L 5900:127.0.0.1:5900 user@YOUR_VPS_IP` — then connect to **`127.0.0.1:5900`** (or `localhost:5900`).
 
+   **Black screen in VNC:** Normal until something draws on that X display. (1) Confirm Xvfb is on the **same** display as the bot (`DISPLAY` in `.env`, e.g. `:98`). (2) On the VPS: `DISPLAY=:98 fluxbox &` (optional but helps). (3) Smoke test: `DISPLAY=:98 xterm &` — you should see a terminal in VNC; if not, `x11vnc` display or Xvfb is wrong. (4) **After** VNC is connected, trigger **`POST /api/debug/follow-up/browser`** again (or restart PM2) so Chromium opens on that display. (5) In the viewer, try **three quick presses of Left Alt** (x11vnc full repaint). If still black, restart `x11vnc` with **`-noxdamage`**:  
+   `x11vnc -display :98 -forever -shared -nopw -listen 127.0.0.1 -rfbport 5900 -noxdamage &`
+
    **Mac client (free):** `brew install --cask tigervnc-viewer` (note: **`tigervnc-viewer`**, not `tiger-vnc-viewer`). Or download from [TigerVNC releases](https://github.com/TigerVNC/tigervnc/releases). **Finder → Connect to Server** can use `vnc://127.0.0.1:5900` but is fussy with x11vnc; TigerVNC Viewer is more reliable.
 
-   If the viewer says **“no matching security types”**, use **Option B** above or add **`-securitytypes none`** to Option A’s `x11vnc` line.
+   If the viewer says **“no matching security types”**, use **Option B** (VNC password + `-rfbauth`) — do not rely on `-securitytypes` on Ubuntu’s `x11vnc`.
 
 5. **Bot:** In `.env` set `HEADLESS_MODE=false` and `DISPLAY=:99`, restart PM2. `cli.js` loads `.env` via `dotenv`, so `DISPLAY` is picked up by Chromium.
 

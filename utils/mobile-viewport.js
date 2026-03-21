@@ -13,7 +13,20 @@ function getRandomMobileUA() {
 }
 
 const MOBILE_VIEWPORT = { width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 2 };
-const DESKTOP_VIEWPORT = { width: 1280, height: 800, isMobile: false, hasTouch: false, deviceScaleFactor: 1 };
+
+function parseViewportDim(envVal, fallback) {
+  const n = parseInt(String(envVal || '').trim(), 10);
+  return Number.isFinite(n) && n >= 320 && n <= 4096 ? n : fallback;
+}
+
+/** Desktop layout for Instagram Web (DM inbox needs width; 1280 was visibly clipped). */
+function buildDesktopViewport() {
+  const width = parseViewportDim(process.env.DESKTOP_VIEWPORT_WIDTH, 1920);
+  const height = parseViewportDim(process.env.DESKTOP_VIEWPORT_HEIGHT, 1080);
+  return { width, height, isMobile: false, hasTouch: false, deviceScaleFactor: 1 };
+}
+
+const DESKTOP_VIEWPORT = buildDesktopViewport();
 const DESKTOP_UA =
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
 
@@ -24,7 +37,14 @@ async function applyMobileEmulation(page) {
 
 async function applyDesktopEmulation(page) {
   await page.setUserAgent(DESKTOP_UA);
-  await page.setViewport(DESKTOP_VIEWPORT);
+  await page.setViewport(buildDesktopViewport());
 }
 
-module.exports = { getRandomMobileUA, MOBILE_VIEWPORT, DESKTOP_VIEWPORT, applyMobileEmulation, applyDesktopEmulation };
+module.exports = {
+  getRandomMobileUA,
+  MOBILE_VIEWPORT,
+  DESKTOP_VIEWPORT,
+  buildDesktopViewport,
+  applyMobileEmulation,
+  applyDesktopEmulation,
+};
