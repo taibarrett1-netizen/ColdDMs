@@ -62,13 +62,16 @@ Detection is **scoped to the composer dock** (the “Message…” row and strip
 The worker tries **several mic gestures in order**, and after **each** one polls until real recording UI appears or a per-attempt timeout hits:
 
 1. `element.click()` on the mic node (with coordinate fallback)  
-2. `mouse` move → `down` → `up` at mic center  
-3. `mouse.click` at coordinates  
-4. `elementFromPoint` + synthetic pointer/mouse events  
+2. **`stepped_move+press_hold`** — short multi-step `mouse.move` toward the mic (small jitter), then `down` → hold **`VOICE_MIC_PRESS_HOLD_MS`** (default **210** ms, clamped 120–400) → `up` (often registers better than an instant click on desktop Web)  
+3. `mouse` move → `down` → `up` at mic center (short hold)  
+4. `mouse.click` at coordinates  
+5. `elementFromPoint` + synthetic pointer/mouse events  
+
+Composer-scoped detection uses the **same composer discovery** as focus/mic prep (`p[contenteditable]`, “add/write a message”, then first visible textbox) so logs are less likely to show **`lastWhy=no_composer`** when the dock is non-English or the placeholder omits the word “message”.
 
 **ffmpeg → Pulse** starts only after that check passes (timer **`0:xx`/`1:xx`**, pause/delete **aria**, or a **wide** blue strip in the dock — not a bubble). If all attempts fail → **`voice_recording_ui_not_detected`**.
 
-Optional env: **`VOICE_MIC_ATTEMPT_WAIT_MS`** (per gesture poll window); **`VOICE_RECORDING_UI_TIMEOUT_MS`** still influences the default when unset.
+Optional env: **`VOICE_MIC_ATTEMPT_WAIT_MS`** (per gesture poll window); **`VOICE_RECORDING_UI_TIMEOUT_MS`** still influences the default when unset; **`VOICE_MIC_PRESS_HOLD_MS`** for the press-hold attempt.
 
 ### Stricter success criteria
 

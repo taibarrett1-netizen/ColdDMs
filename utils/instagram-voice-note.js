@@ -164,14 +164,44 @@ async function waitForVoiceDeliveredInThread(page, before, opts = {}) {
 function detectInstagramVoiceRecordingUiScript() {
   return function detectInstagramVoiceRecordingUi() {
     const lower = (s) => (s || '').toLowerCase();
-    const inputs = Array.from(
-      document.querySelectorAll('textarea[placeholder], [contenteditable="true"], [role="textbox"]')
-    );
-    const compose = inputs.find((el) => {
-      const ph = lower(el.getAttribute('placeholder') || '');
-      const al = lower(el.getAttribute('aria-label') || '');
-      return ph.includes('message') || al.includes('message');
-    });
+    /** Match focusThreadComposer / mic layout — avoids false lastWhy=no_composer on non-English UI. */
+    function findComposerForDock() {
+      const byPlaceholder = (el) => {
+        const p = (el.getAttribute && el.getAttribute('placeholder')) || '';
+        const a = (el.getAttribute && el.getAttribute('aria-label')) || '';
+        const t = (p + ' ' + a).toLowerCase();
+        return (
+          t.includes('message') ||
+          t.includes('messenger') ||
+          t.includes('add a message') ||
+          t.includes('write a message')
+        );
+      };
+      const all = document.querySelectorAll(
+        'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]'
+      );
+      for (const el of all) {
+        try {
+          if (!el || el.disabled) continue;
+          if (el.offsetParent === null && (!el.getClientRects || el.getClientRects().length === 0)) continue;
+          if (byPlaceholder(el)) return el;
+        } catch {
+          /* ignore */
+        }
+      }
+      for (const el of all) {
+        try {
+          if (!el || el.disabled) continue;
+          if (el.offsetParent === null && (!el.getClientRects || el.getClientRects().length === 0)) continue;
+          return el;
+        } catch {
+          /* ignore */
+        }
+      }
+      return null;
+    }
+
+    const compose = findComposerForDock();
     if (!compose) {
       return { ok: false, why: 'no_composer' };
     }
@@ -289,6 +319,15 @@ const PER_ATTEMPT_RECORDING_WAIT_MS = Math.min(
 );
 
 /**
+ * Desktop IG sometimes uses placeholders without the word "message" (i18n / A/B).
+ * Keep in sync with focusThreadComposer() below.
+ */
+const VOICE_MIC_PRESS_HOLD_MS = Math.min(
+  Math.max(parseInt(process.env.VOICE_MIC_PRESS_HOLD_MS, 10) || 210, 120),
+  400
+);
+
+/**
  * Try several click paths; only proceed to the next if recording UI did not appear.
  */
 async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger) {
@@ -301,6 +340,32 @@ async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger) {
         } catch {
           await page.mouse.click(cx, cy, { delay: 40 });
         }
+      },
+    },
+    {
+      /** Stepped pointer path + short press-hold (desktop Web often responds better than instant click). */
+      name: 'stepped_move+press_hold',
+      run: async () => {
+        const steps = 8;
+        const offX = Math.min(130, Math.max(36, cx * 0.14));
+        const offY = Math.min(90, Math.max(22, cy * 0.07));
+        const startX = Math.max(4, cx - offX);
+        const startY = Math.max(4, cy - offY);
+        for (let i = 0; i <= steps; i++) {
+          const t = i / steps;
+          const jx = Math.random() * 5 - 2.5;
+          const jy = Math.random() * 5 - 2.5;
+          await page.mouse.move(
+            Math.round(startX + (cx - startX) * t + jx),
+            Math.round(startY + (cy - startY) * t + jy)
+          );
+          await delay(10 + Math.floor(Math.random() * 12));
+        }
+        await page.mouse.move(Math.round(cx), Math.round(cy));
+        await delay(50 + Math.floor(Math.random() * 45));
+        await page.mouse.down();
+        await delay(VOICE_MIC_PRESS_HOLD_MS);
+        await page.mouse.up();
       },
     },
     {
@@ -464,14 +529,43 @@ function buildMicFinderScript() {
     /** Desktop Web: [mic][gallery photo][sticker/heart] to the RIGHT of the "Message..." field only.
      *  Mic = leftmost of those three (NOT the emoji inside the bar on the left). */
     function findMicByComposerLayout() {
-      const inputs = Array.from(
-        document.querySelectorAll('textarea[placeholder], [contenteditable="true"], [role="textbox"]')
-      );
-      const compose = inputs.find((el) => {
-        const ph = lower(el.getAttribute('placeholder') || '');
-        const al = lower(el.getAttribute('aria-label') || '');
-        return ph.includes('message') || al.includes('message');
-      });
+      function findComposerForDock() {
+        const byPlaceholder = (el) => {
+          const p = (el.getAttribute && el.getAttribute('placeholder')) || '';
+          const a = (el.getAttribute && el.getAttribute('aria-label')) || '';
+          const t = (p + ' ' + a).toLowerCase();
+          return (
+            t.includes('message') ||
+            t.includes('messenger') ||
+            t.includes('add a message') ||
+            t.includes('write a message')
+          );
+        };
+        const all = document.querySelectorAll(
+          'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]'
+        );
+        for (const el of all) {
+          try {
+            if (!el || el.disabled) continue;
+            if (el.offsetParent === null && (!el.getClientRects || el.getClientRects().length === 0)) continue;
+            if (byPlaceholder(el)) return el;
+          } catch {
+            /* ignore */
+          }
+        }
+        for (const el of all) {
+          try {
+            if (!el || el.disabled) continue;
+            if (el.offsetParent === null && (!el.getClientRects || el.getClientRects().length === 0)) continue;
+            return el;
+          } catch {
+            /* ignore */
+          }
+        }
+        return null;
+      }
+
+      const compose = findComposerForDock();
       if (!compose) return null;
 
       const cr = compose.getBoundingClientRect();
@@ -762,14 +856,40 @@ async function sendVoiceNoteInThread(page, opts = {}) {
 
       await page
         .evaluate(() => {
-          const lower = (s) => (s || '').toLowerCase();
-          const inputs = document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]');
-          for (const el of inputs) {
-            const ph = lower(el.getAttribute('placeholder') || '');
-            const al = lower(el.getAttribute('aria-label') || '');
-            if (ph.includes('message') || al.includes('message')) {
+          const byPlaceholder = (el) => {
+            const p = (el.getAttribute && el.getAttribute('placeholder')) || '';
+            const a = (el.getAttribute && el.getAttribute('aria-label')) || '';
+            const t = (p + ' ' + a).toLowerCase();
+            return (
+              t.includes('message') ||
+              t.includes('messenger') ||
+              t.includes('add a message') ||
+              t.includes('write a message')
+            );
+          };
+          const all = document.querySelectorAll(
+            'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]'
+          );
+          for (const el of all) {
+            try {
+              if (!el || el.disabled) continue;
+              if (el.offsetParent === null && (!el.getClientRects || el.getClientRects().length === 0)) continue;
+              if (byPlaceholder(el)) {
+                el.focus();
+                return;
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+          for (const el of all) {
+            try {
+              if (!el || el.disabled) continue;
+              if (el.offsetParent === null && (!el.getClientRects || el.getClientRects().length === 0)) continue;
               el.focus();
               return;
+            } catch {
+              /* ignore */
             }
           }
         })
