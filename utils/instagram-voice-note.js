@@ -7,6 +7,11 @@
  * no OS dialog blocks automation (Safari dialogs are not in the page DOM).
  */
 
+/** Puppeteer removed `page.waitForTimeout`; use this instead. */
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Grant mic for instagram.com so getUserMedia succeeds without a permission prompt.
  * Safe to call once per page/context.
@@ -201,7 +206,7 @@ async function prepareVoiceNoteUi(page, opts = {}) {
   const finder = buildMicFinderScript();
 
   await focusThreadComposer(page).catch(() => {});
-  await page.waitForTimeout(350);
+  await delay(350);
 
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -215,7 +220,7 @@ async function prepareVoiceNoteUi(page, opts = {}) {
     }
     if (h) await h.dispose().catch(() => {});
     await focusThreadComposer(page).catch(() => {});
-    await page.waitForTimeout(450);
+    await delay(450);
   }
 
   return { ok: false, reason: 'voice_mic_not_found' };
@@ -298,28 +303,28 @@ async function sendVoiceNoteInThread(page, opts = {}) {
   if (desktopFlow) {
     if (logger) logger.log(`Voice (desktop): click mic, record ${Math.round(holdMs)} ms, then send`);
     await page.mouse.click(cx, cy, { delay: 40 });
-    await page.waitForTimeout(holdMs);
+    await delay(holdMs);
   } else {
     if (logger) logger.log(`Voice (press-hold): ${Math.round(holdMs)} ms`);
     await page.mouse.move(cx, cy);
     await page.mouse.down();
-    await page.waitForTimeout(holdMs);
+    await delay(holdMs);
     await page.mouse.up();
   }
 
   await micEl.dispose().catch(() => {});
   await micHandle.dispose().catch(() => {});
 
-  await page.waitForTimeout(800);
+  await delay(800);
   const clickSend = clickSendAfterRecordingScript();
   let sent = await page.evaluate(clickSend).catch(() => false);
   if (!sent) {
-    await page.waitForTimeout(600);
+    await delay(600);
     sent = await page.evaluate(clickSend).catch(() => false);
   }
   if (!sent) return { ok: false, reason: 'voice_send_button_not_found' };
 
-  await page.waitForTimeout(1200);
+  await delay(1200);
   return { ok: true };
 }
 
