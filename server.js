@@ -31,6 +31,7 @@ const {
 const { loadLeadsFromCSV, connectInstagram, completeInstagram2FA, sendFollowUp } = require('./bot');
 const { connectScraper, runFollowerScrape, runCommentScrape } = require('./scraper');
 const { MESSAGES } = require('./config/messages');
+const logger = require('./utils/logger');
 
 const app = express();
 const PORT = process.env.DASHBOARD_PORT || 3000;
@@ -284,15 +285,30 @@ app.post('/api/leads/upload', upload.single('file'), (req, res) => {
  */
 app.post('/api/follow-up/send', async (req, res) => {
   if (!isSupabaseConfigured()) {
+    logger.warn('[API] follow-up/send 503 Supabase not configured');
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
   }
+  const body = req.body || {};
+  const cid = (body.clientId || '').trim();
+  const sid = (body.instagramSessionId || '').trim();
+  const recip = (body.recipientUsername || '').trim().replace(/^@/, '');
+  let mode = 'unknown';
+  if (body.text != null && String(body.text).trim() !== '') mode = 'text';
+  else if (Array.isArray(body.messages) && body.messages.some((m) => String(m).trim())) {
+    mode = `messages(${body.messages.filter((m) => String(m).trim()).length})`;
+  } else if (body.audioUrl) mode = body.caption != null && String(body.caption).trim() !== '' ? 'voice+caption' : 'voice';
+  logger.log(`[API] follow-up/send request clientId=${cid || '-'} sessionId=${sid || '-'} recipient=@${recip || '-'} mode=${mode}`);
   try {
-    const result = await sendFollowUp(req.body || {});
-    if (result.ok) return res.json({ ok: true });
+    const result = await sendFollowUp(body);
+    if (result.ok) {
+      logger.log(`[API] follow-up/send response ok=true clientId=${cid || '-'} recipient=@${recip || '-'}`);
+      return res.json({ ok: true });
+    }
     const status = result.statusCode && result.statusCode >= 400 && result.statusCode < 600 ? result.statusCode : 400;
+    logger.warn(`[API] follow-up/send response ok=false status=${status} error=${result.error || 'Send failed'}`);
     return res.status(status).json({ ok: false, error: result.error || 'Send failed' });
   } catch (e) {
-    console.error('[API] follow-up/send failed', e);
+    logger.error('[API] follow-up/send exception', e);
     return res.status(500).json({ ok: false, error: e.message || 'Internal error' });
   }
 });

@@ -11,6 +11,11 @@ SkeduleMore **follow-ups** are triggered by the dashboard when a scheduled follo
   - `caption` (optional): sent as a text DM before the voice note, in the same thread
 - **VPS behavior:** Downloads the file from `audioUrl`, plays it into the virtual Pulse sink, and drives Instagram Web’s mic UI (same helpers as cold-DM voice notes). Session comes from `clientId` + `instagramSessionId` (`cold_dm_instagram_sessions` row).
 
+## Logging
+
+- **Dashboard (`server.js`):** Each request logs `[API] follow-up/send request …` and a line for `response ok=true/false` (see `pm2 logs ig-dm-dashboard` or `logs/bot.log` — same logger writes to stdout and `logs/bot.log`).
+- **Send path (`bot.js`):** `[follow-up] start …` before launching the browser (after session validation), `[follow-up] sent ok …` on success, and `[follow-up] failed …` / `[follow-up] exception …` on errors. Signed `audioUrl` values are not logged.
+
 ## Cold DM campaign voice (separate)
 
 Voice for **cold outreach campaigns** may use `cold_dm_campaigns` / `cold_dm_message_group_messages` columns (see migration `010_voice_notes.sql`) and env `VOICE_NOTE_*` on the worker. That path is **independent** from follow-up sends.
