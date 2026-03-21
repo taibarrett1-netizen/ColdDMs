@@ -19,11 +19,18 @@ function parseViewportDim(envVal, fallback) {
   return Number.isFinite(n) && n >= 320 && n <= 4096 ? n : fallback;
 }
 
-/** Desktop layout for Instagram Web (DM inbox needs width; 1280 was visibly clipped). */
+/** Desktop layout for Instagram Web (DM inbox needs width + enough height for thread + composer). */
 function buildDesktopViewport() {
   const width = parseViewportDim(process.env.DESKTOP_VIEWPORT_WIDTH, 1920);
-  const height = parseViewportDim(process.env.DESKTOP_VIEWPORT_HEIGHT, 1080);
+  const height = parseViewportDim(process.env.DESKTOP_VIEWPORT_HEIGHT, 1200);
   return { width, height, isMobile: false, hasTouch: false, deviceScaleFactor: 1 };
+}
+
+/** Extra pixels for `--window-size` vs layout viewport (tabs, URL bar, bookmark bar — not part of page). */
+function getDesktopWindowPadding() {
+  const px = Math.max(0, parseInt(process.env.DESKTOP_WINDOW_PAD_X, 10) || 0);
+  const py = Math.max(0, parseInt(process.env.DESKTOP_WINDOW_PAD_Y, 10) || 220);
+  return { padX: px, padY: py };
 }
 
 const DESKTOP_VIEWPORT = buildDesktopViewport();
@@ -45,6 +52,7 @@ module.exports = {
   MOBILE_VIEWPORT,
   DESKTOP_VIEWPORT,
   buildDesktopViewport,
+  getDesktopWindowPadding,
   applyMobileEmulation,
   applyDesktopEmulation,
 };

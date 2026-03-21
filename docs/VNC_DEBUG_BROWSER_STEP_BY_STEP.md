@@ -52,15 +52,17 @@ If you see `Xvfb :98` already and you did **not** start it yourself, either reus
 
 ### B2. Start `Xvfb` (if not already running)
 
-Use a **wide** screen — Instagram’s desktop DM layout clips on 1280px. Defaults in code are **1920×1080** (`DESKTOP_VIEWPORT_WIDTH` / `HEIGHT`); **match Xvfb** to that (or set env smaller and match Xvfb to it).
+Use a **wide and tall** screen. The bot uses a **layout viewport** (default **1920×1200**) plus a **taller Chromium window** (`--window-size` adds **~220px** by default for tabs/toolbar above the page). **Xvfb must be at least as big as that outer window** (roughly **1920 × 1420** with defaults), or the bottom of the page (DM composer) will still look “cut off”.
 
 ```bash
-# Only if :98 is free:
-Xvfb :98 -screen 0 1920x1080x24 &
+# Only if :98 is free — 1440 height leaves a little slack above min outer window:
+Xvfb :98 -screen 0 1920x1440x24 &
 sleep 1
 ```
 
-If you already had `1280x800`, **stop** that Xvfb (`pkill Xvfb` — note: kills all Xvfb) and start again with `1920x1080x24`, then restart `fluxbox` / `x11vnc` on `:98`.
+Verify: `DISPLAY=:98 xdpyinfo | grep dimensions` → should show **1920x1440** (or whatever you chose).
+
+If you already had `1280x800`, **stop** that Xvfb (`pkill Xvfb` — note: kills all Xvfb) and start again with a large mode, then restart `fluxbox` / `x11vnc` on `:98`.
 
 ### B3. Optional but recommended: window manager
 
@@ -230,7 +232,8 @@ If **no** chromium process:
 
 | Symptom | What to check |
 |--------|----------------|
-| Instagram / Chromium **cut off on the right** | (1) **Deploy latest `bot.js`**: headed mode must pass Chromium **`--window-size=…`** (not only `page.setViewport` — that does not resize the X11 window). Logs should show `desktopViewport=1920x1080`. (2) Xvfb at least **`1920x1080x24`**. (3) Optional: `DESKTOP_VIEWPORT_WIDTH` / `HEIGHT` in `.env`. (4) TigerVNC: maximize viewer, **100%** scale. |
+| DM **composer missing** / bottom cut off | Browser **chrome** (tabs, URL bar) sits **above** the page. The outer window must be **taller** than the viewport: defaults add **`DESKTOP_WINDOW_PAD_Y` (220px)** to `--window-size`. **Xvfb height ≥ viewport height + pad** (e.g. **1440** with defaults). Check logs: `viewport=… windowSize=…`. Increase **`DESKTOP_WINDOW_PAD_Y`** (e.g. `280`) if needed. |
+| Instagram / Chromium **cut off on the right** | Widen **`DESKTOP_VIEWPORT_WIDTH`** (e.g. `2048`) and grow Xvfb width to match. Deploy latest `bot.js` so **`--window-size`** includes chrome padding. TigerVNC: **100%** scale, maximize viewer. |
 | Black screen in VNC | Run Part D (`xterm`) again while VNC is connected. |
 | `curl` fails to port 443 | Use **`http://IP:3000`**, not `https://IP` unless you have a reverse proxy. |
 | `409` from debug endpoint | `pm2 restart all`, wait for online, curl again. |

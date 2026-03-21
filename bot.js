@@ -9,7 +9,12 @@ const { getRandomMessage } = require('./config/messages');
 const { alreadySent, logSentMessage, getDailyStats, normalizeUsername, getControl, setControl } = require('./database/db');
 const sb = require('./database/supabase');
 const logger = require('./utils/logger');
-const { applyMobileEmulation, applyDesktopEmulation, buildDesktopViewport } = require('./utils/mobile-viewport');
+const {
+  applyMobileEmulation,
+  applyDesktopEmulation,
+  buildDesktopViewport,
+  getDesktopWindowPadding,
+} = require('./utils/mobile-viewport');
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
 const { isFfmpegAvailable } = require('./utils/voice-note-audio');
 const {
@@ -35,12 +40,19 @@ function getPuppeteerSlowMo() {
 /**
  * Headed Chromium often opens ~800×600; `page.setViewport()` alone does not resize the X11 window,
  * so Instagram stays visually clipped until the real window matches (especially on VNC + Xvfb).
+ *
+ * `--window-size` must be **larger** than the layout viewport: browser chrome (tab strip, toolbar,
+ * bookmarks) is outside the page. If they match, the composer / right column look "cut off" even
+ * when Xvfb is big enough.
  */
 function applyHeadedChromeWindowToLaunchOpts(launchOpts) {
   if (HEADLESS || !launchOpts || !Array.isArray(launchOpts.args)) return;
   const vp = buildDesktopViewport();
+  const { padX, padY } = getDesktopWindowPadding();
+  const outerW = vp.width + padX;
+  const outerH = vp.height + padY;
   if (!launchOpts.args.some((a) => typeof a === 'string' && a.startsWith('--window-size='))) {
-    launchOpts.args.push(`--window-size=${vp.width},${vp.height}`);
+    launchOpts.args.push(`--window-size=${outerW},${outerH}`);
   }
   launchOpts.defaultViewport = {
     width: vp.width,
@@ -951,9 +963,11 @@ async function debugOpenFollowUpBrowserForManualTest(body) {
     const hasTimedHold = Number.isFinite(holdMs) && holdMs > 0;
 
     const dvp = buildDesktopViewport();
+    const pad = getDesktopWindowPadding();
     logger.log(
       `[debug] follow-up/browser: Chromium open for manual test (user=${session.instagram_username || 'n/a'}). ` +
-        `DISPLAY=${process.env.DISPLAY || '(unset)'} desktopViewport=${dvp.width}x${dvp.height} (HEADLESS_MODE=false adds --window-size). ` +
+        `DISPLAY=${process.env.DISPLAY || '(unset)'} viewport=${dvp.width}x${dvp.height} ` +
+        `windowSize=${dvp.width + pad.padX}x${dvp.height + pad.padY} (pad +${pad.padX},+${pad.padY} for browser chrome). ` +
         (hasTimedHold
           ? `Auto-close after FOLLOW_UP_DEBUG_BROWSER_MS=${holdMs}ms.`
           : 'Holding until PM2 restart (or set FOLLOW_UP_DEBUG_BROWSER_MS).')
