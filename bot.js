@@ -11,7 +11,7 @@ const sb = require('./database/supabase');
 const logger = require('./utils/logger');
 const { applyMobileEmulation, applyDesktopEmulation } = require('./utils/mobile-viewport');
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
-const { startVoiceNotePlayback, isFfmpegAvailable } = require('./utils/voice-note-audio');
+const { isFfmpegAvailable } = require('./utils/voice-note-audio');
 const {
   sendVoiceNoteInThread,
   prepareVoiceNoteUi,
@@ -728,7 +728,6 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 
   const attemptVoiceSend = async () => {
     if (!shouldSendVoice) return;
-    let playback = null;
     let resolved = null;
     try {
       resolved = await resolveVoiceNotePath(voiceCfg.voiceNotePath);
@@ -738,9 +737,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         logger.warn(`Voice note UI not ready for @${u}: ${voiceFailure}`);
         return;
       }
-      playback = startVoiceNotePlayback(resolved.localPath, VOICE_NOTE_SINK, logger);
-      const holdMs = Math.round(playback.durationSec * 1000 + 700);
-      const voiceResult = await sendVoiceNoteInThread(page, { holdMs, logger });
+      const voiceResult = await sendVoiceNoteInThread(page, {
+        logger,
+        voiceSource: { path: resolved.localPath, sink: VOICE_NOTE_SINK },
+      });
       if (!voiceResult.ok) {
         voiceFailure = voiceResult.reason || 'voice_note_failed';
         logger.warn(`Voice note send failed for @${u}: ${voiceFailure}`);
@@ -752,7 +752,6 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       voiceFailure = e.message || 'voice_note_failed';
       logger.warn(`Voice note send error for @${u}: ${voiceFailure}`);
     } finally {
-      if (playback) playback.stop();
       if (resolved) await resolved.cleanup();
     }
   };
@@ -875,6 +874,8 @@ function followUpReasonToError(reason, pageSnippet) {
     voice_permission_denied: 'Microphone permission denied',
     voice_send_button_not_found: 'Could not send voice note',
     voice_note_failed: 'Voice note failed',
+    voice_recording_ui_not_detected:
+      'Voice recording UI did not appear after clicking the mic (no blue bar / 0:00 timer). Wrong control clicked or mic blocked; check FOLLOW_UP_DEBUG_SCREENSHOTS and VNC',
     voice_not_confirmed_in_thread: 'Voice send was not confirmed in the thread (DOM did not update). Try debug screenshots, VNC, or PUPPETEER_SLOW_MO_MS',
     empty_message: 'Empty message',
   };
@@ -1014,38 +1015,34 @@ async function sendFollowUp(body) {
         }
         await delay(1200);
       }
-      let playback = null;
-      let resolved = null;
-      try {
-        resolved = await resolveVoiceNotePath(audioUrlRaw);
-        if (!resolved.localPath) {
-          return fail('Could not download audio file', 400);
-        }
-        const prep = await prepareVoiceNoteUi(page, { logger });
-        if (!prep.ok) {
-          return fail(followUpReasonToError(prep.reason || 'voice_mic_not_found'), 400);
-        }
-        playback = startVoiceNotePlayback(resolved.localPath, VOICE_NOTE_SINK, logger);
-        const holdMs = Math.round(playback.durationSec * 1000 + 700);
-        const voiceResult = await sendVoiceNoteInThread(page, {
-          holdMs,
-          logger,
-          correlationId,
-        });
-        if (!voiceResult.ok) {
-          return fail(followUpReasonToError(voiceResult.reason || 'voice_note_failed'), 400);
-        }
-        logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}${cLog}`);
-        return { ok: true };
-      } catch (e) {
-        if (e.message === 'voice_note_download_failed') {
-          return fail('Could not download audio from audioUrl', 400);
-        }
-        throw e;
-      } finally {
-        if (playback) playback.stop();
-        if (resolved) await resolved.cleanup();
+    let resolved = null;
+    try {
+      resolved = await resolveVoiceNotePath(audioUrlRaw);
+      if (!resolved.localPath) {
+        return fail('Could not download audio file', 400);
       }
+      const prep = await prepareVoiceNoteUi(page, { logger });
+      if (!prep.ok) {
+        return fail(followUpReasonToError(prep.reason || 'voice_mic_not_found'), 400);
+      }
+      const voiceResult = await sendVoiceNoteInThread(page, {
+        logger,
+        correlationId,
+        voiceSource: { path: resolved.localPath, sink: VOICE_NOTE_SINK },
+      });
+      if (!voiceResult.ok) {
+        return fail(followUpReasonToError(voiceResult.reason || 'voice_note_failed'), 400);
+      }
+      logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}${cLog}`);
+      return { ok: true };
+    } catch (e) {
+      if (e.message === 'voice_note_download_failed') {
+        return fail('Could not download audio from audioUrl', 400);
+      }
+      throw e;
+    } finally {
+      if (resolved) await resolved.cleanup();
+    }
     }
 
     return fail('No delivery mode', 400);

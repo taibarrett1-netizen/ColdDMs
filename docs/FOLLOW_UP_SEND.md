@@ -2,6 +2,16 @@
 
 SkeduleMore **follow-ups** are triggered by the dashboard when a scheduled follow-up runs. The VPS only receives an HTTP request; it does **not** read follow-up configuration from `cold_dm_campaigns`, `cold_dm_message_group_messages`, or any follow-up-specific DB tables.
 
+## Production contract (VPS)
+
+- **Method / path:** `POST /api/follow-up/send` with `Content-Type: application/json` (and `Authorization: Bearer …` when `COLD_DM_API_KEY` is set).
+- **Required:** `clientId`, `instagramSessionId`, `recipientUsername` (no `@` required; a leading `@` is stripped).
+- **Voice follow-up:** `audioUrl` — **HTTPS** URL the worker **GET**s and saves to a temp file before the voice UI pipeline.
+- **Optional with `audioUrl`:** `caption` — one text DM in the same thread **before** the voice note (`bot.js` → `sendPlainTextInThread` then voice).
+- **Correlation (optional):** header **`X-Correlation-ID`** or **`X-Request-ID`**, or JSON **`correlationId`** / **`requestId`**. Logged on `[API] follow-up/send` and `[follow-up] …` lines.
+
+**Strict modes:** exactly one of `text`, non-empty `messages[]`, or `audioUrl` (see table below). Implemented in `server.js` (`/api/follow-up/send`) and `sendFollowUp` in `bot.js`.
+
 ## Voice notes (follow-ups) — intended behaviour
 
 Instagram **Web** does not expose a reliable “upload this `.wav` as a voice note” API for automation. The worker therefore uses this **single pipeline**:
@@ -32,8 +42,11 @@ Exactly **one** of:
 ## Debug screenshots (optional)
 
 1. Set **`FOLLOW_UP_DEBUG_SCREENSHOTS=true`** in `.env` on the VPS and restart PM2.
-2. For **voice** follow-ups, **one** PNG is saved **right after the mic is clicked** (recording UI should appear):  
-   `follow-up-screenshots/*_voice-after-mic-click.png` (includes `correlationId` in the filename when sent).
+2. For **voice** follow-ups, when debug screenshots are on you may get:
+   - **`*_voice-mic-click-target.png`** — **before** the mic click, with a **red crosshair** at the exact viewport coordinates used (so you can see if we’re hitting the wrong icon).
+   - **`*_voice-recording-ui-missed.png`** — if recording UI never appears after the click, same crosshair on the current page (usually wrong target or blocked mic).
+   - **`*_voice-after-mic-click.png`** — after recording UI is confirmed and a short delay (recording strip should be visible).
+   Filenames include `correlationId` when sent in the request.
 3. **Download via HTTP** (Bearer `COLD_DM_API_KEY` when set): `GET /api/debug/follow-up-screenshots` and `GET /api/debug/follow-up-screenshots/file?name=...`
 
 Optional: **`FOLLOW_UP_SCREENSHOTS_FULL_PAGE=true`** for full-page PNGs.
@@ -41,6 +54,12 @@ Optional: **`FOLLOW_UP_SCREENSHOTS_FULL_PAGE=true`** for full-page PNGs.
 ### Watch the browser on the VPS (VNC + Xvfb)
 
 See **`DEPLOYMENT.md`** → *Watching the browser on a VPS*. Set `HEADLESS_MODE=false`, `DISPLAY=:99` (or your Xvfb display), run `x11vnc`, tunnel with SSH, connect VNC to `localhost:5900`. Use **`PUPPETEER_SLOW_MO_MS=80`** so actions are easier to follow.
+
+### Recording UI gate (desktop)
+
+After clicking the mic, the worker **waits** for Instagram’s recording UI (blue strip, **`0:00`–`0:59`**-style timer in the composer band, or pause/delete recording controls). It **does not** start feeding audio into Pulse/ffmpeg until that passes (so you don’t burn the file while the composer still shows “Message…”). If the UI never appears, you get **`voice_recording_ui_not_detected`** and the debug PNG (if enabled) should still show the idle composer.
+
+Optional env: **`VOICE_RECORDING_UI_TIMEOUT_MS`** (default **12000**) — max wait for that UI after the mic click.
 
 ### Stricter success criteria
 

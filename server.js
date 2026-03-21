@@ -284,7 +284,7 @@ app.post('/api/leads/upload', upload.single('file'), (req, res) => {
 /**
  * SkeduleMore follow-up send (browser session). Auth: Bearer COLD_DM_API_KEY (same as other /api routes when set).
  * Body: { clientId, instagramSessionId, recipientUsername, text? | messages? | audioUrl?, caption? }
- * Follow-up voice: `audioUrl` = signed HTTPS URL (e.g. Storage voice-notes); no cold_dm_campaigns / message_group columns.
+ * Voice: `audioUrl` = HTTPS URL the worker GETs; optional `caption` = text in-thread before voice. Correlation: X-Correlation-ID / X-Request-ID / body correlationId | requestId.
  */
 app.post('/api/follow-up/send', async (req, res) => {
   if (!isSupabaseConfigured()) {

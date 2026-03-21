@@ -8,10 +8,21 @@
  */
 
 const { closeDmComposerOverlays } = require('./instagram-modals');
-const { captureFollowUpScreenshot, isFollowUpScreenshotsEnabled } = require('./follow-up-screenshots');
+const {
+  captureFollowUpScreenshot,
+  isFollowUpScreenshotsEnabled,
+  captureFollowUpScreenshotWithMarkers,
+} = require('./follow-up-screenshots');
+const { startVoiceNotePlayback } = require('./voice-note-audio');
 
 /** When not `false`, wait for thread DOM to change after Send (audio/list rows). Reduces false "sent ok". */
 const VOICE_NOTE_STRICT_VERIFY = process.env.VOICE_NOTE_STRICT_VERIFY !== 'false';
+
+/** Max wait after mic click for Instagram recording strip (blue bar / 0:xx timer). */
+const VOICE_RECORDING_UI_TIMEOUT_MS = Math.min(
+  Math.max(parseInt(process.env.VOICE_RECORDING_UI_TIMEOUT_MS, 10) || 12000, 3000),
+  45000
+);
 
 /** Puppeteer removed `page.waitForTimeout`; use this instead. */
 function delay(ms) {
@@ -19,8 +30,8 @@ function delay(ms) {
 }
 
 /**
- * Rough metrics inside the main thread area (before/after voice send).
- * Instagram DOM changes often; we look for list growth or new <audio>.
+ * Rough metrics before/after voice send. Instagram DM often does NOT use role=listitem/row or <audio>
+ * until play, so we also use the scrollable message column above the composer (scrollHeight, children, text).
  */
 function threadDomMetricsScript() {
   return function collectThreadDomMetrics() {
@@ -29,60 +40,200 @@ function threadDomMetricsScript() {
       document.querySelector('[role="main"]') ||
       document.querySelector('main') ||
       document.body;
-    const audios = root.querySelectorAll('audio');
+
+    const lower = (s) => (s || '').toLowerCase();
+    const findMessageScroller = () => {
+      const inputs = document.querySelectorAll(
+        'textarea[placeholder], textarea, [contenteditable="true"], [role="textbox"], div[contenteditable="true"]'
+      );
+      for (const ta of inputs) {
+        const ph = lower(ta.getAttribute('placeholder') || ta.getAttribute('aria-label') || '');
+        if (!ph.includes('message') && !ph.includes('messenger')) {
+          try {
+            const r = ta.getBoundingClientRect();
+            if (r.bottom < window.innerHeight * 0.25) continue;
+          } catch {
+            continue;
+          }
+        }
+        let el = ta;
+        for (let i = 0; i < 18 && el; i++) {
+          el = el.parentElement;
+          if (!el) break;
+          try {
+            const sh = el.scrollHeight;
+            const ch = el.clientHeight || 0;
+            if (sh > ch + 60 && sh > 120) return el;
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      return null;
+    };
+
+    const scroller = findMessageScroller();
+    let scrollerScrollHeight = 0;
+    let scrollerChildCount = 0;
+    let scrollerTextLen = 0;
+    if (scroller) {
+      try {
+        scrollerScrollHeight = Math.round(scroller.scrollHeight);
+        scrollerChildCount = scroller.children.length;
+        scrollerTextLen = (scroller.innerText || '').length;
+      } catch {
+        /* ignore */
+      }
+    }
+
+    const mainEl = document.querySelector('main') || root;
+    let mainTextLen = 0;
+    try {
+      mainTextLen = (mainEl.innerText || '').length;
+    } catch {
+      /* ignore */
+    }
+
+    const audios = document.querySelectorAll('audio');
     const listItems = root.querySelectorAll('[role="listitem"]');
     const rows = root.querySelectorAll('[role="row"]');
+
     return {
       audio: audios.length,
       listItems: listItems.length,
       rows: rows.length,
+      scrollerScrollHeight,
+      scrollerChildCount,
+      scrollerTextLen,
+      mainTextLen,
     };
   };
 }
 
+function voiceThreadLooksDelivered(before, after) {
+  const scrollDelta = after.scrollerScrollHeight - before.scrollerScrollHeight;
+  const childDelta = after.scrollerChildCount - before.scrollerChildCount;
+  const scrollerTextDelta = after.scrollerTextLen - before.scrollerTextLen;
+  const mainTextDelta = after.mainTextLen - before.mainTextLen;
+
+  if (after.audio > before.audio) return true;
+  if (after.listItems > before.listItems) return true;
+  if (after.rows > before.rows) return true;
+  /** New bubble often grows scroll area or adds a child row. */
+  if (scrollDelta >= 25) return true;
+  if (childDelta >= 1) return true;
+  /** New message text (e.g. duration label) inside the thread scroller. */
+  if (before.scrollerTextLen > 0 && scrollerTextDelta >= 8) return true;
+  if (before.scrollerScrollHeight > 0 && scrollerTextDelta >= 8) return true;
+  /** Fallback: main pane text grew (noisier; ignore tiny deltas). */
+  if (mainTextDelta >= 12) return true;
+  return false;
+}
+
 /**
- * After clicking Send, poll until we see a new message row / list item / audio vs snapshot.
+ * After clicking Send, poll until thread metrics suggest a new message vs snapshot.
  */
 async function waitForVoiceDeliveredInThread(page, before, opts = {}) {
-  const { timeoutMs = 18000, pollMs = 450, logger = null } = opts;
+  const { timeoutMs = 22000, pollMs = 450, logger = null } = opts;
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     const after = await page.evaluate(threadDomMetricsScript()).catch(() => null);
-    if (after) {
-      const gained =
-        after.audio > before.audio ||
-        after.listItems > before.listItems ||
-        after.rows > before.rows;
-      if (gained) {
-        if (logger) {
-          logger.log(
-            `Voice verify: thread DOM changed (audio ${before.audio}→${after.audio}, listItems ${before.listItems}→${after.listItems}, rows ${before.rows}→${after.rows})`
-          );
-        }
-        return true;
+    if (after && voiceThreadLooksDelivered(before, after)) {
+      if (logger) {
+        logger.log(
+          `Voice verify: thread changed (audio ${before.audio}→${after.audio}, list ${before.listItems}→${after.listItems}, rows ${before.rows}→${after.rows}, scroll ${before.scrollerScrollHeight}→${after.scrollerScrollHeight}, scrollerKids ${before.scrollerChildCount}→${after.scrollerChildCount}, scrollerText ${before.scrollerTextLen}→${after.scrollerTextLen}, mainText ${before.mainTextLen}→${after.mainTextLen})`
+        );
       }
+      return true;
     }
     await delay(pollMs);
   }
   if (logger) {
+    const snap = await page.evaluate(threadDomMetricsScript()).catch(() => before);
     logger.warn(
-      `Voice verify: no thread change within ${timeoutMs}ms (audio ${before.audio}, listItems ${before.listItems}, rows ${before.rows})`
+      `Voice verify: no thread change within ${timeoutMs}ms (final: audio=${snap.audio} listItems=${snap.listItems} rows=${snap.rows} scroll=${snap.scrollerScrollHeight} kids=${snap.scrollerChildCount} scrollerText=${snap.scrollerTextLen} mainText=${snap.mainTextLen}; before scroll=${before.scrollerScrollHeight})`
     );
   }
   return false;
 }
 
-/** Best-effort: recording UI often shows a mm:ss timer. */
-function recordingUiHintScript() {
-  return function recordingUiHint() {
-    const t = document.body.innerText || '';
-    const m = t.match(/\b(\d{1,2}:\d{2})\b/);
-    return {
-      hasTimerLike: !!m,
-      timerSample: m ? m[1] : '',
-      composerLower: (t || '').toLowerCase().includes('message'),
-    };
+/**
+ * True when desktop voice recording UI is likely active (blue strip, 0:xx timer in composer band, pause/delete).
+ * Avoids false positives from header clock (e.g. 11:07) by scoping to lower viewport and 0:xx pattern.
+ */
+function detectInstagramVoiceRecordingUiScript() {
+  return function detectInstagramVoiceRecordingUi() {
+    const lower = (s) => (s || '').toLowerCase();
+    const bottomStart = window.innerHeight * 0.48;
+
+    for (const el of document.querySelectorAll('div, span, section')) {
+      let r;
+      try {
+        r = el.getBoundingClientRect();
+      } catch {
+        continue;
+      }
+      if (r.top < bottomStart || r.width < 100) continue;
+      const bg = window.getComputedStyle(el).backgroundColor;
+      const mm = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+      if (mm) {
+        const R = +mm[1];
+        const G = +mm[2];
+        const B = +mm[3];
+        if (B > 200 && R < 100 && G > 90 && r.height >= 16 && r.height <= 220) {
+          return { ok: true, why: 'blue_strip' };
+        }
+      }
+    }
+
+    for (const el of document.querySelectorAll('div, span, p')) {
+      let r;
+      try {
+        r = el.getBoundingClientRect();
+      } catch {
+        continue;
+      }
+      if (r.top < bottomStart || r.height <= 0 || r.height > 72) continue;
+      const text = (el.textContent || '').trim();
+      if (/^0:[0-5]\d$/.test(text)) return { ok: true, why: 'timer_0mm' };
+      if (/^1:[0-5]\d$/.test(text)) return { ok: true, why: 'timer_1mm' };
+    }
+
+    for (const el of document.querySelectorAll('[aria-label], [title], button, [role="button"]')) {
+      let r;
+      try {
+        r = el.getBoundingClientRect();
+      } catch {
+        continue;
+      }
+      if (r.top < bottomStart) continue;
+      const al = lower(el.getAttribute('aria-label') || '');
+      const ti = lower(el.getAttribute('title') || '');
+      const t = `${al} ${ti}`;
+      if (t.includes('pause') && (t.includes('record') || t.includes('recording'))) return { ok: true, why: 'aria_pause' };
+      if (t.includes('delete') && (t.includes('clip') || t.includes('record'))) return { ok: true, why: 'aria_delete' };
+    }
+
+    return { ok: false, why: 'none' };
   };
+}
+
+async function waitForVoiceRecordingUi(page, opts = {}) {
+  const { timeoutMs = VOICE_RECORDING_UI_TIMEOUT_MS, pollMs = 350, logger = null } = opts;
+  const script = detectInstagramVoiceRecordingUiScript();
+  const start = Date.now();
+  let lastWhy = 'none';
+  while (Date.now() - start < timeoutMs) {
+    const res = await page.evaluate(script).catch(() => ({ ok: false, why: 'eval_error' }));
+    if (res && res.ok) {
+      if (logger) logger.log(`Voice: recording UI detected (${res.why || 'ok'})`);
+      return true;
+    }
+    lastWhy = (res && res.why) || 'none';
+    await delay(pollMs);
+  }
+  if (logger) logger.warn(`Voice: recording UI not detected within ${timeoutMs}ms (last=${lastWhy})`);
+  return false;
 }
 
 /**
@@ -406,104 +557,164 @@ function clickSendAfterRecordingScript() {
  */
 async function sendVoiceNoteInThread(page, opts = {}) {
   const {
-    holdMs = 7000,
+    holdMs: holdMsOpt = null,
     logger = null,
     correlationId = '',
     strictVerify = VOICE_NOTE_STRICT_VERIFY,
+    /** When set, ffmpeg → Pulse starts only after recording UI is confirmed (desktop) or at press-start (mobile). */
+    voiceSource = null,
   } = opts;
   const shotMeta = { correlationId, logger };
 
-  await closeDmComposerOverlays(page);
-
-  const metricsBefore = await page.evaluate(threadDomMetricsScript()).catch(() => ({
-    audio: 0,
-    listItems: 0,
-    rows: 0,
-  }));
-  if (logger) {
-    logger.log(
-      `Voice: thread snapshot before mic (audio=${metricsBefore.audio}, listItems=${metricsBefore.listItems}, rows=${metricsBefore.rows})`
-    );
+  if (!voiceSource && (holdMsOpt == null || holdMsOpt < 400)) {
+    return { ok: false, reason: 'voice_note_failed' };
   }
 
-  const finder = buildMicFinderScript();
-  const viewport = page.viewport();
-  const desktopFlow = !!(viewport && viewport.isMobile === false);
+  let internalPlayback = null;
+  try {
+    await closeDmComposerOverlays(page);
 
-  const micHandle = await page.evaluateHandle(finder);
-  const micEl = micHandle.asElement();
-  if (!micEl) {
-    await micHandle.dispose().catch(() => {});
-    return { ok: false, reason: 'voice_mic_not_found' };
-  }
-
-  await micEl.scrollIntoViewIfNeeded().catch(() => {});
-  const box = await micEl.boundingBox();
-  if (!box) {
-    await micEl.dispose().catch(() => {});
-    await micHandle.dispose().catch(() => {});
-    return { ok: false, reason: 'voice_mic_not_found' };
-  }
-
-  const cx = box.x + box.width / 2;
-  const cy = box.y + box.height / 2;
-
-  const afterShotMs = 600;
-  if (desktopFlow) {
-    if (logger) logger.log(`Voice (desktop): click mic, wait ${Math.round(holdMs)} ms, then send`);
-    /** Native DOM click on the resolved mic node (often more reliable than synthetic coords for React). */
-    try {
-      await micEl.click({ delay: 50 });
-    } catch {
-      await page.mouse.click(cx, cy, { delay: 40 });
-    }
-    await delay(afterShotMs);
-    if (isFollowUpScreenshotsEnabled()) {
-      await captureFollowUpScreenshot(page, 'voice-after-mic-click', shotMeta);
-    }
-    const recHint = await page.evaluate(recordingUiHintScript()).catch(() => ({}));
+    const metricsBefore = await page.evaluate(threadDomMetricsScript()).catch(() => ({
+      audio: 0,
+      listItems: 0,
+      rows: 0,
+      scrollerScrollHeight: 0,
+      scrollerChildCount: 0,
+      scrollerTextLen: 0,
+      mainTextLen: 0,
+    }));
     if (logger) {
       logger.log(
-        `Voice: after mic click hint timerLike=${recHint.hasTimerLike || false} sample=${recHint.timerSample || '-'}`
+        `Voice: thread snapshot before mic (audio=${metricsBefore.audio}, listItems=${metricsBefore.listItems}, rows=${metricsBefore.rows}, scroll=${metricsBefore.scrollerScrollHeight || 0})`
       );
     }
-    await delay(Math.max(0, holdMs - afterShotMs));
-  } else {
-    if (logger) logger.log(`Voice (mobile web): press-and-hold ${Math.round(holdMs)} ms`);
-    await page.mouse.move(cx, cy);
-    await page.mouse.down();
-    await delay(holdMs);
-    await page.mouse.up();
-  }
 
-  await micEl.dispose().catch(() => {});
-  await micHandle.dispose().catch(() => {});
+    const finder = buildMicFinderScript();
+    const viewport = page.viewport();
+    const desktopFlow = !!(viewport && viewport.isMobile === false);
 
-  /** Do NOT send Escape here — it dismisses Instagram's voice recording UI before Send. */
-  await delay(1200);
-  const clickSend = clickSendAfterRecordingScript();
-  let sent = false;
-  for (let attempt = 0; attempt < 15; attempt++) {
-    sent = await page.evaluate(clickSend).catch(() => false);
-    if (sent) break;
-    await delay(450);
-  }
-  if (!sent) return { ok: false, reason: 'voice_send_button_not_found' };
-
-  if (logger) logger.log('Voice: send control clicked; waiting for thread to update…');
-  await delay(800);
-
-  if (strictVerify) {
-    const verified = await waitForVoiceDeliveredInThread(page, metricsBefore, { logger });
-    if (!verified) {
-      return { ok: false, reason: 'voice_not_confirmed_in_thread' };
+    const micHandle = await page.evaluateHandle(finder);
+    const micEl = micHandle.asElement();
+    if (!micEl) {
+      await micHandle.dispose().catch(() => {});
+      return { ok: false, reason: 'voice_mic_not_found' };
     }
-  } else if (logger) {
-    logger.log('Voice: VOICE_NOTE_STRICT_VERIFY=false — skipping post-send DOM check');
-  }
 
-  await delay(400);
-  return { ok: true };
+    await micEl.scrollIntoViewIfNeeded().catch(() => {});
+    const box = await micEl.boundingBox();
+    if (!box) {
+      await micEl.dispose().catch(() => {});
+      await micHandle.dispose().catch(() => {});
+      return { ok: false, reason: 'voice_mic_not_found' };
+    }
+
+    const cx = box.x + box.width / 2;
+    const cy = box.y + box.height / 2;
+
+    const afterShotMs = 600;
+    let effectiveHoldMs = holdMsOpt || 7000;
+
+    if (desktopFlow) {
+      if (logger) logger.log('Voice (desktop): click mic, then wait for recording UI before audio + hold');
+      if (isFollowUpScreenshotsEnabled()) {
+        await captureFollowUpScreenshotWithMarkers(
+          page,
+          [{ x: cx, y: cy, label: 'mic click target (red crosshair)' }],
+          'voice-mic-click-target',
+          shotMeta
+        );
+      }
+      try {
+        await micEl.click({ delay: 50 });
+      } catch {
+        await page.mouse.click(cx, cy, { delay: 40 });
+      }
+
+      const uiOk = await waitForVoiceRecordingUi(page, { logger });
+      if (!uiOk) {
+        if (isFollowUpScreenshotsEnabled()) {
+          await captureFollowUpScreenshotWithMarkers(
+            page,
+            [{ x: cx, y: cy, label: 'clicked here — recording UI never appeared' }],
+            'voice-recording-ui-missed',
+            shotMeta
+          );
+        }
+        await micEl.dispose().catch(() => {});
+        await micHandle.dispose().catch(() => {});
+        return { ok: false, reason: 'voice_recording_ui_not_detected' };
+      }
+
+      if (voiceSource) {
+        internalPlayback = startVoiceNotePlayback(
+          voiceSource.path,
+          voiceSource.sink || 'ColdDMsVoice',
+          logger
+        );
+        effectiveHoldMs = Math.round(internalPlayback.durationSec * 1000 + 700);
+      }
+
+      if (logger) logger.log(`Voice (desktop): hold recording ~${Math.round(effectiveHoldMs)} ms, then send`);
+      await delay(afterShotMs);
+      if (isFollowUpScreenshotsEnabled()) {
+        await captureFollowUpScreenshot(page, 'voice-after-mic-click', shotMeta);
+      }
+      await delay(Math.max(0, effectiveHoldMs - afterShotMs));
+    } else {
+      if (voiceSource) {
+        internalPlayback = startVoiceNotePlayback(
+          voiceSource.path,
+          voiceSource.sink || 'ColdDMsVoice',
+          logger
+        );
+        effectiveHoldMs = Math.round(internalPlayback.durationSec * 1000 + 700);
+      }
+      if (logger) logger.log(`Voice (mobile web): press-and-hold ${Math.round(effectiveHoldMs)} ms`);
+      if (isFollowUpScreenshotsEnabled()) {
+        await captureFollowUpScreenshotWithMarkers(
+          page,
+          [{ x: cx, y: cy, label: 'mic press-and-hold target' }],
+          'voice-mic-click-target',
+          shotMeta
+        );
+      }
+      await page.mouse.move(cx, cy);
+      await page.mouse.down();
+      await delay(effectiveHoldMs);
+      await page.mouse.up();
+    }
+
+    await micEl.dispose().catch(() => {});
+    await micHandle.dispose().catch(() => {});
+
+    /** Do NOT send Escape here — it dismisses Instagram's voice recording UI before Send. */
+    await delay(1200);
+    const clickSend = clickSendAfterRecordingScript();
+    let sent = false;
+    for (let attempt = 0; attempt < 15; attempt++) {
+      sent = await page.evaluate(clickSend).catch(() => false);
+      if (sent) break;
+      await delay(450);
+    }
+    if (!sent) return { ok: false, reason: 'voice_send_button_not_found' };
+
+    if (logger) logger.log('Voice: send control clicked; waiting for thread to update…');
+    await delay(800);
+
+    if (strictVerify) {
+      const verified = await waitForVoiceDeliveredInThread(page, metricsBefore, { logger });
+      if (!verified) {
+        return { ok: false, reason: 'voice_not_confirmed_in_thread' };
+      }
+    } else if (logger) {
+      logger.log('Voice: VOICE_NOTE_STRICT_VERIFY=false — skipping post-send DOM check');
+    }
+
+    await delay(400);
+    return { ok: true };
+  } finally {
+    if (internalPlayback) internalPlayback.stop();
+  }
 }
 
 module.exports = {
