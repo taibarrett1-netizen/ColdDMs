@@ -43,7 +43,7 @@ function fetchBuffer(url, headers = {}) {
 async function main() {
   if (!KEY) {
     console.error('Missing KEY.\n');
-    console.error('  BASE=http://IP:3000 KEY=your_secret node scripts/download-follow-up-screenshots.js');
+    console.error('  BASE=http://IP:3000 KEY=b12c9af6cda400a483c7d03a99e9f771c4eed254501ceb202bd65b8589f43354 scripts/download-follow-up-screenshots.js');
     console.error('  node scripts/download-follow-up-screenshots.js http://IP:3000 your_secret\n');
     process.exit(1);
   }

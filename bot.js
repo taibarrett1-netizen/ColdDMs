@@ -16,8 +16,8 @@ const {
   getDesktopWindowPadding,
 } = require('./utils/mobile-viewport');
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
-const { isFfmpegAvailable } = require('./utils/voice-note-audio');
-const { ensureVoicePipeSource, getPulseClientEnv } = require('./utils/pulse-pipe-source');
+const { isFfmpegAvailable, convertToChromeFakeMicWav, ensureChromeFakeMicPlaceholder } = require('./utils/voice-note-audio');
+const { appendChromeFakeMicArgs, CHROME_FAKE_MIC_WAV } = require('./utils/chrome-fake-mic');
 const {
   sendVoiceNoteInThread,
   prepareVoiceNoteUi,
@@ -78,23 +78,7 @@ function applyPuppeteerSlowMo(launchOpts) {
   return launchOpts;
 }
 
-/**
- * Voice notes: we use PulseAudio module-pipe-source (see utils/pulse-pipe-source.js).
- * The pipe-source is a virtual mic that exists from startup; getUserMedia sees it immediately.
- * No PULSE_SOURCE needed — we set it as default source. Do NOT add --use-fake-device-for-media-stream.
- */
 const VOICE_NOTE_SOURCE_NAME = (process.env.VOICE_NOTE_SOURCE_NAME || 'ColdDMsVoice').trim();
-
-function appendOptionalFakeMediaDeviceArg(args) {
-  if (!Array.isArray(args)) return;
-  if (args.some((a) => a === '--use-fake-device-for-media-stream')) return;
-  // Pipe-source provides a real virtual mic; never add fake device (per requirements).
-  // Explicit override only if user really needs it (e.g. local dev without Pulse).
-  const explicitTrue =
-    process.env.CHROMIUM_USE_FAKE_MEDIA_DEVICE === '1' ||
-    process.env.CHROMIUM_USE_FAKE_MEDIA_DEVICE === 'true';
-  if (explicitTrue) args.push('--use-fake-device-for-media-stream');
-}
 const BROWSER_PROFILE_DIR = path.join(process.cwd(), '.browser-profile');
 const VOICE_NOTE_FILE = (process.env.VOICE_NOTE_FILE || '').trim();
 const VOICE_NOTE_MODE = (process.env.VOICE_NOTE_MODE || 'after_text').trim().toLowerCase();
@@ -784,9 +768,14 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 
   const attemptVoiceSend = async () => {
     if (!shouldSendVoice) return;
-    let resolved = null;
+    // NEW: Chrome fake mic — durationSec from browser restart (must be set by caller).
+    const durationSec = sendOpts.voiceDurationSec;
+    if (durationSec == null) {
+      voiceFailure = 'voice_duration_missing';
+      logger.warn(`Voice note: durationSec not set — browser restart with convert required before sendDM.`);
+      return;
+    }
     try {
-      resolved = await resolveVoiceNotePath(voiceCfg.voiceNotePath);
       const prep = await prepareVoiceNoteUi(page, { logger });
       if (!prep.ok) {
         voiceFailure = prep.reason || 'voice_mic_not_found';
@@ -795,7 +784,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       }
       const voiceResult = await sendVoiceNoteInThread(page, {
         logger,
-        voiceSource: { path: resolved.localPath, sink: VOICE_NOTE_SOURCE_NAME },
+        voiceSource: { durationSec },
       });
       if (!voiceResult.ok) {
         voiceFailure = voiceResult.reason || 'voice_note_failed';
@@ -807,8 +796,6 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     } catch (e) {
       voiceFailure = e.message || 'voice_note_failed';
       logger.warn(`Voice note send error for @${u}: ${voiceFailure}`);
-    } finally {
-      if (resolved) await resolved.cleanup();
     }
   };
 
@@ -904,20 +891,18 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 }
 
 function buildFollowUpLaunchOptions() {
-  // Ensure pipe-source is ready before any browser launch (once per process).
-  ensureVoicePipeSource(logger);
+  // NEW: Chrome fake mic with file injection (no PulseAudio needed).
+  ensureChromeFakeMicPlaceholder(logger);
   const opts = {
     headless: HEADLESS,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--use-fake-ui-for-media-stream',
       '--autoplay-policy=no-user-gesture-required',
     ],
-    env: getPulseClientEnv(),
   };
-  appendOptionalFakeMediaDeviceArg(opts.args);
+  appendChromeFakeMicArgs(opts.args);
   applyPuppeteerSlowMo(opts);
   applyHeadedChromeWindowToLaunchOpts(opts);
   return opts;
@@ -1139,6 +1124,24 @@ async function sendFollowUp(body) {
     );
   }
 
+  // NEW: For voice, download + convert to Chrome fake mic format BEFORE launch.
+  // We restart browser so the new audio file is loaded via --use-file-for-fake-audio-capture.
+  let voiceDurationSec = null;
+  if (hasAudio) {
+    const resolved = await resolveVoiceNotePath(audioUrlRaw);
+    if (!resolved.localPath) {
+      return fail('Could not download audio file', 400);
+    }
+    try {
+      const conv = convertToChromeFakeMicWav(resolved.localPath, logger);
+      voiceDurationSec = conv.durationSec;
+    } catch (e) {
+      await resolved.cleanup().catch(() => {});
+      return fail(e.message && e.message.includes('convert') ? 'Could not convert audio' : (e.message || 'Audio conversion failed'), 400);
+    }
+    await resolved.cleanup();
+  }
+
   const launchOpts = buildFollowUpLaunchOptions();
   let browser;
   try {
@@ -1195,12 +1198,6 @@ async function sendFollowUp(body) {
         }
         await delay(1200);
       }
-    let resolved = null;
-    try {
-      resolved = await resolveVoiceNotePath(audioUrlRaw);
-      if (!resolved.localPath) {
-        return fail('Could not download audio file', 400);
-      }
       const prep = await prepareVoiceNoteUi(page, { logger });
       if (!prep.ok) {
         return fail(followUpReasonToError(prep.reason || 'voice_mic_not_found'), 400);
@@ -1208,21 +1205,14 @@ async function sendFollowUp(body) {
       const voiceResult = await sendVoiceNoteInThread(page, {
         logger,
         correlationId,
-        voiceSource: { path: resolved.localPath, sink: VOICE_NOTE_SOURCE_NAME },
+        voiceSource: { durationSec: voiceDurationSec },
       });
       if (!voiceResult.ok) {
         return fail(followUpReasonToError(voiceResult.reason || 'voice_note_failed'), 400);
       }
       logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}${cLog}`);
+      fs.unlink(CHROME_FAKE_MIC_WAV, () => {});
       return { ok: true };
-    } catch (e) {
-      if (e.message === 'voice_note_download_failed') {
-        return fail('Could not download audio from audioUrl', 400);
-      }
-      throw e;
-    } finally {
-      if (resolved) await resolved.cleanup();
-    }
     }
 
     return fail('No delivery mode', 400);
@@ -1281,6 +1271,7 @@ async function sendDM(page, username, adapter, options = {}) {
         firstNameBlocklist,
         voiceNotePath: resolvedVoicePath,
         voiceNoteMode: resolvedVoiceMode,
+        voiceDurationSec: options.voiceDurationSec,
       });
       if (result.ok) {
         const finalMessage = result.finalMessage != null ? result.finalMessage : (resolvedVoiceMode === 'voice_only' ? '' : messageTemplate);
@@ -1382,19 +1373,18 @@ async function buildAdapterForClient(clientId) {
  */
 async function runBotMultiTenant() {
   logger.log('Starting multi-tenant sender loop (always-on).');
+  // NEW: Chrome fake mic with file injection (no PulseAudio needed).
+  ensureChromeFakeMicPlaceholder(logger);
   const launchOpts = {
     headless: HEADLESS,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--use-fake-ui-for-media-stream',
       '--autoplay-policy=no-user-gesture-required',
     ],
-    env: getPulseClientEnv(),
   };
-  appendOptionalFakeMediaDeviceArg(launchOpts.args);
-  ensureVoicePipeSource(logger);
+  appendChromeFakeMicArgs(launchOpts.args);
   applyPuppeteerSlowMo(launchOpts);
   applyHeadedChromeWindowToLaunchOpts(launchOpts);
   if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
@@ -1532,6 +1522,34 @@ async function runBotMultiTenant() {
       voice_note_mode: work.voiceNoteMode || VOICE_NOTE_MODE || 'after_text',
     };
     sb.setClientStatusMessage(clientId, 'Sending…').catch(() => {});
+
+    // NEW: For voice notes, close browser, convert audio, relaunch so Chrome loads the new file.
+    const needsVoice = (options.voice_note_path || '').trim() !== '';
+    if (needsVoice && browser) {
+      let resolved = null;
+      try {
+        resolved = await resolveVoiceNotePath(options.voice_note_path);
+        if (resolved.localPath) {
+          const conv = convertToChromeFakeMicWav(resolved.localPath, logger);
+          options.voiceDurationSec = conv.durationSec;
+          await browser.close().catch(() => {});
+          browser = await puppeteer.launch(launchOpts);
+          page = await browser.newPage();
+          await grantMicrophoneForInstagram(page, logger);
+          await applyDesktopEmulation(page);
+          currentSessionId = null;
+          const ok = await ensurePageSession(page, session);
+          if (!ok) {
+            logger.warn('Could not restore session after voice browser restart.');
+          }
+        }
+      } catch (e) {
+        logger.warn('Voice browser restart failed: ' + (e.message || e));
+      } finally {
+        if (resolved) await resolved.cleanup().catch(() => {});
+      }
+    }
+
     const sendResult = await sendDM(page, work.username, adapter, options);
 
     let delayMs;
@@ -1596,19 +1614,18 @@ async function runBot() {
 
   logger.log('Starting sender loop (legacy CSV mode).');
 
+  // NEW: Chrome fake mic with file injection (no PulseAudio needed).
+  ensureChromeFakeMicPlaceholder(logger);
   const launchOpts = {
     headless: HEADLESS,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--use-fake-ui-for-media-stream',
       '--autoplay-policy=no-user-gesture-required',
     ],
-    env: getPulseClientEnv(),
   };
-  appendOptionalFakeMediaDeviceArg(launchOpts.args);
-  ensureVoicePipeSource(logger);
+  appendChromeFakeMicArgs(launchOpts.args);
   applyPuppeteerSlowMo(launchOpts);
   applyHeadedChromeWindowToLaunchOpts(launchOpts);
   if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
@@ -1705,6 +1722,33 @@ async function runBot() {
       voice_note_mode: VOICE_NOTE_MODE || 'after_text',
     };
 
+    // NEW: For voice notes, close browser, convert audio, relaunch (userDataDir preserves session).
+    const needsVoice = (options.voice_note_path || '').trim() !== '';
+    if (needsVoice && browser) {
+      let resolved = null;
+      try {
+        resolved = await resolveVoiceNotePath(options.voice_note_path);
+        if (resolved.localPath) {
+          const conv = convertToChromeFakeMicWav(resolved.localPath, logger);
+          options.voiceDurationSec = conv.durationSec;
+          await browser.close().catch(() => {});
+          browser = await puppeteer.launch(launchOpts);
+          page = await browser.newPage();
+          await grantMicrophoneForInstagram(page, logger);
+          await applyDesktopEmulation(page);
+          await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+          await delay(2000);
+          if (page.url().includes('/accounts/login')) {
+            throw new Error('Instagram session expired after voice restart.');
+          }
+        }
+      } catch (e) {
+        logger.warn('Voice browser restart failed: ' + (e.message || e));
+      } finally {
+        if (resolved) await resolved.cleanup().catch(() => {});
+      }
+    }
+
     const result = await sendDM(page, work.username, adapter, options);
     if (result.ok) index += 1;
 
@@ -1736,19 +1780,18 @@ async function runBot() {
 async function connectInstagram(instagramUsername, instagramPassword, twoFactorCode = null) {
   const useMobile = process.env.DISABLE_MOBILE_LOGIN !== '1' && process.env.DISABLE_MOBILE_LOGIN !== 'true';
   if (!useMobile) logger.log('Using desktop view for login (DISABLE_MOBILE_LOGIN is set).');
+  // NEW: Chrome fake mic with file injection (no PulseAudio needed).
+  ensureChromeFakeMicPlaceholder(logger);
   const connectLaunch = {
     headless: true,
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
-      '--use-fake-ui-for-media-stream',
       '--autoplay-policy=no-user-gesture-required',
     ],
-    env: getPulseClientEnv(),
   };
-  ensureVoicePipeSource(logger);
-  appendOptionalFakeMediaDeviceArg(connectLaunch.args);
+  appendChromeFakeMicArgs(connectLaunch.args);
   applyPuppeteerSlowMo(connectLaunch);
   const browser = await puppeteer.launch(connectLaunch);
   let keepBrowserOpen = false;

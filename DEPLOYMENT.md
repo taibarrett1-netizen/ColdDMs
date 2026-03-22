@@ -33,7 +33,7 @@ sudo apt install -y libgbm1 libasound2 libnss3 libatk1.0-0 libatk-bridge2.0-0 li
 
 ### Voice notes (required for voice follow-ups and cold-DM voice)
 
-**`ffmpeg` and `ffprobe` must be installed** (voice pipeline runs `ffmpeg` to play audio into PulseAudio). If you see `spawn ffmpeg ENOENT` in logs, install:
+**`ffmpeg` and `ffprobe` must be installed** (used to convert audio to Chrome fake mic format). If you see `spawn ffmpeg ENOENT` in logs, install:
 
 ```bash
 sudo apt install -y ffmpeg
@@ -42,7 +42,7 @@ ffmpeg -version && ffprobe -version
 
 Optional: set `FFMPEG_PATH` / `FFPROBE_PATH` in `.env` if the binaries are not on `PATH`.
 
-Then configure PulseAudio virtual sink (for routing audio into the browser “mic”):
+**Chrome fake mic:** The worker uses Chrome's `--use-file-for-fake-audio-capture` flag. No PulseAudio needed (for routing audio into the browser “mic”):
 
 ```bash
 sudo apt install -y pulseaudio-utils pulseaudio
@@ -50,7 +50,7 @@ pactl load-module module-null-sink sink_name=ColdDMsVoice sink_properties=device
 pactl list short sources | rg "ColdDMsVoice.*monitor"
 ```
 
-Set these in `.env` (minimal):
+Set these in `.env` (optional):
 
 - `VOICE_NOTE_FILE=/absolute/path/to/voice.wav`
 - `VOICE_NOTE_MODE=after_text` or `voice_only`

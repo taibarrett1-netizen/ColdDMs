@@ -1,14 +1,10 @@
+/**
+ * Voice note audio helpers. Chrome fake mic: convert to WAV; no PulseAudio.
+ */
+
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
-const {
-  getVoiceNotePipePath,
-  getVoiceAudioMode,
-  getPulseClientEnv,
-  isPipeSourceReady,
-  pausePipeSilenceFiller,
-  resumePipeSilenceFiller,
-  VOICE_NOTE_SOURCE_NAME,
-} = require('./pulse-pipe-source');
+const { CHROME_FAKE_MIC_WAV } = require('./chrome-fake-mic');
 
 function ffmpegBin() {
   return process.env.FFMPEG_PATH || process.env.FFMPEG_BIN || 'ffmpeg';
@@ -18,7 +14,7 @@ function ffprobeBin() {
   return process.env.FFPROBE_PATH || process.env.FFPROBE_BIN || 'ffprobe';
 }
 
-/** True if ffmpeg + ffprobe are on PATH (or FFMPEG_PATH / FFPROBE_PATH). Required for voice-note pipe feeding. */
+/** True if ffmpeg + ffprobe are on PATH. Required for voice-note conversion. */
 function isFfmpegAvailable() {
   try {
     const a = spawnSync(ffmpegBin(), ['-hide_banner', '-version'], { encoding: 'utf8' });
@@ -51,88 +47,71 @@ function getAudioDurationSec(audioPath) {
 }
 
 /**
- * Start ffmpeg feeding the voice-note audio. Uses pipe-source (raw PCM → fifo) or
- * null-sink (ffmpeg -f pulse → sink) depending on getVoiceAudioMode().
+ * Convert audio to Chrome fake mic format and write to /tmp/current-voice-note.wav.
+ * Chrome expects: 48kHz, stereo, s16.
+ * @returns {{ durationSec: number }}
  */
-function startVoiceNotePlayback(audioPath, _pipePathOrSink, logger, timeoutMs = 90000) {
-  if (!audioPath) throw new Error('voice_note_path_missing');
-  if (!fs.existsSync(audioPath)) throw new Error('voice_note_file_not_found');
-  if (!isPipeSourceReady()) {
-    throw new Error(
-      'voice_pipe_source_not_ready: PulseAudio setup failed. Voice notes require a VPS with PulseAudio. Install: sudo apt install pulseaudio.'
-    );
+function convertToChromeFakeMicWav(inputPath, logger = null) {
+  if (!inputPath || !fs.existsSync(inputPath)) {
+    throw new Error('voice_note_file_not_found');
   }
-  const durationSec = getAudioDurationSec(audioPath);
-  const mode = getVoiceAudioMode();
-  const sinkName = _pipePathOrSink?.sink || VOICE_NOTE_SOURCE_NAME;
-
+  const durationSec = getAudioDurationSec(inputPath);
   const bin = ffmpegBin();
-  let child;
-
-  if (mode === 'nullsink') {
-    // ffmpeg writes directly to Pulse sink; Chromium captures from sink.monitor
-    const args = [
-      '-re', '-stream_loop', '0', '-i', audioPath,
-      '-vn', '-ac', '1', '-ar', '48000',
-      '-f', 'pulse', sinkName,
-    ];
-    child = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], env: getPulseClientEnv() });
-  } else {
-    // pipe-source: ffmpeg → raw PCM → fifo
-    pausePipeSilenceFiller();
-    spawnSync('sleep', ['0.05'], { encoding: 'utf8' });
-    const resumeIfNeeded = () => resumePipeSilenceFiller(logger);
-    const pipePath = getVoiceNotePipePath();
-
-    let pipeFd;
-    try {
-      pipeFd = fs.openSync(pipePath, 'w');
-    } catch (e) {
-      resumeIfNeeded();
-      throw new Error(`voice_note_pipe_open_failed: ${pipePath}`);
-    }
-
-    const args = [
-      '-re', '-stream_loop', '0', '-i', audioPath,
-      '-vn', '-ac', '2', '-ar', '48000', '-f', 's16le', '-',
-    ];
-    child = spawn(bin, args, { stdio: ['ignore', pipeFd, 'pipe'] });
-
-    child.on('exit', () => {
-      try { fs.closeSync(pipeFd); } catch { /* ignore */ }
-      resumeIfNeeded();
-    });
-    child.on('error', () => { if (!child.killed) resumeIfNeeded(); });
+  const result = spawnSync(
+    bin,
+    [
+      '-y',
+      '-i', inputPath,
+      '-ar', '48000',
+      '-ac', '2',
+      '-sample_fmt', 's16',
+      '-f', 'wav',
+      CHROME_FAKE_MIC_WAV,
+    ],
+    { encoding: 'utf8', timeout: 30000 }
+  );
+  if (result.status !== 0) {
+    const err = (result.stderr || result.error || '').slice(-500);
+    throw new Error(`voice_note_convert_failed: ${err}`);
   }
-
-  let stderrBuf = '';
-  if (child.stderr) {
-    child.stderr.on('data', (d) => {
-      if (stderrBuf.length < 2000) stderrBuf += d.toString();
-    });
+  if (logger && typeof logger.log === 'function') {
+    logger.log(`[voice] Converted to Chrome fake mic format: ${inputPath} → ${CHROME_FAKE_MIC_WAV} (${durationSec.toFixed(1)}s)`);
   }
-  const timeout = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
-  let exited = false;
-  child.on('exit', () => {
-    exited = true;
-    clearTimeout(timeout);
-  });
-  child.on('error', (err) => {
-    if (err && err.code === 'ENOENT' && logger) {
-      logger.warn(`ffmpeg not found (${bin}). Install: sudo apt install ffmpeg.`);
-    } else if (logger) {
-      logger.warn('ffmpeg spawn error: ' + (err && err.message ? err.message : String(err)));
-    }
-  });
-
-  if (logger) logger.log(`Voice playback started (${durationSec.toFixed(1)}s) ${mode === 'nullsink' ? '→ pulse sink' : '→ pipe'}: ${audioPath}`);
-  return {
-    durationSec,
-    stop: () => {
-      if (!exited) child.kill('SIGTERM');
-    },
-    getStderr: () => stderrBuf.slice(-1000),
-  };
+  return { durationSec };
 }
 
-module.exports = { startVoiceNotePlayback, getAudioDurationSec, isFfmpegAvailable, ffmpegBin, ffprobeBin };
+/**
+ * Ensure /tmp/current-voice-note.wav exists (silent placeholder) so Chrome can launch.
+ * Call before first browser launch when no voice file has been converted yet.
+ */
+function ensureChromeFakeMicPlaceholder(logger = null) {
+  if (fs.existsSync(CHROME_FAKE_MIC_WAV)) return;
+  const bin = ffmpegBin();
+  const result = spawnSync(
+    bin,
+    [
+      '-y',
+      '-f', 'lavfi',
+      '-i', 'anullsrc=r=48000:cl=stereo',
+      '-t', '1',
+      '-ar', '48000',
+      '-ac', '2',
+      '-sample_fmt', 's16',
+      '-f', 'wav',
+      CHROME_FAKE_MIC_WAV,
+    ],
+    { encoding: 'utf8', timeout: 5000 }
+  );
+  if (result.status !== 0 && logger && typeof logger.warn === 'function') {
+    logger.warn(`[voice] Could not create placeholder ${CHROME_FAKE_MIC_WAV}: ${result.stderr || ''}`);
+  }
+}
+
+module.exports = {
+  getAudioDurationSec,
+  isFfmpegAvailable,
+  convertToChromeFakeMicWav,
+  ensureChromeFakeMicPlaceholder,
+  ffmpegBin,
+  ffprobeBin,
+};

@@ -277,9 +277,13 @@ function getVoiceAudioMode() {
   return voiceAudioMode;
 }
 
-/** Env for Chromium so getUserMedia finds PulseAudio (same as pactl). */
+/** Env for Chromium so getUserMedia finds PulseAudio. For null-sink, PULSE_SOURCE must point at the monitor. */
 function getPulseClientEnv() {
-  return pactlEnv();
+  const env = pactlEnv();
+  if (voiceAudioMode === 'nullsink') {
+    env.PULSE_SOURCE = `${VOICE_NOTE_SOURCE_NAME}.monitor`;
+  }
+  return env;
 }
 
 module.exports = {

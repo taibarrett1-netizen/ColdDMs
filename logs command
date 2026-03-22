@@ -53,3 +53,5 @@ curl -sS -X POST "http://178.62.52.200:3000/api/debug/follow-up/browser" \
   rm -f follow-up-screenshots/*.png
 
   npm run download-follow-up-screenshots
+
+  BASE=http://178.62.52.200:3000 KEY='b12c9af6cda400a483c7d03a99e9f771c4eed254501ceb202bd65b8589f43354' node scripts/download-follow-up-screenshots.js

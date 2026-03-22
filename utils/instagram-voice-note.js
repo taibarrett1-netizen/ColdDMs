@@ -2,9 +2,8 @@
  * Instagram Web DM voice note: find mic control, record, send.
  * Desktop viewport is required (see applyDesktopEmulation).
  *
- * Chromium still requests microphone access for WebRTC/getUserMedia; on a VPS the
- * "mic" is typically PulseAudio (virtual sink). Grant permission in the browser so
- * no OS dialog blocks automation (Safari dialogs are not in the page DOM).
+ * Chromium requests microphone access for WebRTC/getUserMedia. We use Chrome's fake
+ * mic flags (--use-file-for-fake-audio-capture) so the exact audio file is played.
  */
 
 const { closeDmComposerOverlays } = require('./instagram-modals');
@@ -13,7 +12,6 @@ const {
   isFollowUpScreenshotsEnabled,
   captureFollowUpScreenshotWithMarkers,
 } = require('./follow-up-screenshots');
-const { startVoiceNotePlayback } = require('./voice-note-audio');
 
 /** When not `false`, wait for thread DOM to change after Send (audio/list rows). Reduces false "sent ok". */
 const VOICE_NOTE_STRICT_VERIFY = process.env.VOICE_NOTE_STRICT_VERIFY !== 'false';
@@ -669,7 +667,7 @@ async function grantMicrophoneForInstagram(page, logger) {
   }
   if (logger && typeof logger.warn === 'function') {
     logger.warn(
-      '[voice] Could not grant microphone via overridePermissions — Chrome may show a top infobar or block recording. Check PulseAudio / PULSE_SOURCE on the VPS.'
+      '[voice] Could not grant microphone via overridePermissions — Chrome may show a top infobar or block recording. Ensure Chrome fake mic flags are set.'
     );
   }
   return false;
@@ -1175,7 +1173,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     logger = null,
     correlationId = '',
     strictVerify = VOICE_NOTE_STRICT_VERIFY,
-    /** When set, ffmpeg → Pulse starts only after recording UI is confirmed (desktop) or at press-start (mobile). */
+    /** When set, durationSec is used for hold (Chrome fake mic plays file automatically). */
     voiceSource = null,
   } = opts;
   const shotMeta = { correlationId, logger };
@@ -1184,7 +1182,6 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     return { ok: false, reason: 'voice_note_failed' };
   }
 
-  let internalPlayback = null;
   try {
     await closeDmComposerOverlays(page);
 
@@ -1230,17 +1227,10 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     let effectiveHoldMs = holdMsOpt || 7000;
 
     if (desktopFlow) {
-      // Pipe-source: start ffmpeg feeding the pipe BEFORE mic click so audio flows when recording starts.
-      // The virtual mic exists from startup; getUserMedia already sees it. Clicking mic starts recording immediately.
-      if (voiceSource) {
-        internalPlayback = startVoiceNotePlayback(
-          voiceSource.path,
-          voiceSource.sink || 'ColdDMsVoice',
-          logger
-        );
-        effectiveHoldMs = Math.round(internalPlayback.durationSec * 1000 + 700);
+      // NEW: Chrome fake mic — audio file is loaded via --use-file-for-fake-audio-capture; no ffmpeg needed.
+      if (voiceSource && voiceSource.durationSec != null) {
+        effectiveHoldMs = Math.round(voiceSource.durationSec * 1000 + 700);
       }
-      await delay(VOICE_FFMPEG_HEAD_START_MS);
 
       if (logger) {
         logger.log(
@@ -1337,7 +1327,6 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         await captureFollowUpScreenshot(page, 'voice-recording-ui-just-confirmed', shotMeta);
       }
 
-      // ffmpeg already started before mic click (pipe-source flow)
       if (logger) logger.log(`Voice (desktop): hold recording ~${Math.round(effectiveHoldMs)} ms, then send`);
       await delay(afterShotMs);
       if (isFollowUpScreenshotsEnabled()) {
@@ -1359,16 +1348,10 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         await delay(remainingHold);
       }
     } else {
-      // Mobile: same pipe-source flow — start ffmpeg before press-and-hold
-      if (voiceSource) {
-        internalPlayback = startVoiceNotePlayback(
-          voiceSource.path,
-          voiceSource.sink || 'ColdDMsVoice',
-          logger
-        );
-        effectiveHoldMs = Math.round(internalPlayback.durationSec * 1000 + 700);
+      // Mobile: Chrome fake mic — use durationSec for hold
+      if (voiceSource && voiceSource.durationSec != null) {
+        effectiveHoldMs = Math.round(voiceSource.durationSec * 1000 + 700);
       }
-      await delay(VOICE_FFMPEG_HEAD_START_MS);
       if (logger) logger.log(`Voice (mobile web): press-and-hold ${Math.round(effectiveHoldMs)} ms`);
       if (isFollowUpScreenshotsEnabled()) {
         await captureFollowUpScreenshotWithMarkers(
@@ -1382,16 +1365,6 @@ async function sendVoiceNoteInThread(page, opts = {}) {
       await page.mouse.down();
       await delay(effectiveHoldMs);
       await page.mouse.up();
-    }
-
-    /**
-     * Stop ffmpeg (pipe feeding) **before** clicking Send. Leaving the stream running made the “recording”
-     * session ambiguous and matched mis-clicks (e.g. heart) that never queued a voice message.
-     */
-    if (internalPlayback) {
-      if (logger) logger.log('Voice: stopping ffmpeg playback before Send click');
-      internalPlayback.stop();
-      internalPlayback = null;
     }
 
     await micEl.dispose().catch(() => {});
@@ -1505,7 +1478,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     await delay(400);
     return { ok: true };
   } finally {
-    if (internalPlayback) internalPlayback.stop();
+    /* no cleanup needed with Chrome fake mic */
   }
 }
 
