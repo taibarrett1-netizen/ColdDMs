@@ -159,9 +159,15 @@ function getVoiceNotePipePath() {
   return VOICE_NOTE_PIPE_PATH;
 }
 
+/** True if pipe-source setup succeeded (pactl load-module worked). */
+function isPipeSourceReady() {
+  return pipeSourceSetupDone;
+}
+
 module.exports = {
   ensureVoicePipeSource,
   getVoiceNotePipePath,
+  isPipeSourceReady,
   VOICE_NOTE_SOURCE_NAME,
   VOICE_NOTE_PIPE_PATH,
 };

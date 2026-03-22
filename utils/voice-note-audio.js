@@ -1,6 +1,6 @@
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
-const { getVoiceNotePipePath } = require('./pulse-pipe-source');
+const { getVoiceNotePipePath, isPipeSourceReady } = require('./pulse-pipe-source');
 
 function ffmpegBin() {
   return process.env.FFMPEG_PATH || process.env.FFMPEG_BIN || 'ffmpeg';
@@ -53,6 +53,11 @@ function getAudioDurationSec(audioPath) {
 function startVoiceNotePlayback(audioPath, _pipePathOrSink, logger, timeoutMs = 90000) {
   if (!audioPath) throw new Error('voice_note_path_missing');
   if (!fs.existsSync(audioPath)) throw new Error('voice_note_file_not_found');
+  if (!isPipeSourceReady()) {
+    throw new Error(
+      'voice_pipe_source_not_ready: PulseAudio pipe-source setup failed (pactl not found or load-module failed). Voice notes require a VPS with PulseAudio. Install: sudo apt install pulseaudio.'
+    );
+  }
   const durationSec = getAudioDurationSec(audioPath);
   const pipePath = getVoiceNotePipePath();
 
@@ -74,8 +79,17 @@ function startVoiceNotePlayback(audioPath, _pipePathOrSink, logger, timeoutMs = 
   ];
 
   const bin = ffmpegBin();
-  const pipeWriteStream = fs.createWriteStream(pipePath);
-  const child = spawn(bin, args, { stdio: ['ignore', pipeWriteStream, 'pipe'] });
+  // Use fd not WriteStream: Node spawn rejects streams with fd:null; opening the pipe for write
+  // blocks until module-pipe-source (reader) connects — ensure ensureVoicePipeSource ran first.
+  let pipeFd;
+  try {
+    pipeFd = fs.openSync(pipePath, 'w');
+  } catch (e) {
+    throw new Error(
+      `voice_note_pipe_open_failed: ${pipePath} — run on VPS with PulseAudio. pactl load-module module-pipe-source must succeed first.`
+    );
+  }
+  const child = spawn(bin, args, { stdio: ['ignore', pipeFd, 'pipe'] });
   let stderrBuf = '';
   if (child.stderr) {
     child.stderr.on('data', (d) => {
@@ -100,7 +114,11 @@ function startVoiceNotePlayback(audioPath, _pipePathOrSink, logger, timeoutMs = 
   child.on('exit', () => {
     exited = true;
     clearTimeout(timeout);
-    pipeWriteStream.end().catch(() => {});
+    try {
+      fs.closeSync(pipeFd);
+    } catch {
+      /* ignore */
+    }
   });
   if (logger) logger.log(`Voice playback started (${durationSec.toFixed(1)}s) → pipe: ${audioPath}`);
   return {
