@@ -27,19 +27,21 @@ function pactlEnv() {
   if (rt) {
     env.XDG_RUNTIME_DIR = rt;
     env.PULSE_RUNTIME_PATH = rt;
+    env.PULSE_SERVER = `unix:${rt}/pulse/native`;
   }
   return env;
 }
 
 /**
  * Find and unload PulseAudio modules by name and argument match.
+ * @param {object} env - env for pactl (from pactlEnv())
  * @param {string} moduleName - e.g. 'module-null-sink' or 'module-pipe-source'
  * @param {string} argMatch - e.g. 'sink_name=ColdDMsVoice' or 'source_name=ColdDMsVoice'
  * @returns {boolean} true if something was unloaded
  */
-function unloadPulseModuleIfPresent(moduleName, argMatch) {
+function unloadPulseModuleIfPresent(env, moduleName, argMatch) {
   try {
-    const list = spawnSync('pactl', ['list', 'modules'], { encoding: 'utf8', env: pactlEnv() });
+    const list = spawnSync('pactl', ['list', 'modules'], { encoding: 'utf8', env });
     if (list.status !== 0 || !list.stdout) return false;
     const blocks = list.stdout.split('\n\n');
     for (const block of blocks) {
@@ -101,15 +103,27 @@ function ensureVoicePipeSource(logger = null) {
     return { ok: true, pipePath: VOICE_NOTE_PIPE_PATH };
   }
 
+  const env = pactlEnv();
+  const testConn = spawnSync('pactl', ['info'], { encoding: 'utf8', env });
+  if (testConn.status !== 0) {
+    const hint =
+      env.PULSE_SERVER ||
+      env.XDG_RUNTIME_DIR ||
+      '(none set — set PULSE_SERVER=unix:/run/user/0/pulse/native in .env)';
+    const err = `[voice] pactl cannot connect to PulseAudio. PULSE_SERVER/XDG_RUNTIME_DIR=${hint}. Start PulseAudio: XDG_RUNTIME_DIR=/run/user/0 pulseaudio -D`;
+    if (logger) logger.warn(err);
+    return { ok: false, pipePath: VOICE_NOTE_PIPE_PATH, error: err };
+  }
+
   try {
     // 1. Unload any old module-null-sink (ColdDMsVoice sink from previous setup)
-    const unloadedSink = unloadPulseModuleIfPresent('module-null-sink', `sink_name=${VOICE_NOTE_SOURCE_NAME}`);
+    const unloadedSink = unloadPulseModuleIfPresent(env, 'module-null-sink', `sink_name=${VOICE_NOTE_SOURCE_NAME}`);
     if (unloadedSink && logger) {
       logger.log(`[voice] Unloaded old null-sink (${VOICE_NOTE_SOURCE_NAME})`);
     }
 
     // 2. Unload any existing pipe-source so we get a clean reload
-    const unloadedSource = unloadPulseModuleIfPresent('module-pipe-source', `source_name=${VOICE_NOTE_SOURCE_NAME}`);
+    const unloadedSource = unloadPulseModuleIfPresent(env, 'module-pipe-source', `source_name=${VOICE_NOTE_SOURCE_NAME}`);
     if (unloadedSource && logger) {
       logger.log(`[voice] Unloaded old pipe-source (${VOICE_NOTE_SOURCE_NAME})`);
     }
@@ -133,7 +147,7 @@ function ensureVoicePipeSource(logger = null) {
         'rate=48000',
         'channels=2',
       ],
-      { encoding: 'utf8', env: pactlEnv() }
+      { encoding: 'utf8', env }
     );
 
     if (load.status !== 0) {
@@ -148,7 +162,7 @@ function ensureVoicePipeSource(logger = null) {
     // 5. Set as default source so Chromium's getUserMedia uses it without PULSE_SOURCE
     const setDefault = spawnSync('pactl', ['set-default-source', VOICE_NOTE_SOURCE_NAME], {
       encoding: 'utf8',
-      env: pactlEnv(),
+      env,
     });
     if (setDefault.status !== 0 && logger) {
       logger.warn(`[voice] pactl set-default-source failed: ${setDefault.stderr || ''}`);
