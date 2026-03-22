@@ -215,12 +215,12 @@ function voiceThreadLooksDelivered(before, after) {
   /** New message text (e.g. duration label) inside the thread scroller. */
   if (before.scrollerTextLen > 0 && scrollerTextDelta >= 8) return true;
   if (before.scrollerScrollHeight > 0 && scrollerTextDelta >= 8) return true;
-  /** Voice note row often adds a play/voice control in the thread. */
-  if (hintDelta >= 1) return true;
-  /** Fallback: main pane text grew (noisier; ignore tiny deltas). */
-  if (mainTextDelta >= 12) return true;
+  /** mediaHints alone caused false positives — pair with scroll/children/text. */
+  if (hintDelta >= 1 && (scrollDelta >= 10 || childDelta >= 1 || scrollerTextDelta >= 10)) return true;
+  /** Main pane text: require larger delta (timestamps/seen text move otherwise). */
+  if (mainTextDelta >= 45) return true;
   /** Voice-only bubble may add almost no innerText; allow tiny growth if scroller started working. */
-  if (mainTextDelta >= 4 && after.scrollerScrollHeight > before.scrollerScrollHeight) return true;
+  if (mainTextDelta >= 8 && after.scrollerScrollHeight > before.scrollerScrollHeight + 15) return true;
   return false;
 }
 
@@ -1251,6 +1251,70 @@ function voiceSendTargetPreviewScript() {
 }
 
 /**
+ * Same pattern as the mic: Puppeteer ElementHandle.click() on the DOM node.
+ * Coordinate-only clicks often miss React handlers; this matches micEl.click().
+ */
+async function clickVoiceSendWithPuppeteerElement(page, logger) {
+  const handle = await page.evaluateHandle(() => {
+    const lower = (s) => (s || '').toLowerCase();
+    const notSend = (lab) =>
+      /\bmicrophone\b|\bmic\b|\bvoice message\b|\brecord\b|\brecording\b|\bpause\b|\bdelete\b|\btrash\b/.test(
+        lower(lab || '')
+      );
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    const inSendZone = (r) =>
+      r.bottom > h - 100 &&
+      r.right > w - 100 &&
+      r.width >= 16 &&
+      r.width <= 96 &&
+      r.height >= 16 &&
+      r.height <= 96;
+    const probes = [
+      [w - 28, h - 28],
+      [w - 36, h - 32],
+      [w - 44, h - 36],
+      [w - 52, h - 40],
+    ];
+    for (const [px, py] of probes) {
+      let node = document.elementFromPoint(px, py);
+      for (let depth = 0; depth < 16 && node; depth++) {
+        try {
+          const r = node.getBoundingClientRect();
+          if (inSendZone(r) && node.querySelector && node.querySelector('svg')) {
+            const lab = (node.getAttribute('aria-label') || '') + (node.getAttribute('title') || '');
+            if (!notSend(lab)) return node;
+          }
+        } catch {
+          /* ignore */
+        }
+        node = node.parentElement;
+      }
+    }
+    return null;
+  });
+  const el = handle.asElement();
+  if (!el) {
+    await handle.dispose().catch(() => {});
+    return { ok: false };
+  }
+  try {
+    await el.click({ delay: 55 });
+    await el.dispose().catch(() => {});
+    if (logger && typeof logger.log === 'function') {
+      logger.log('Voice: Send via Puppeteer element.click (same as mic)');
+    }
+    return { ok: true, via: 'puppeteer_element_click' };
+  } catch (e) {
+    await el.dispose().catch(() => {});
+    if (logger && typeof logger.warn === 'function') {
+      logger.warn(`Voice: Puppeteer Send element.click failed: ${e.message || e}`);
+    }
+    return { ok: false };
+  }
+}
+
+/**
  * Desktop Chrome: one click on the mic starts recording; wait for audio duration; click Send (paper plane).
  * Mobile web: press-and-hold on the mic for the duration (older mobile IG pattern).
  */
@@ -1448,35 +1512,38 @@ async function sendVoiceNoteInThread(page, opts = {}) {
 
     const clickSend = clickSendAfterRecordingScript();
     const previewOnly = voiceSendTargetPreviewScript();
-    let sendResult = null;
-    for (let attempt = 0; attempt < 15; attempt++) {
-      const preview = await page.evaluate(previewOnly).catch(() => null);
-      if (preview && preview.ok && Number.isFinite(preview.x) && Number.isFinite(preview.y)) {
-        const nx = Math.round(preview.x + VOICE_SEND_CLICK_NUDGE_X);
-        const ny = Math.round(preview.y);
-        try {
-          await page.mouse.move(nx, ny);
-          await delay(90);
-          await page.mouse.click(nx, ny, { delay: 55 });
-          sendResult = {
-            ok: true,
-            via: `${preview.via || 'preview'}_puppeteer_nudge${VOICE_SEND_CLICK_NUDGE_X}`,
-            label: preview.label,
-            dockedCount: preview.dockedCount,
-          };
-          if (logger) {
-            logger.log(
-              `Voice: Send via Puppeteer mouse at (${nx},${ny}) nudgeX=${VOICE_SEND_CLICK_NUDGE_X} (${preview.via || 'preview'})`
-            );
+    let sendResult = await clickVoiceSendWithPuppeteerElement(page, logger);
+    if (!sendResult || !sendResult.ok) {
+      sendResult = null;
+      for (let attempt = 0; attempt < 15; attempt++) {
+        const preview = await page.evaluate(previewOnly).catch(() => null);
+        if (preview && preview.ok && Number.isFinite(preview.x) && Number.isFinite(preview.y)) {
+          const nx = Math.round(preview.x + VOICE_SEND_CLICK_NUDGE_X);
+          const ny = Math.round(preview.y);
+          try {
+            await page.mouse.move(nx, ny);
+            await delay(90);
+            await page.mouse.click(nx, ny, { delay: 55 });
+            sendResult = {
+              ok: true,
+              via: `${preview.via || 'preview'}_puppeteer_nudge${VOICE_SEND_CLICK_NUDGE_X}`,
+              label: preview.label,
+              dockedCount: preview.dockedCount,
+            };
+            if (logger) {
+              logger.log(
+                `Voice: Send via Puppeteer mouse at (${nx},${ny}) nudgeX=${VOICE_SEND_CLICK_NUDGE_X} (${preview.via || 'preview'})`
+              );
+            }
+            break;
+          } catch (e) {
+            if (logger) logger.warn(`Voice: Puppeteer Send click failed (${e.message}); falling back to DOM click`);
           }
-          break;
-        } catch (e) {
-          if (logger) logger.warn(`Voice: Puppeteer Send click failed (${e.message}); falling back to DOM click`);
         }
+        sendResult = await page.evaluate(clickSend).catch(() => ({ ok: false, why: 'eval_error' }));
+        if (sendResult && sendResult.ok) break;
+        await delay(450);
       }
-      sendResult = await page.evaluate(clickSend).catch(() => ({ ok: false, why: 'eval_error' }));
-      if (sendResult && sendResult.ok) break;
-      await delay(450);
     }
     if (!sendResult || !sendResult.ok) {
       const vp = page.viewport();
@@ -1515,6 +1582,9 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     if (strictVerify) {
       const verified = await waitForVoiceDeliveredInThread(page, metricsBefore, { logger });
       if (!verified) {
+        if (isFollowUpScreenshotsEnabled()) {
+          await captureFollowUpScreenshot(page, 'voice-after-send-verify-failed', shotMeta);
+        }
         return { ok: false, reason: 'voice_not_confirmed_in_thread' };
       }
     } else if (logger) {
@@ -1522,6 +1592,10 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     }
 
     await delay(400);
+    /** Screenshot 3: Thread state after Send (success path). */
+    if (isFollowUpScreenshotsEnabled()) {
+      await captureFollowUpScreenshot(page, 'voice-after-send', shotMeta);
+    }
     return { ok: true };
   } finally {
     /* no cleanup needed with Chrome fake mic */
