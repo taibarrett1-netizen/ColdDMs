@@ -76,7 +76,7 @@ Optional env: **`VOICE_MIC_ATTEMPT_WAIT_MS`** (per gesture poll window); **`VOIC
 
 ### Stricter success criteria
 
-By default **`VOICE_NOTE_STRICT_VERIFY`** is **on**: after clicking Send, the worker polls the thread until it sees a DOM change (e.g. new `audio` / list rows, scroll height in the message column, or new play/voice-related controls in the thread). If Instagram returns “success” in logs but no bubble appears, you should see a **`voice_not_confirmed_in_thread`** error instead of a false **`sent ok`**. Set **`VOICE_NOTE_STRICT_VERIFY=false`** only if this check causes false failures on your layout.
+By default **`VOICE_NOTE_STRICT_VERIFY`** is **off** (many layouts/timeouts produce false failures). Set **`VOICE_NOTE_STRICT_VERIFY=true`** if you want the worker to poll the thread after Send and return **`voice_not_confirmed_in_thread`** when the DOM doesn’t look updated.
 
 **If logs show `scroll=0` / `scrollerText=0` for the whole run:** the old heuristic often **could not find the message scroller**; the voice note may still have been sent. Check the thread in the app or in a VNC session. Recent worker builds add a **fallback scroller** (largest `overflow-y: auto|scroll` region in `main`) and **`mediaHints`** (play/voice/clip aria in the thread) so verification matches IG Web better.
 

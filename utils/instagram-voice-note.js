@@ -13,8 +13,11 @@ const {
   captureFollowUpScreenshotWithMarkers,
 } = require('./follow-up-screenshots');
 
-/** When not `false`, wait for thread DOM to change after Send (audio/list rows). Reduces false "sent ok". */
-const VOICE_NOTE_STRICT_VERIFY = process.env.VOICE_NOTE_STRICT_VERIFY !== 'false';
+/**
+ * After Send, poll thread DOM until it looks updated. Often false-negative on IG layout changes — default off.
+ * Set VOICE_NOTE_STRICT_VERIFY=true to enable.
+ */
+const VOICE_NOTE_STRICT_VERIFY = process.env.VOICE_NOTE_STRICT_VERIFY === 'true';
 
 /**
  * If true, after the full mic gesture sequence we still run ffmpeg + hold + Send when recording-UI
@@ -62,9 +65,10 @@ const VOICE_FAKE_MIC_HOLD_JITTER_MS = Math.min(
   2000,
   Math.max(0, parseInt(process.env.VOICE_FAKE_MIC_HOLD_JITTER_MS, 10) || 80)
 );
+/** Extra ms shaved off the hold so recording stops before the fake-mic file loops (~2s tail). Tune via env. */
 const VOICE_FAKE_MIC_LOOP_TRIM_MS = Math.min(
   8000,
-  Math.max(0, parseInt(process.env.VOICE_FAKE_MIC_LOOP_TRIM_MS, 10) || 180)
+  Math.max(0, parseInt(process.env.VOICE_FAKE_MIC_LOOP_TRIM_MS, 10) || 2200)
 );
 
 /** Puppeteer removed `page.waitForTimeout`; use this instead. */

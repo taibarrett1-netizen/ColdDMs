@@ -107,7 +107,7 @@ Optional overrides (defaults match the PulseAudio setup above):
 
 5. **Bot:** In `.env` set `HEADLESS_MODE=false` and `DISPLAY=:99`, restart PM2. `cli.js` loads `.env` via `dotenv`, so `DISPLAY` is picked up by Chromium.
 
-**Debug:** `PUPPETEER_SLOW_MO_MS=80` slows Puppeteer (easier to follow in VNC). **Post-send check:** by default `VOICE_NOTE_STRICT_VERIFY` is on — the worker waits for the thread DOM to change after Send; set `VOICE_NOTE_STRICT_VERIFY=false` only if you get false failures and need to compare behaviour.
+**Debug:** `PUPPETEER_SLOW_MO_MS=80` slows Puppeteer (easier to follow in VNC). **Post-send check:** by default `VOICE_NOTE_STRICT_VERIFY` is **off** (DOM checks often false-negative). Set `VOICE_NOTE_STRICT_VERIFY=true` if you want to fail the API when the thread doesn’t update after Send.
 
 Do **not** expose an unauthenticated VNC port to the public internet; use SSH tunnel or firewall + VNC password.
 
