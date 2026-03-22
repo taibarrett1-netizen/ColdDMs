@@ -39,23 +39,6 @@ Exactly **one** of:
 | `messages` | Array of text DMs (sequential) |
 | `audioUrl` | Voice follow-up (`caption` optional text before voice) |
 
-## Debug screenshots (optional)
-
-1. Set **`FOLLOW_UP_DEBUG_SCREENSHOTS=true`** in `.env` on the VPS and restart PM2.
-2. For **voice** follow-ups, when debug screenshots are on you may get:
-   - **`*_voice-mic-click-target.png`** — **before** the mic click, with a **red crosshair** at the exact viewport coordinates used (so you can see if we’re hitting the wrong icon).
-   - **`*_voice-recording-ui-missed.png`** — if recording UI never appears after the click, same crosshair on the current page (usually wrong target or blocked mic).
-   - **`*_voice-recording-ui-just-confirmed.png`** — **plain** screenshot ~220ms after the worker’s recording-UI check passes (blue bar / timer / dock heuristics). Use this to compare **what you see** vs what the heuristic matched.
-   - **`*_voice-after-mic-click.png`** — ~600ms after recording starts; **red crosshair** still on the **mic** coordinates (reference only).
-   - **`*_voice-recording-mid-hold.png`** — halfway through the ffmpeg/hold window (long clips only), **plain** — confirms the recording UI is still visible mid-capture.
-   - **`*_voice-after-playback-before-send.png`** — **plain** screenshot after playback stops and **before** Send is clicked (composer / recording strip as IG shows it then).
-   - **`*_voice-send-click-target.png`** — **red crosshair** on the **resolved Send** center (same logic as the click), with a short label naming the match reason (`dock_aria_send_generic`, `dock_rightmost_composer_band`, etc.).
-   - **`*_voice-send-target-unresolved.png`** — if no Send control could be resolved for coordinates; crosshair is a **placeholder** — inspect `voice-after-playback-before-send` and PM2 logs (`dockedButtons=…`).
-   Filenames include `correlationId` when sent in the request.
-3. **Download via HTTP** (Bearer `COLD_DM_API_KEY` when set): `GET /api/debug/follow-up-screenshots` and `GET /api/debug/follow-up-screenshots/file?name=...`
-
-Optional: **`FOLLOW_UP_SCREENSHOTS_FULL_PAGE=true`** for full-page PNGs.
-
 ### Watch the browser on the VPS (VNC + Xvfb)
 
 See **`DEPLOYMENT.md`** → *Watching the browser on a VPS*. Set `HEADLESS_MODE=false`, `DISPLAY=:99` (or your Xvfb display), run `x11vnc`, tunnel with SSH, connect VNC to `localhost:5900`. Use **`PUPPETEER_SLOW_MO_MS=80`** so actions are easier to follow.
@@ -133,46 +116,23 @@ If you see **duplicate opener-style text** in the thread:
 - Check no **second** job (cold DM campaign, another follow-up) ran for the same user.
 - This worker does not re-run “saved reply” or campaign templates on follow-up unless you sent `text` / `messages` / `caption`.
 
-## What the debug screenshots showed (common issues)
+## Common UI issues (voice)
 
-- **Home (`01-home`):** If a **“Turn on Notifications”** modal is visible, it blocks the rest of the session until dismissed. The worker now clicks **Not Now** on that (and similar) modals **before** the `01-home` screenshot.
-- **Composer (`04`):** A **sticker / GIF panel** over the thread steals clicks from the real mic/send. The worker now sends **Escape** several times before voice actions and **excludes emoji/sticker/GIF controls** when resolving the mic. The send step prefers **voice send** controls and avoids sticker regions.
-
-### Clear debug PNGs on the VPS
-
-From project root (where `follow-up-screenshots/` lives):
-
-```bash
-npm run clean-follow-up-screenshots
-# or: rm -f follow-up-screenshots/*.png
-```
-
-### Per–mic-method screenshots
-
-With **`FOLLOW_UP_DEBUG_SCREENSHOTS=true`**, each desktop mic attempt saves **`voice-mic-after_<method>.png`** with an on-image label:  
-`METHOD: <name> | recordingUI=YES|no (why)`. Pick the method that first shows **`YES`**, then set **`VOICE_DESKTOP_MIC_METHOD=<exact name>`** so only that path runs.
-
-Valid names (same order as default attempts):  
-`element.click`, `mouse_hold_to_start_recording`, `stepped_move+press_hold`, `mouse_move+down+up`, `mouse.click_coords`, `elementFromPoint+pointer+mouse`.
+- **Home modal:** If a **“Turn on Notifications”** (or similar) modal is visible, it blocks the session until dismissed. The worker dismisses common modals before voice actions.
+- **Composer:** A **sticker / GIF panel** over the thread steals clicks from the real mic/send. The worker sends **Escape** before voice actions and **excludes emoji/sticker/GIF controls** when resolving the mic.
 
 ### Send click nudge
 
 After playback stops, the worker resolves the Send control, moves the mouse **slightly right** (default **14px**, **`VOICE_SEND_CLICK_NUDGE_X`**), then clicks with Puppeteer (falls back to in-page `el.click()` if needed).
 
-### Why per-method screenshots say `recordingUI=no` but `voice-recording-ui-missed.png` shows a blue bar
+### Recording UI detection quirks
 
-Headless Chromium often **does not get a working mic** from the OS. Instagram then **does not arm recording** until `getUserMedia` succeeds. Our **per-method** PNG is taken **right after** each ~4s wait — the UI can still be idle.
+Headless timing/DOM can differ from what you see in VNC. Optional:
 
-**Defaults (VPS):** the worker sets **`PULSE_SOURCE`** to **`${VOICE_NOTE_SINK}.monitor`** (e.g. `ColdDMsVoice.monitor`) and **does not** enable `--use-fake-device-for-media-stream`, so Chrome captures **real** audio from ffmpeg → sink → monitor. If you have **no** Pulse sink, set **`VOICE_SKIP_PULSE_SOURCE=true`** or **`CHROMIUM_USE_FAKE_MEDIA_DEVICE=true`** so headless uses the fake stream (UI may work; audio will not be your file). Override with **`CHROMIUM_USE_FAKE_MEDIA_DEVICE=false`** / **`true`** when you need explicit control.
-
-After all gestures, we also **wait ~2s** and poll once (`VOICE_LATE_RECORDING_UI_MS`) to catch a **delayed** recording strip.
-
-### Recording UI not detected (but screenshots show the blue bar)
-
-Headless Chromium sometimes **does not match** our DOM/`getComputedStyle` heuristics even when **`voice-recording-ui-missed.png`** shows an active recording strip (timing or paint differences).
-
-- **`VOICE_ASSUME_RECORDING_AFTER_MIC=true`** — after the normal mic gesture sequence, still run **ffmpeg → Pulse**, hold for the audio duration, then **Send**, even if recording UI was never “confirmed.” Check screenshots / the thread; if recording never started, you may capture silence.
+- **`VOICE_ASSUME_RECORDING_AFTER_MIC=true`** — after the mic gesture sequence, still run hold + Send even if recording UI was never confirmed (risk: silence if recording never started). Check the thread.
 - **`VOICE_RECORDING_UI_CONFIRM_STREAK=1`** — require only **one** successful poll instead of two before treating recording UI as confirmed (default `2`).
+
+After all gestures, the worker also waits **~2s** and polls once (`VOICE_LATE_RECORDING_UI_MS`) for a delayed recording strip.
 
 ## VPS requirements (voice)
 

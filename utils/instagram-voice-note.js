@@ -7,11 +7,6 @@
  */
 
 const { closeDmComposerOverlays } = require('./instagram-modals');
-const {
-  captureFollowUpScreenshot,
-  isFollowUpScreenshotsEnabled,
-  captureFollowUpScreenshotWithMarkers,
-} = require('./follow-up-screenshots');
 
 /** When not `false`, wait for thread DOM to change after Send (audio/list rows). Reduces false "sent ok". */
 const VOICE_NOTE_STRICT_VERIFY = process.env.VOICE_NOTE_STRICT_VERIFY !== 'false';
@@ -19,7 +14,7 @@ const VOICE_NOTE_STRICT_VERIFY = process.env.VOICE_NOTE_STRICT_VERIFY !== 'false
 /**
  * If true, after the full mic gesture sequence we still run ffmpeg + hold + Send when recording-UI
  * heuristics never confirm (headless often matches screenshots but not `getComputedStyle` / DOM checks).
- * Risk: if recording never started, you may send silence or mis-click — use with FOLLOW_UP_DEBUG_SCREENSHOTS.
+ * Risk: if recording never started, you may send silence or mis-click.
  */
 const VOICE_ASSUME_RECORDING_AFTER_MIC =
   process.env.VOICE_ASSUME_RECORDING_AFTER_MIC === '1' ||
@@ -47,6 +42,20 @@ const VOICE_RECORDING_UI_TIMEOUT_MS = Math.min(
 const VOICE_FFMPEG_HEAD_START_MS = Math.min(
   Math.max(parseInt(process.env.VOICE_FFMPEG_HEAD_START_MS, 10) || 350, 200),
   500
+);
+
+/**
+ * Chrome fake mic loops the WAV; we pad silence in `convertToChromeFakeMicWav` so the loop is inaudible.
+ * `durationSec` is the full padded file length — hold for that plus this jitter (timer / UI slack).
+ * Optional: `VOICE_FAKE_MIC_LOOP_TRIM_MS` subtracts ms if you disable padding and need the old behavior.
+ */
+const VOICE_FAKE_MIC_HOLD_JITTER_MS = Math.min(
+  2000,
+  Math.max(0, parseInt(process.env.VOICE_FAKE_MIC_HOLD_JITTER_MS, 10) || 200)
+);
+const VOICE_FAKE_MIC_LOOP_TRIM_MS = Math.min(
+  8000,
+  Math.max(0, parseInt(process.env.VOICE_FAKE_MIC_LOOP_TRIM_MS, 10) || 0)
 );
 
 /** Puppeteer removed `page.waitForTimeout`; use this instead. */
@@ -614,12 +623,9 @@ function selectDesktopMicAttempts(page, micEl, cx, cy, logger) {
 
 /**
  * Try click paths; only proceed to the next if recording UI did not appear.
- * With FOLLOW_UP_DEBUG_SCREENSHOTS, saves one PNG per method (label = method + detected y/n).
  */
-async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger, shotMeta = null) {
+async function activateMicUntilRecordingUi(page, micEl, cx, cy, logger) {
   const attempts = selectDesktopMicAttempts(page, micEl, cx, cy, logger);
-  const safeStep = (name) =>
-    `voice-mic-after_${String(name).replace(/[^a-zA-Z0-9]+/g, '_').replace(/_+/g, '_').slice(0, 40)}`;
 
   for (const a of attempts) {
     await a.run();
@@ -1327,7 +1333,6 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     /** When set, durationSec is used for hold (Chrome fake mic plays file automatically). */
     voiceSource = null,
   } = opts;
-  const shotMeta = { correlationId, logger };
 
   if (!voiceSource && (holdMsOpt == null || holdMsOpt < 400)) {
     return { ok: false, reason: 'voice_note_failed' };
@@ -1381,7 +1386,10 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     if (desktopFlow) {
       // NEW: Chrome fake mic — audio file is loaded via --use-file-for-fake-audio-capture; no ffmpeg needed.
       if (voiceSource && voiceSource.durationSec != null) {
-        effectiveHoldMs = Math.round(voiceSource.durationSec * 1000 + 150);
+        effectiveHoldMs = Math.round(
+          voiceSource.durationSec * 1000 + VOICE_FAKE_MIC_HOLD_JITTER_MS - VOICE_FAKE_MIC_LOOP_TRIM_MS
+        );
+        effectiveHoldMs = Math.max(1500, effectiveHoldMs);
       }
 
       if (logger) {
@@ -1431,7 +1439,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         })
         .catch(() => {});
 
-      let act = await activateMicUntilRecordingUi(page, micEl, cx, cy, logger, shotMeta);
+      let act = await activateMicUntilRecordingUi(page, micEl, cx, cy, logger);
       if (!act.ok && VOICE_LATE_RECORDING_UI_MS > 0) {
         await delay(VOICE_LATE_RECORDING_UI_MS);
         const late = await evaluateRecordingUiOnce(page);
@@ -1445,7 +1453,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
       if (!act.ok && VOICE_ASSUME_RECORDING_AFTER_MIC) {
         if (logger) {
           logger.warn(
-            '[voice] Recording UI heuristics did not confirm after mic attempts; continuing anyway (VOICE_ASSUME_RECORDING_AFTER_MIC=true). Playback + hold will run — verify with screenshots / thread.'
+            '[voice] Recording UI heuristics did not confirm after mic attempts; continuing anyway (VOICE_ASSUME_RECORDING_AFTER_MIC=true). Playback + hold will run — verify in thread.'
           );
         }
         act = { ok: true, why: 'assumed_after_mic_attempts', method: 'VOICE_ASSUME_RECORDING_AFTER_MIC' };
@@ -1457,31 +1465,29 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         return { ok: false, reason: 'voice_recording_ui_not_detected' };
       }
 
-      /** Screenshot 1: After mic click — recording UI visible. */
-      if (isFollowUpScreenshotsEnabled()) {
-        await delay(220);
-        await captureFollowUpScreenshot(page, 'voice-after-mic-click', shotMeta);
+      if (logger) {
+        const trimNote =
+          voiceSource && voiceSource.durationSec != null
+            ? ` (jitter=${VOICE_FAKE_MIC_HOLD_JITTER_MS}ms${VOICE_FAKE_MIC_LOOP_TRIM_MS ? ` loopTrim=${VOICE_FAKE_MIC_LOOP_TRIM_MS}ms` : ''})`
+            : '';
+        logger.log(`Voice (desktop): hold recording ~${Math.round(effectiveHoldMs)} ms, then send${trimNote}`);
       }
-
-      if (logger) logger.log(`Voice (desktop): hold recording ~${Math.round(effectiveHoldMs)} ms, then send`);
       await delay(afterShotMs);
       const remainingHold = Math.max(0, effectiveHoldMs - afterShotMs);
       await delay(remainingHold);
     } else {
       // Mobile: Chrome fake mic — use durationSec for hold
       if (voiceSource && voiceSource.durationSec != null) {
-        effectiveHoldMs = Math.round(voiceSource.durationSec * 1000 + 150);
+        effectiveHoldMs = Math.round(
+          voiceSource.durationSec * 1000 + VOICE_FAKE_MIC_HOLD_JITTER_MS - VOICE_FAKE_MIC_LOOP_TRIM_MS
+        );
+        effectiveHoldMs = Math.max(1500, effectiveHoldMs);
       }
       if (logger) logger.log(`Voice (mobile web): press-and-hold ${Math.round(effectiveHoldMs)} ms`);
       await page.mouse.move(cx, cy);
       await page.mouse.down();
       await delay(effectiveHoldMs);
       await page.mouse.up();
-      /** Screenshot 1 (mobile): After hold — recording UI. */
-      if (isFollowUpScreenshotsEnabled()) {
-        await delay(300);
-        await captureFollowUpScreenshot(page, 'voice-after-mic-click', shotMeta);
-      }
     }
 
     await micEl.dispose().catch(() => {});
@@ -1489,27 +1495,6 @@ async function sendVoiceNoteInThread(page, opts = {}) {
 
     /** Do NOT send Escape here — it dismisses Instagram's voice recording UI before Send. */
     await delay(1200);
-
-    const previewSend = voiceSendTargetPreviewScript();
-    /** Screenshot 2: Where we're clicking to send. */
-    if (isFollowUpScreenshotsEnabled()) {
-      await delay(280);
-      const preview = await page.evaluate(previewSend).catch(() => null);
-      const vp = page.viewport() || { width: 1280, height: 800 };
-      const sx = preview && preview.ok && Number.isFinite(preview.x) ? preview.x : vp.width - 36;
-      const sy = preview && preview.ok && Number.isFinite(preview.y) ? preview.y : vp.height - 36;
-      if (logger && preview?.via) {
-        logger.log(`Voice: Send target (${preview.via}) at (${Math.round(sx)},${Math.round(sy)})`);
-      } else if (logger && preview?.why) {
-        logger.warn(`Voice: Send coords unresolved (${preview.why}) — using corner fallback`);
-      }
-      await captureFollowUpScreenshotWithMarkers(
-        page,
-        [{ x: sx, y: sy, label: 'Send target — Puppeteer will click here' }],
-        'voice-send-target',
-        shotMeta
-      );
-    }
 
     const clickSend = clickSendAfterRecordingScript();
     const previewOnly = voiceSendTargetPreviewScript();
@@ -1583,9 +1568,6 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     if (strictVerify) {
       const verified = await waitForVoiceDeliveredInThread(page, metricsBefore, { logger });
       if (!verified) {
-        if (isFollowUpScreenshotsEnabled()) {
-          await captureFollowUpScreenshot(page, 'voice-after-send-verify-failed', shotMeta);
-        }
         return { ok: false, reason: 'voice_not_confirmed_in_thread' };
       }
     } else if (logger) {
@@ -1593,10 +1575,6 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     }
 
     await delay(400);
-    /** Screenshot 3: Thread state after Send (success path). */
-    if (isFollowUpScreenshotsEnabled()) {
-      await captureFollowUpScreenshot(page, 'voice-after-send', shotMeta);
-    }
     return { ok: true };
   } finally {
     /* no cleanup needed with Chrome fake mic */

@@ -1,9 +1,3 @@
-# Download all follow-up debug PNGs from VPS (KEY = COLD_DM_API_KEY, one line)
-# Red crosshair = where Puppeteer clicked: *voice-mic-click-target* (before mic) and *voice-after-mic-click* (during record)
-cd "/Users/taibarrett/Documents/SkeduleMore/Dashboard/Cold DMs V1"
-BASE=http://178.62.52.200:3000 KEY='paste_key_here' node scripts/download-follow-up-screenshots.js
-# Then: open follow-up-screenshots-download/ and sort by date, or: ls follow-up-screenshots-download/*click*
-
 # Watch IG in the VPS browser (Xvfb + VNC): see DEPLOYMENT.md "Watching the browser on a VPS"
 # ssh -L 5900:127.0.0.1:5900 root@YOUR_IP
 # VNC Viewer -> localhost:5900  |  .env: HEADLESS_MODE=false DISPLAY=:99 PUPPETEER_SLOW_MO_MS=80
@@ -27,9 +21,6 @@ cd "/Users/taibarrett/Documents/SkeduleMore/Dashboard/Cold DMs V1"
 scp root@178.62.52.200:/root/ColdDMs/scraper-debug/followers_modal_fail_bbbbf662-64f8-492d-aeaa-6098374a43dc.png .
 open followers_modal_fail_bbbbf662-64f8-492d-aeaa-6098374a43dc.png
 
-cd "/Users/taibarrett/Documents/SkeduleMore/Dashboard/Cold DMs V1"
-BASE=http://178.62.52.200:3000 KEY='b12c9af6cda400a483c7d03a99e9f771c4eed254501ceb202bd65b8589f43354' node scripts/download-follow-up-screenshots.js
-
 curl -sS -X POST "http://178.62.52.200:3000/api/debug/follow-up/browser" \
   -H "Authorization: Bearer b12c9af6cda400a483c7d03a99e9f771c4eed254501ceb202bd65b8589f43354" \
   -H "Content-Type: application/json" \
@@ -49,9 +40,3 @@ curl -sS -X POST "http://178.62.52.200:3000/api/debug/follow-up/browser" \
   -H "Authorization: Bearer b12c9af6cda400a483c7d03a99e9f771c4eed254501ceb202bd65b8589f43354" \
   -H "Content-Type: application/json" \
   -d '{"clientId":"f0aff6c5-64f8-498b-83f5-b31e7291d34d","instagramSessionId":"e5c11f0f-8fa2-48f4-a06e-57381ef7c2e0"}'
-
-  rm -f follow-up-screenshots/*.png
-
-  npm run download-follow-up-screenshots
-
-  BASE=http://178.62.52.200:3000 KEY='b12c9af6cda400a483c7d03a99e9f771c4eed254501ceb202bd65b8589f43354' node scripts/download-follow-up-screenshots.js
