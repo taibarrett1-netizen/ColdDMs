@@ -597,17 +597,19 @@ function buildDesktopMicAttempts(page, micEl, cx, cy) {
 
 function selectDesktopMicAttempts(page, micEl, cx, cy, logger) {
   const all = buildDesktopMicAttempts(page, micEl, cx, cy);
-  if (!VOICE_DESKTOP_MIC_METHOD) return all;
-  const one = all.filter((a) => a.name === VOICE_DESKTOP_MIC_METHOD);
-  if (one.length) return one;
-  if (logger && typeof logger.warn === 'function') {
-    logger.warn(
-      `[voice] VOICE_DESKTOP_MIC_METHOD="${VOICE_DESKTOP_MIC_METHOD}" not found. Valid: ${VOICE_DESKTOP_MIC_METHOD_NAMES.join(
-        ', '
-      )}. Running all methods.`
-    );
+  if (VOICE_DESKTOP_MIC_METHOD) {
+    const one = all.filter((a) => a.name === VOICE_DESKTOP_MIC_METHOD);
+    if (one.length) return one;
+    if (logger && typeof logger.warn === 'function') {
+      logger.warn(
+        `[voice] VOICE_DESKTOP_MIC_METHOD="${VOICE_DESKTOP_MIC_METHOD}" not found. Valid: ${VOICE_DESKTOP_MIC_METHOD_NAMES.join(
+          ', '
+        )}. Using element.click.`
+      );
+    }
   }
-  return all;
+  // element.click works reliably; skip other fallback methods.
+  return all.filter((a) => a.name === 'element.click');
 }
 
 /**
@@ -986,14 +988,21 @@ function voiceSendResolveScript(opts) {
     };
 
     const compose = findComposerForDock();
-    if (!compose) {
-      return { ok: false, why: 'no_composer', dockedCount: 0 };
+    let cr;
+    let dockTop;
+    let dockBottom = window.innerHeight + 4;
+    let dockLeft;
+    let dockRight = window.innerWidth - 4;
+    if (compose) {
+      cr = compose.getBoundingClientRect();
+      dockTop = Math.max(cr.top - 160, window.innerHeight * 0.52);
+      dockLeft = Math.max(0, cr.left - 80);
+    } else {
+      // Recording UI replaces the text composer — use bottom strip for Send button.
+      cr = { top: window.innerHeight - 100 };
+      dockTop = window.innerHeight - 140;
+      dockLeft = Math.max(0, window.innerWidth - 400);
     }
-    const cr = compose.getBoundingClientRect();
-    const dockTop = Math.max(cr.top - 160, window.innerHeight * 0.52);
-    const dockBottom = window.innerHeight + 4;
-    const dockLeft = Math.max(0, cr.left - 80);
-    const dockRight = window.innerWidth - 4;
 
     const centerInDock = (el) => {
       let r;
@@ -1148,6 +1157,29 @@ function voiceSendResolveScript(opts) {
 
     if (bandCandidates.length) {
       const res = finish(bandCandidates[0], 'dock_rightmost_composer_band');
+      if (res.ok) return res;
+    }
+
+    /** Recording UI fallback: rightmost button in bottom strip (Send = paper plane, often rightmost). */
+    const bottomStrip = clickables
+      .filter((el) => {
+        if (!visible(el) || inStickerNoise(el)) return false;
+        try {
+          const r = el.getBoundingClientRect();
+          const cy = r.top + r.height / 2;
+          if (cy < window.innerHeight - 120 || cy > window.innerHeight + 4) return false;
+          if (r.right < window.innerWidth - 150) return false;
+          if (r.width < 24 || r.width > 80 || r.height < 24 || r.height > 80) return false;
+          const label = lower(el.getAttribute('aria-label') || '') + lower(el.getAttribute('title') || '');
+          if (isDefinitelyNotSend(label, '', '')) return false;
+          return !!(el.querySelector && el.querySelector('svg'));
+        } catch {
+          return false;
+        }
+      })
+      .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+    if (bottomStrip.length) {
+      const res = finish(bottomStrip[0], 'recording_fallback_rightmost');
       if (res.ok) return res;
     }
 
