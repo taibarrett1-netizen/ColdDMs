@@ -9,7 +9,7 @@
  * Per voice note: ffmpeg writes raw PCM into the pipe (see voice-note-audio.js).
  */
 
-const { spawnSync } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -18,6 +18,54 @@ const VOICE_NOTE_PIPE_PATH = process.env.VOICE_NOTE_PIPE_PATH || '/tmp/cold-dms-
 const VOICE_USE_PIPE_SOURCE = process.env.VOICE_USE_PIPE_SOURCE !== 'false' && process.env.VOICE_USE_PIPE_SOURCE !== '0';
 
 let pipeSourceSetupDone = false;
+
+/** Background `cat /dev/zero` — holds the fifo write end open with silence so PulseAudio can load module-pipe-source (FIFO needs both ends). */
+let silenceFillerChild = null;
+
+/**
+ * Start feeding silence into the pipe (required before load-module; keep running between voice sends).
+ * Killed briefly while ffmpeg writes (see pausePipeSilenceFiller).
+ */
+function startPipeSilenceFiller(pipePath, logger) {
+  if (silenceFillerChild && !silenceFillerChild.killed) return;
+  try {
+    const safe = pipePath.replace(/'/g, "'\\''");
+    silenceFillerChild = spawn('bash', ['-c', `exec cat /dev/zero > '${safe}'`], {
+      stdio: 'ignore',
+    });
+    silenceFillerChild.on('error', (e) => {
+      if (logger) logger.warn(`[voice] silence filler spawn error: ${e.message}`);
+    });
+    silenceFillerChild.on('exit', (code, sig) => {
+      silenceFillerChild = null;
+      if (code && code !== 0 && logger) {
+        logger.warn(`[voice] silence filler exited code=${code} signal=${sig}`);
+      }
+    });
+  } catch (e) {
+    if (logger) logger.warn(`[voice] startPipeSilenceFiller: ${e.message}`);
+  }
+}
+
+function killPipeSilenceFiller() {
+  if (!silenceFillerChild) return;
+  try {
+    silenceFillerChild.kill('SIGTERM');
+  } catch {
+    /* ignore */
+  }
+  silenceFillerChild = null;
+}
+
+/** Call before ffmpeg opens the pipe for writing. */
+function pausePipeSilenceFiller() {
+  killPipeSilenceFiller();
+}
+
+/** Call after ffmpeg stops so the virtual mic keeps getting silence until the next send. */
+function resumePipeSilenceFiller(logger) {
+  startPipeSilenceFiller(VOICE_NOTE_PIPE_PATH, logger);
+}
 
 /** Build env so PulseAudio clients (pactl, Chromium) find the server. PM2 often lacks XDG_RUNTIME_DIR. */
 function pactlEnv() {
@@ -34,14 +82,17 @@ function pactlEnv() {
 
 /**
  * Find and unload PulseAudio modules by name and argument match.
- * @param {object} env - env for pactl (from pactlEnv())
+ * @param {string} pulseServer - PULSE_SERVER value for pactl
  * @param {string} moduleName - e.g. 'module-null-sink' or 'module-pipe-source'
  * @param {string} argMatch - e.g. 'sink_name=ColdDMsVoice' or 'source_name=ColdDMsVoice'
  * @returns {boolean} true if something was unloaded
  */
-function unloadPulseModuleIfPresent(env, moduleName, argMatch) {
+function unloadPulseModuleIfPresent(pulseServer, moduleName, argMatch) {
   try {
-    const list = spawnSync('pactl', ['list', 'modules'], { encoding: 'utf8', env });
+    const list = spawnSync('bash', ['-c', `PULSE_SERVER="${pulseServer}" pactl list modules`], {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
     if (list.status !== 0 || !list.stdout) return false;
     const blocks = list.stdout.split('\n\n');
     for (const block of blocks) {
@@ -54,7 +105,10 @@ function unloadPulseModuleIfPresent(env, moduleName, argMatch) {
         const indexMatch = block.match(/Module #(\d+)/);
         if (indexMatch) {
           const idx = indexMatch[1];
-          spawnSync('pactl', ['unload-module', idx], { encoding: 'utf8' });
+          spawnSync('bash', ['-c', `PULSE_SERVER="${pulseServer}" pactl unload-module ${idx}`], {
+            encoding: 'utf8',
+            timeout: 5000,
+          });
           return true;
         }
       }
@@ -104,7 +158,11 @@ function ensureVoicePipeSource(logger = null) {
   }
 
   const env = pactlEnv();
-  const testConn = spawnSync('pactl', ['info'], { encoding: 'utf8', env });
+  const pulseServer = env.PULSE_SERVER || 'unix:/run/user/0/pulse/native';
+  const testConn = spawnSync('bash', ['-c', `PULSE_SERVER="${pulseServer}" pactl info`], {
+    encoding: 'utf8',
+    timeout: 5000,
+  });
   if (testConn.status !== 0) {
     const hint =
       env.PULSE_SERVER ||
@@ -117,13 +175,13 @@ function ensureVoicePipeSource(logger = null) {
 
   try {
     // 1. Unload any old module-null-sink (ColdDMsVoice sink from previous setup)
-    const unloadedSink = unloadPulseModuleIfPresent(env, 'module-null-sink', `sink_name=${VOICE_NOTE_SOURCE_NAME}`);
+    const unloadedSink = unloadPulseModuleIfPresent(pulseServer, 'module-null-sink', `sink_name=${VOICE_NOTE_SOURCE_NAME}`);
     if (unloadedSink && logger) {
       logger.log(`[voice] Unloaded old null-sink (${VOICE_NOTE_SOURCE_NAME})`);
     }
 
     // 2. Unload any existing pipe-source so we get a clean reload
-    const unloadedSource = unloadPulseModuleIfPresent(env, 'module-pipe-source', `source_name=${VOICE_NOTE_SOURCE_NAME}`);
+    const unloadedSource = unloadPulseModuleIfPresent(pulseServer, 'module-pipe-source', `source_name=${VOICE_NOTE_SOURCE_NAME}`);
     if (unloadedSource && logger) {
       logger.log(`[voice] Unloaded old pipe-source (${VOICE_NOTE_SOURCE_NAME})`);
     }
@@ -135,22 +193,18 @@ function ensureVoicePipeSource(logger = null) {
       return { ok: false, pipePath: VOICE_NOTE_PIPE_PATH, error: err };
     }
 
+    // 3b. FIFO deadlock fix: Pulse opens read during load-module and blocks until a writer exists.
+    // Start a background writer first (silence), then pactl load-module can complete.
+    startPipeSilenceFiller(VOICE_NOTE_PIPE_PATH, logger);
+    spawnSync('sleep', ['0.25'], { encoding: 'utf8' });
+
     // 4. Load module-pipe-source (virtual mic that reads from the pipe)
-    const load = spawnSync(
-      'pactl',
-      [
-        'load-module',
-        'module-pipe-source',
-        `source_name=${VOICE_NOTE_SOURCE_NAME}`,
-        `file=${VOICE_NOTE_PIPE_PATH}`,
-        'format=s16le',
-        'rate=48000',
-        'channels=2',
-      ],
-      { encoding: 'utf8', env }
-    );
+    // Use explicit shell env to avoid PM2 spawn env issues ("Connection terminated")
+    const loadCmd = `PULSE_SERVER="${pulseServer}" pactl load-module module-pipe-source source_name=${VOICE_NOTE_SOURCE_NAME} file=${VOICE_NOTE_PIPE_PATH} format=s16le rate=48000 channels=2`;
+    const load = spawnSync('bash', ['-c', loadCmd], { encoding: 'utf8', timeout: 10000 });
 
     if (load.status !== 0) {
+      killPipeSilenceFiller();
       const err = `[voice] pactl load-module failed: ${load.stderr || load.error || 'unknown'}`;
       if (logger) logger.warn(err);
       return { ok: false, pipePath: VOICE_NOTE_PIPE_PATH, error: err };
@@ -160,9 +214,12 @@ function ensureVoicePipeSource(logger = null) {
     if (logger) logger.log(`[voice] Loaded pipe-source ${VOICE_NOTE_SOURCE_NAME} (module ${moduleIndex})`);
 
     // 5. Set as default source so Chromium's getUserMedia uses it without PULSE_SOURCE
-    const setDefault = spawnSync('pactl', ['set-default-source', VOICE_NOTE_SOURCE_NAME], {
+    const setDefault = spawnSync('bash', [
+      '-c',
+      `PULSE_SERVER="${pulseServer}" pactl set-default-source ${VOICE_NOTE_SOURCE_NAME}`,
+    ], {
       encoding: 'utf8',
-      env,
+      timeout: 5000,
     });
     if (setDefault.status !== 0 && logger) {
       logger.warn(`[voice] pactl set-default-source failed: ${setDefault.stderr || ''}`);
@@ -201,6 +258,8 @@ module.exports = {
   getVoiceNotePipePath,
   getPulseClientEnv,
   isPipeSourceReady,
+  pausePipeSilenceFiller,
+  resumePipeSilenceFiller,
   VOICE_NOTE_SOURCE_NAME,
   VOICE_NOTE_PIPE_PATH,
 };

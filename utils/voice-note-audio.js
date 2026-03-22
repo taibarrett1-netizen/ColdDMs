@@ -1,6 +1,11 @@
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
-const { getVoiceNotePipePath, isPipeSourceReady } = require('./pulse-pipe-source');
+const {
+  getVoiceNotePipePath,
+  isPipeSourceReady,
+  pausePipeSilenceFiller,
+  resumePipeSilenceFiller,
+} = require('./pulse-pipe-source');
 
 function ffmpegBin() {
   return process.env.FFMPEG_PATH || process.env.FFMPEG_BIN || 'ffmpeg';
@@ -61,6 +66,12 @@ function startVoiceNotePlayback(audioPath, _pipePathOrSink, logger, timeoutMs = 
   const durationSec = getAudioDurationSec(audioPath);
   const pipePath = getVoiceNotePipePath();
 
+  // Release silence writer so ffmpeg can open the fifo exclusively
+  pausePipeSilenceFiller();
+  spawnSync('sleep', ['0.05'], { encoding: 'utf8' });
+
+  const resumeIfNeeded = () => resumePipeSilenceFiller(logger);
+
   // ffmpeg outputs raw s16le 48kHz stereo to stdout; we stream that into the pipe
   const args = [
     '-re',
@@ -85,6 +96,7 @@ function startVoiceNotePlayback(audioPath, _pipePathOrSink, logger, timeoutMs = 
   try {
     pipeFd = fs.openSync(pipePath, 'w');
   } catch (e) {
+    resumeIfNeeded();
     throw new Error(
       `voice_note_pipe_open_failed: ${pipePath} — run on VPS with PulseAudio. pactl load-module module-pipe-source must succeed first.`
     );
@@ -96,7 +108,12 @@ function startVoiceNotePlayback(audioPath, _pipePathOrSink, logger, timeoutMs = 
       if (stderrBuf.length < 2000) stderrBuf += d.toString();
     });
   }
+  const timeout = setTimeout(() => {
+    child.kill('SIGTERM');
+  }, timeoutMs);
+  let exited = false;
   child.on('error', (err) => {
+    if (!exited) resumeIfNeeded();
     if (err && err.code === 'ENOENT') {
       if (logger) {
         logger.warn(
@@ -107,10 +124,6 @@ function startVoiceNotePlayback(audioPath, _pipePathOrSink, logger, timeoutMs = 
       logger.warn('ffmpeg spawn error: ' + (err && err.message ? err.message : String(err)));
     }
   });
-  const timeout = setTimeout(() => {
-    child.kill('SIGTERM');
-  }, timeoutMs);
-  let exited = false;
   child.on('exit', () => {
     exited = true;
     clearTimeout(timeout);
@@ -119,6 +132,7 @@ function startVoiceNotePlayback(audioPath, _pipePathOrSink, logger, timeoutMs = 
     } catch {
       /* ignore */
     }
+    resumeIfNeeded();
   });
   if (logger) logger.log(`Voice playback started (${durationSec.toFixed(1)}s) → pipe: ${audioPath}`);
   return {
