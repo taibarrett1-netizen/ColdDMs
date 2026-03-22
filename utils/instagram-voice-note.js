@@ -7,6 +7,11 @@
  */
 
 const { closeDmComposerOverlays } = require('./instagram-modals');
+const {
+  captureFollowUpScreenshot,
+  isFollowUpScreenshotsEnabled,
+  captureFollowUpScreenshotWithMarkers,
+} = require('./follow-up-screenshots');
 
 /** When not `false`, wait for thread DOM to change after Send (audio/list rows). Reduces false "sent ok". */
 const VOICE_NOTE_STRICT_VERIFY = process.env.VOICE_NOTE_STRICT_VERIFY !== 'false';
@@ -1341,6 +1346,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     /** When set, durationSec is used for hold (Chrome fake mic plays file automatically). */
     voiceSource = null,
   } = opts;
+  const shotMeta = { correlationId, logger };
 
   if (!voiceSource && (holdMsOpt == null || holdMsOpt < 400)) {
     return { ok: false, reason: 'voice_note_failed' };
@@ -1476,6 +1482,11 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         return { ok: false, reason: 'voice_recording_ui_not_detected' };
       }
 
+      if (isFollowUpScreenshotsEnabled()) {
+        await delay(220);
+        await captureFollowUpScreenshot(page, 'voice-after-mic-click', shotMeta);
+      }
+
       if (logger) {
         const trimNote =
           voiceSource && voiceSource.durationSec != null
@@ -1499,6 +1510,10 @@ async function sendVoiceNoteInThread(page, opts = {}) {
       await page.mouse.down();
       await delay(effectiveHoldMs);
       await page.mouse.up();
+      if (isFollowUpScreenshotsEnabled()) {
+        await delay(300);
+        await captureFollowUpScreenshot(page, 'voice-after-mic-click', shotMeta);
+      }
     }
 
     await micEl.dispose().catch(() => {});
@@ -1506,6 +1521,26 @@ async function sendVoiceNoteInThread(page, opts = {}) {
 
     /** Do NOT send Escape here — it dismisses Instagram's voice recording UI before Send. */
     await delay(1200);
+
+    const previewSend = voiceSendTargetPreviewScript();
+    if (isFollowUpScreenshotsEnabled()) {
+      await delay(280);
+      const preview = await page.evaluate(previewSend).catch(() => null);
+      const vp = page.viewport() || { width: 1280, height: 800 };
+      const sx = preview && preview.ok && Number.isFinite(preview.x) ? preview.x : vp.width - 36;
+      const sy = preview && preview.ok && Number.isFinite(preview.y) ? preview.y : vp.height - 36;
+      if (logger && preview?.via) {
+        logger.log(`Voice: Send target (${preview.via}) at (${Math.round(sx)}, ${Math.round(sy)})`);
+      } else if (logger && preview?.why) {
+        logger.warn(`Voice: Send coords unresolved (${preview.why}) — using corner fallback`);
+      }
+      await captureFollowUpScreenshotWithMarkers(
+        page,
+        [{ x: sx, y: sy, label: 'Send target — Puppeteer will click here' }],
+        'voice-send-target',
+        shotMeta
+      );
+    }
 
     const clickSend = clickSendAfterRecordingScript();
     const previewOnly = voiceSendTargetPreviewScript();
@@ -1579,6 +1614,9 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     if (strictVerify) {
       const verified = await waitForVoiceDeliveredInThread(page, metricsBefore, { logger });
       if (!verified) {
+        if (isFollowUpScreenshotsEnabled()) {
+          await captureFollowUpScreenshot(page, 'voice-after-send-verify-failed', shotMeta);
+        }
         return { ok: false, reason: 'voice_not_confirmed_in_thread' };
       }
     } else if (logger) {
@@ -1586,6 +1624,9 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     }
 
     await delay(400);
+    if (isFollowUpScreenshotsEnabled()) {
+      await captureFollowUpScreenshot(page, 'voice-after-send', shotMeta);
+    }
     return { ok: true };
   } finally {
     /* no cleanup needed with Chrome fake mic */
