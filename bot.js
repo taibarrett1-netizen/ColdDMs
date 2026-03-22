@@ -17,6 +17,7 @@ const {
 } = require('./utils/mobile-viewport');
 const { substituteVariables, normalizeName } = require('./utils/message-variables');
 const { isFfmpegAvailable } = require('./utils/voice-note-audio');
+const { ensureVoicePipeSource } = require('./utils/pulse-pipe-source');
 const {
   sendVoiceNoteInThread,
   prepareVoiceNoteUi,
@@ -78,50 +79,21 @@ function applyPuppeteerSlowMo(launchOpts) {
 }
 
 /**
- * Headless: without a capture device getUserMedia fails → Instagram never shows recording during mic gestures.
- * Defaults (no env spam):
- * - Pulse capture source defaults to `${VOICE_NOTE_SINK}.monitor` (ffmpeg plays into the sink; Chrome captures the monitor).
- * - With that default set, we do NOT add `--use-fake-device-for-media-stream` so the recording UI + real audio align.
- * Local dev without Pulse: set VOICE_SKIP_PULSE_SOURCE=1 (restores headless fake device) or CHROMIUM_USE_FAKE_MEDIA_DEVICE=true.
+ * Voice notes: we use PulseAudio module-pipe-source (see utils/pulse-pipe-source.js).
+ * The pipe-source is a virtual mic that exists from startup; getUserMedia sees it immediately.
+ * No PULSE_SOURCE needed — we set it as default source. Do NOT add --use-fake-device-for-media-stream.
  */
-function voicePulseDefaultsDisabled() {
-  const v = process.env.VOICE_SKIP_PULSE_SOURCE;
-  return v === '1' || v === 'true' || v === 'yes';
-}
-
-const VOICE_NOTE_SINK = (process.env.VOICE_NOTE_SINK || 'ColdDMsVoice').trim();
-const VOICE_NOTE_PULSE_SOURCE_OVERRIDE = (process.env.VOICE_NOTE_PULSE_SOURCE || '').trim();
-
-/** Pulse source Chromium should capture (typically monitor of the sink ffmpeg writes to). */
-function getEffectiveVoicePulseSource() {
-  if (voicePulseDefaultsDisabled()) return '';
-  if (VOICE_NOTE_PULSE_SOURCE_OVERRIDE) return VOICE_NOTE_PULSE_SOURCE_OVERRIDE;
-  return `${VOICE_NOTE_SINK}.monitor`;
-}
-
-function buildBrowserEnvWithPulse() {
-  const src = getEffectiveVoicePulseSource();
-  if (!src) return undefined;
-  return { ...process.env, PULSE_SOURCE: src };
-}
+const VOICE_NOTE_SOURCE_NAME = (process.env.VOICE_NOTE_SOURCE_NAME || 'ColdDMsVoice').trim();
 
 function appendOptionalFakeMediaDeviceArg(args) {
   if (!Array.isArray(args)) return;
   if (args.some((a) => a === '--use-fake-device-for-media-stream')) return;
-  const explicitFalse =
-    process.env.CHROMIUM_USE_FAKE_MEDIA_DEVICE === 'false' ||
-    process.env.CHROMIUM_USE_FAKE_MEDIA_DEVICE === '0';
+  // Pipe-source provides a real virtual mic; never add fake device (per requirements).
+  // Explicit override only if user really needs it (e.g. local dev without Pulse).
   const explicitTrue =
     process.env.CHROMIUM_USE_FAKE_MEDIA_DEVICE === '1' ||
     process.env.CHROMIUM_USE_FAKE_MEDIA_DEVICE === 'true';
-  const headless = process.env.HEADLESS_MODE !== 'false';
-  const hasPulseSource = !!getEffectiveVoicePulseSource();
-  let useFake;
-  if (explicitTrue) useFake = true;
-  else if (explicitFalse) useFake = false;
-  else if (hasPulseSource) useFake = false;
-  else useFake = headless;
-  if (useFake) args.push('--use-fake-device-for-media-stream');
+  if (explicitTrue) args.push('--use-fake-device-for-media-stream');
 }
 const BROWSER_PROFILE_DIR = path.join(process.cwd(), '.browser-profile');
 const VOICE_NOTE_FILE = (process.env.VOICE_NOTE_FILE || '').trim();
@@ -823,7 +795,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       }
       const voiceResult = await sendVoiceNoteInThread(page, {
         logger,
-        voiceSource: { path: resolved.localPath, sink: VOICE_NOTE_SINK },
+        voiceSource: { path: resolved.localPath, sink: VOICE_NOTE_SOURCE_NAME },
       });
       if (!voiceResult.ok) {
         voiceFailure = voiceResult.reason || 'voice_note_failed';
@@ -932,6 +904,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 }
 
 function buildFollowUpLaunchOptions() {
+  // Ensure pipe-source is ready before any browser launch (once per process).
+  ensureVoicePipeSource(logger);
   const opts = {
     headless: HEADLESS,
     args: [
@@ -942,8 +916,6 @@ function buildFollowUpLaunchOptions() {
       '--autoplay-policy=no-user-gesture-required',
     ],
   };
-  const pulseEnv = buildBrowserEnvWithPulse();
-  if (pulseEnv) opts.env = pulseEnv;
   appendOptionalFakeMediaDeviceArg(opts.args);
   applyPuppeteerSlowMo(opts);
   applyHeadedChromeWindowToLaunchOpts(opts);
@@ -1235,7 +1207,7 @@ async function sendFollowUp(body) {
       const voiceResult = await sendVoiceNoteInThread(page, {
         logger,
         correlationId,
-        voiceSource: { path: resolved.localPath, sink: VOICE_NOTE_SINK },
+        voiceSource: { path: resolved.localPath, sink: VOICE_NOTE_SOURCE_NAME },
       });
       if (!voiceResult.ok) {
         return fail(followUpReasonToError(voiceResult.reason || 'voice_note_failed'), 400);
@@ -1420,10 +1392,7 @@ async function runBotMultiTenant() {
     ],
   };
   appendOptionalFakeMediaDeviceArg(launchOpts.args);
-  {
-    const pulseEnv = buildBrowserEnvWithPulse();
-    if (pulseEnv) launchOpts.env = pulseEnv;
-  }
+  ensureVoicePipeSource(logger);
   applyPuppeteerSlowMo(launchOpts);
   applyHeadedChromeWindowToLaunchOpts(launchOpts);
   if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
@@ -1636,10 +1605,7 @@ async function runBot() {
     ],
   };
   appendOptionalFakeMediaDeviceArg(launchOpts.args);
-  {
-    const pulseEnv = buildBrowserEnvWithPulse();
-    if (pulseEnv) launchOpts.env = pulseEnv;
-  }
+  ensureVoicePipeSource(logger);
   applyPuppeteerSlowMo(launchOpts);
   applyHeadedChromeWindowToLaunchOpts(launchOpts);
   if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
@@ -1777,10 +1743,7 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
       '--autoplay-policy=no-user-gesture-required',
     ],
   };
-  {
-    const pulseEnv = buildBrowserEnvWithPulse();
-    if (pulseEnv) connectLaunch.env = pulseEnv;
-  }
+  ensureVoicePipeSource(logger);
   appendOptionalFakeMediaDeviceArg(connectLaunch.args);
   applyPuppeteerSlowMo(connectLaunch);
   const browser = await puppeteer.launch(connectLaunch);

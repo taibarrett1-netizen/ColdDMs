@@ -95,10 +95,10 @@
         <option value="after_text">Send text then voice note</option>
         <option value="voice_only">Voice note only</option>
       </select>
-      <label>Pulse sink name</label>
-      <input type="text" id="env-voice-note-sink" placeholder="ColdDMsVoice">
-      <label>Pulse source (optional)</label>
-      <input type="text" id="env-voice-note-source" placeholder="optional — defaults to &lt;sink&gt;.monitor">
+      <label>Pipe source name</label>
+      <input type="text" id="env-voice-note-source-name" placeholder="ColdDMsVoice">
+      <label>Pipe path</label>
+      <input type="text" id="env-voice-note-pipe-path" placeholder="/tmp/cold-dms-voice.pipe">
       <label>Upload a voice note to VPS</label>
       <input type="file" id="voice-file" accept=".wav,.mp3,.m4a,.ogg,.webm,audio/*">
       <button id="btn-upload-voice">Upload voice note</button>
@@ -257,8 +257,8 @@
         document.getElementById('env-headless').value = (d.HEADLESS_MODE || 'true') === 'true' ? 'true' : 'false';
         document.getElementById('env-voice-note-file').value = d.VOICE_NOTE_FILE || '';
         document.getElementById('env-voice-note-mode').value = d.VOICE_NOTE_MODE || 'after_text';
-        document.getElementById('env-voice-note-sink').value = d.VOICE_NOTE_SINK || 'ColdDMsVoice';
-        document.getElementById('env-voice-note-source').value = d.VOICE_NOTE_PULSE_SOURCE || '';
+        document.getElementById('env-voice-note-source-name').value = d.VOICE_NOTE_SOURCE_NAME || 'ColdDMsVoice';
+        document.getElementById('env-voice-note-pipe-path').value = d.VOICE_NOTE_PIPE_PATH || '/tmp/cold-dms-voice.pipe';
       });
       fetch('/api/messages').then(r => r.json()).then(d => {
         document.getElementById('messages-list').value = (d.messages || []).join('\n');
@@ -275,8 +275,8 @@
         HEADLESS_MODE: document.getElementById('env-headless').value,
         VOICE_NOTE_FILE: document.getElementById('env-voice-note-file').value.trim(),
         VOICE_NOTE_MODE: document.getElementById('env-voice-note-mode').value,
-        VOICE_NOTE_SINK: document.getElementById('env-voice-note-sink').value.trim(),
-        VOICE_NOTE_PULSE_SOURCE: document.getElementById('env-voice-note-source').value.trim(),
+        VOICE_NOTE_SOURCE_NAME: document.getElementById('env-voice-note-source-name').value.trim(),
+        VOICE_NOTE_PIPE_PATH: document.getElementById('env-voice-note-pipe-path').value.trim(),
       };
       if (payload.INSTAGRAM_PASSWORD === '********') delete payload.INSTAGRAM_PASSWORD;
       fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })

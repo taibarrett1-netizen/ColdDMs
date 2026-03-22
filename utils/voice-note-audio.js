@@ -1,5 +1,6 @@
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
+const { getVoiceNotePipePath } = require('./pulse-pipe-source');
 
 function ffmpegBin() {
   return process.env.FFMPEG_PATH || process.env.FFMPEG_BIN || 'ffmpeg';
@@ -9,7 +10,7 @@ function ffprobeBin() {
   return process.env.FFPROBE_PATH || process.env.FFPROBE_BIN || 'ffprobe';
 }
 
-/** True if ffmpeg + ffprobe are on PATH (or FFMPEG_PATH / FFPROBE_PATH). Required for voice-note playback to PulseAudio. */
+/** True if ffmpeg + ffprobe are on PATH (or FFMPEG_PATH / FFPROBE_PATH). Required for voice-note pipe feeding. */
 function isFfmpegAvailable() {
   try {
     const a = spawnSync(ffmpegBin(), ['-hide_banner', '-version'], { encoding: 'utf8' });
@@ -41,10 +42,21 @@ function getAudioDurationSec(audioPath) {
   return Math.min(Math.max(value, 1), 60);
 }
 
-function startVoiceNotePlayback(audioPath, sinkName, logger, timeoutMs = 90000) {
+/**
+ * Start ffmpeg feeding the voice-note audio file into the pipe-source.
+ *
+ * CHANGED: No longer uses Pulse sink (-f pulse). Now writes raw s16le 48kHz stereo
+ * to the named pipe that module-pipe-source reads. This matches the pipe-source
+ * format (s16le rate=48000 channels=2). The second arg (pipePathOrSink) is kept
+ * for API compatibility but ignored — we always use getVoiceNotePipePath().
+ */
+function startVoiceNotePlayback(audioPath, _pipePathOrSink, logger, timeoutMs = 90000) {
   if (!audioPath) throw new Error('voice_note_path_missing');
   if (!fs.existsSync(audioPath)) throw new Error('voice_note_file_not_found');
   const durationSec = getAudioDurationSec(audioPath);
+  const pipePath = getVoiceNotePipePath();
+
+  // ffmpeg outputs raw s16le 48kHz stereo to stdout; we stream that into the pipe
   const args = [
     '-re',
     '-stream_loop',
@@ -53,15 +65,17 @@ function startVoiceNotePlayback(audioPath, sinkName, logger, timeoutMs = 90000) 
     audioPath,
     '-vn',
     '-ac',
-    '1',
+    '2',
     '-ar',
     '48000',
     '-f',
-    'pulse',
-    sinkName,
+    's16le',
+    '-',
   ];
+
   const bin = ffmpegBin();
-  const child = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+  const pipeWriteStream = fs.createWriteStream(pipePath);
+  const child = spawn(bin, args, { stdio: ['ignore', pipeWriteStream, 'pipe'] });
   let stderrBuf = '';
   if (child.stderr) {
     child.stderr.on('data', (d) => {
@@ -86,8 +100,9 @@ function startVoiceNotePlayback(audioPath, sinkName, logger, timeoutMs = 90000) 
   child.on('exit', () => {
     exited = true;
     clearTimeout(timeout);
+    pipeWriteStream.end().catch(() => {});
   });
-  if (logger) logger.log(`Voice playback started (${durationSec.toFixed(1)}s): ${audioPath}`);
+  if (logger) logger.log(`Voice playback started (${durationSec.toFixed(1)}s) → pipe: ${audioPath}`);
   return {
     durationSec,
     stop: () => {

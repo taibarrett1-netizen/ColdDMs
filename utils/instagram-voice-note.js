@@ -45,6 +45,12 @@ const VOICE_RECORDING_UI_TIMEOUT_MS = Math.min(
   45000
 );
 
+/** With pipe-source: start ffmpeg feeding the pipe before clicking mic; give it this head-start (ms) so audio flows when recording starts. */
+const VOICE_FFMPEG_HEAD_START_MS = Math.min(
+  Math.max(parseInt(process.env.VOICE_FFMPEG_HEAD_START_MS, 10) || 350, 200),
+  500
+);
+
 /** Puppeteer removed `page.waitForTimeout`; use this instead. */
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -1224,6 +1230,18 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     let effectiveHoldMs = holdMsOpt || 7000;
 
     if (desktopFlow) {
+      // Pipe-source: start ffmpeg feeding the pipe BEFORE mic click so audio flows when recording starts.
+      // The virtual mic exists from startup; getUserMedia already sees it. Clicking mic starts recording immediately.
+      if (voiceSource) {
+        internalPlayback = startVoiceNotePlayback(
+          voiceSource.path,
+          voiceSource.sink || 'ColdDMsVoice',
+          logger
+        );
+        effectiveHoldMs = Math.round(internalPlayback.durationSec * 1000 + 700);
+      }
+      await delay(VOICE_FFMPEG_HEAD_START_MS);
+
       if (logger) {
         logger.log(
           'Voice (desktop): mic target screenshot → focus composer → try click methods (with composer-scoped recording check between each)'
@@ -1319,15 +1337,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         await captureFollowUpScreenshot(page, 'voice-recording-ui-just-confirmed', shotMeta);
       }
 
-      if (voiceSource) {
-        internalPlayback = startVoiceNotePlayback(
-          voiceSource.path,
-          voiceSource.sink || 'ColdDMsVoice',
-          logger
-        );
-        effectiveHoldMs = Math.round(internalPlayback.durationSec * 1000 + 700);
-      }
-
+      // ffmpeg already started before mic click (pipe-source flow)
       if (logger) logger.log(`Voice (desktop): hold recording ~${Math.round(effectiveHoldMs)} ms, then send`);
       await delay(afterShotMs);
       if (isFollowUpScreenshotsEnabled()) {
@@ -1349,6 +1359,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         await delay(remainingHold);
       }
     } else {
+      // Mobile: same pipe-source flow — start ffmpeg before press-and-hold
       if (voiceSource) {
         internalPlayback = startVoiceNotePlayback(
           voiceSource.path,
@@ -1357,6 +1368,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         );
         effectiveHoldMs = Math.round(internalPlayback.durationSec * 1000 + 700);
       }
+      await delay(VOICE_FFMPEG_HEAD_START_MS);
       if (logger) logger.log(`Voice (mobile web): press-and-hold ${Math.round(effectiveHoldMs)} ms`);
       if (isFollowUpScreenshotsEnabled()) {
         await captureFollowUpScreenshotWithMarkers(
@@ -1373,7 +1385,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     }
 
     /**
-     * Stop ffmpeg → Pulse **before** clicking Send. Leaving the stream running made the “recording”
+     * Stop ffmpeg (pipe feeding) **before** clicking Send. Leaving the stream running made the “recording”
      * session ambiguous and matched mis-clicks (e.g. heart) that never queued a voice message.
      */
     if (internalPlayback) {
