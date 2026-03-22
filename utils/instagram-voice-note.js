@@ -1374,13 +1374,14 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     const cx = box.x + box.width / 2;
     const cy = box.y + box.height / 2;
 
-    const afterShotMs = 600;
+    /** Delay after recording UI confirmed before we count "hold" — lets IG actually start capturing. */
+    const afterShotMs = 500;
     let effectiveHoldMs = holdMsOpt || 7000;
 
     if (desktopFlow) {
       // NEW: Chrome fake mic — audio file is loaded via --use-file-for-fake-audio-capture; no ffmpeg needed.
       if (voiceSource && voiceSource.durationSec != null) {
-        effectiveHoldMs = Math.round(voiceSource.durationSec * 1000 + 700);
+        effectiveHoldMs = Math.round(voiceSource.durationSec * 1000 + 150);
       }
 
       if (logger) {
@@ -1469,7 +1470,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     } else {
       // Mobile: Chrome fake mic — use durationSec for hold
       if (voiceSource && voiceSource.durationSec != null) {
-        effectiveHoldMs = Math.round(voiceSource.durationSec * 1000 + 700);
+        effectiveHoldMs = Math.round(voiceSource.durationSec * 1000 + 150);
       }
       if (logger) logger.log(`Voice (mobile web): press-and-hold ${Math.round(effectiveHoldMs)} ms`);
       await page.mouse.move(cx, cy);
