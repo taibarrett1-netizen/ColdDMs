@@ -45,17 +45,21 @@ const VOICE_FFMPEG_HEAD_START_MS = Math.min(
 );
 
 /**
- * Chrome fake mic loops the WAV; we pad silence in `convertToChromeFakeMicWav` so the loop is inaudible.
- * `durationSec` is the full padded file length — hold for that plus this jitter (timer / UI slack).
- * Optional: `VOICE_FAKE_MIC_LOOP_TRIM_MS` subtracts ms if you disable padding and need the old behavior.
+ * Chrome fake mic loops the WAV; padding is in `convertToChromeFakeMicWav`.
+ * Playback starts at mic click; desktop hold is measured from after recording UI — subtract `LAG` so
+ * wall time (mic→send) ≈ padded file length (avoids long tail silence + clip looping).
  */
+const VOICE_FAKE_MIC_RECORDING_LAG_MS = Math.min(
+  4000,
+  Math.max(0, parseInt(process.env.VOICE_FAKE_MIC_RECORDING_LAG_MS, 10) || 680)
+);
 const VOICE_FAKE_MIC_HOLD_JITTER_MS = Math.min(
   2000,
-  Math.max(0, parseInt(process.env.VOICE_FAKE_MIC_HOLD_JITTER_MS, 10) || 200)
+  Math.max(0, parseInt(process.env.VOICE_FAKE_MIC_HOLD_JITTER_MS, 10) || 80)
 );
 const VOICE_FAKE_MIC_LOOP_TRIM_MS = Math.min(
   8000,
-  Math.max(0, parseInt(process.env.VOICE_FAKE_MIC_LOOP_TRIM_MS, 10) || 0)
+  Math.max(0, parseInt(process.env.VOICE_FAKE_MIC_LOOP_TRIM_MS, 10) || 180)
 );
 
 /** Puppeteer removed `page.waitForTimeout`; use this instead. */
@@ -1384,14 +1388,17 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     const cy = box.y + box.height / 2;
 
     /** Delay after recording UI confirmed before we count "hold" — lets IG actually start capturing. */
-    const afterShotMs = 500;
+    const afterShotMs = 400;
     let effectiveHoldMs = holdMsOpt || 7000;
 
     if (desktopFlow) {
       // NEW: Chrome fake mic — audio file is loaded via --use-file-for-fake-audio-capture; no ffmpeg needed.
       if (voiceSource && voiceSource.durationSec != null) {
         effectiveHoldMs = Math.round(
-          voiceSource.durationSec * 1000 + VOICE_FAKE_MIC_HOLD_JITTER_MS - VOICE_FAKE_MIC_LOOP_TRIM_MS
+          voiceSource.durationSec * 1000 -
+            VOICE_FAKE_MIC_RECORDING_LAG_MS +
+            VOICE_FAKE_MIC_HOLD_JITTER_MS -
+            VOICE_FAKE_MIC_LOOP_TRIM_MS
         );
         effectiveHoldMs = Math.max(1500, effectiveHoldMs);
       }
@@ -1472,7 +1479,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
       if (logger) {
         const trimNote =
           voiceSource && voiceSource.durationSec != null
-            ? ` (jitter=${VOICE_FAKE_MIC_HOLD_JITTER_MS}ms${VOICE_FAKE_MIC_LOOP_TRIM_MS ? ` loopTrim=${VOICE_FAKE_MIC_LOOP_TRIM_MS}ms` : ''})`
+            ? ` (lag=${VOICE_FAKE_MIC_RECORDING_LAG_MS}ms jitter=${VOICE_FAKE_MIC_HOLD_JITTER_MS}ms trim=${VOICE_FAKE_MIC_LOOP_TRIM_MS}ms)`
             : '';
         logger.log(`Voice (desktop): hold recording ~${Math.round(effectiveHoldMs)} ms, then send${trimNote}`);
       }

@@ -28,14 +28,16 @@ function isFfmpegAvailable() {
 
 /**
  * Leading / trailing silence (seconds) so the fake-mic loop hits silence, not speech.
- * Set `VOICE_FAKE_MIC_PAD_START_SEC=0` / `..._END_SEC=0` to disable that side (still defaults 0.5 if unset).
+ * Defaults: short lead-in (~0.12s) so the message starts quicker; modest tail (~0.22s) before loop.
+ * Set `VOICE_FAKE_MIC_PAD_START_SEC` / `VOICE_FAKE_MIC_PAD_END_SEC` to override (use `0` to disable that side).
  */
 function getChromeFakeMicPadSec() {
   const start = parseFloat(process.env.VOICE_FAKE_MIC_PAD_START_SEC);
   const end = parseFloat(process.env.VOICE_FAKE_MIC_PAD_END_SEC);
-  const def = 0.5;
-  const padStart = Number.isFinite(start) && start >= 0 ? Math.min(start, 5) : def;
-  const padEnd = Number.isFinite(end) && end >= 0 ? Math.min(end, 5) : def;
+  const defStart = 0.12;
+  const defEnd = 0.22;
+  const padStart = Number.isFinite(start) && start >= 0 ? Math.min(start, 5) : defStart;
+  const padEnd = Number.isFinite(end) && end >= 0 ? Math.min(end, 5) : defEnd;
   return { padStart, padEnd };
 }
 
