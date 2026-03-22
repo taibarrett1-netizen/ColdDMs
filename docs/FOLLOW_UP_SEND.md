@@ -12,6 +12,20 @@ SkeduleMore **follow-ups** are triggered by the dashboard when a scheduled follo
 
 **Strict modes:** exactly one of `text`, non-empty `messages[]`, or `audioUrl` (see table below). Implemented in `server.js` (`/api/follow-up/send`) and `sendFollowUp` in `bot.js`.
 
+### Success response (Instagram message ids)
+
+On **`200`** with **`ok: true`**, the body may include ids for dashboard storage / webhook dedupe (parsed from Instagram web GraphQL responses when available):
+
+| Scenario | JSON fields |
+|----------|-------------|
+| Single `text`, or `audioUrl` without `caption`, or one bubble | `instagram_message_id` and `instagramMessageId` (same string) |
+| `messages[]` (multi-line) | `instagram_message_ids` and `instagramMessageIds` — same order as each line sent |
+| `audioUrl` + `caption` | `instagram_message_ids` / `instagramMessageIds`: `[captionBubbleId, voiceBubbleId]` (entries may be `null` if not captured) |
+
+If the worker cannot observe an id (IG changed, filtered network, etc.), the response is still **`{ "ok": true }`** with no id fields.
+
+Optional: **`FOLLOW_UP_MESSAGE_ID_DEBUG=1`** — logs when ids are extracted from network responses.
+
 ## Voice notes (follow-ups) — intended behaviour
 
 Instagram **Web** does not expose a reliable “upload this `.wav` as a voice note” API for automation. The worker therefore uses this **single pipeline**:

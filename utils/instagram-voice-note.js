@@ -1349,6 +1349,8 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     strictVerify = VOICE_NOTE_STRICT_VERIFY,
     /** When set, durationSec is used for hold (Chrome fake mic plays file automatically). */
     voiceSource = null,
+    /** From `attachInstagramSendIdCapture` — capture GraphQL item_id after Send. */
+    idCapture = null,
   } = opts;
   const shotMeta = { correlationId, logger };
 
@@ -1548,6 +1550,8 @@ async function sendVoiceNoteInThread(page, opts = {}) {
 
     const clickSend = clickSendAfterRecordingScript();
     const previewOnly = voiceSendTargetPreviewScript();
+    /** Timestamp for last Send click — used with idCapture (GraphQL item_id). */
+    let voiceSendT0 = Date.now();
     let sendResult = await clickVoiceSendWithPuppeteerElement(page, logger);
     if (!sendResult || !sendResult.ok) {
       sendResult = null;
@@ -1559,6 +1563,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
           try {
             await page.mouse.move(nx, ny);
             await delay(90);
+            voiceSendT0 = Date.now();
             await page.mouse.click(nx, ny, { delay: 55 });
             sendResult = {
               ok: true,
@@ -1576,6 +1581,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
             if (logger) logger.warn(`Voice: Puppeteer Send click failed (${e.message}); falling back to DOM click`);
           }
         }
+        voiceSendT0 = Date.now();
         sendResult = await page.evaluate(clickSend).catch(() => ({ ok: false, why: 'eval_error' }));
         if (sendResult && sendResult.ok) break;
         await delay(450);
@@ -1589,6 +1595,7 @@ async function sendVoiceNoteInThread(page, opts = {}) {
         try {
           await page.mouse.move(bx, by);
           await delay(80);
+          voiceSendT0 = Date.now();
           await page.mouse.click(bx, by, { delay: 55 });
           sendResult = { ok: true, via: 'viewport_blind_corner', label: '' };
           if (logger) logger.log(`Voice: Send blind click at viewport corner (${bx},${by})`);
@@ -1631,7 +1638,17 @@ async function sendVoiceNoteInThread(page, opts = {}) {
     if (isFollowUpScreenshotsEnabled()) {
       await captureFollowUpScreenshot(page, 'voice-after-send', shotMeta);
     }
-    return { ok: true };
+    let instagramMessageId;
+    if (idCapture && typeof idCapture.waitForOneIdAfter === 'function') {
+      try {
+        instagramMessageId = await idCapture.waitForOneIdAfter(voiceSendT0, { timeoutMs: 15000 });
+      } catch {
+        /* optional */
+      }
+    }
+    const out = { ok: true };
+    if (instagramMessageId) out.instagramMessageId = instagramMessageId;
+    return out;
   } finally {
     /* no cleanup needed with Chrome fake mic */
   }

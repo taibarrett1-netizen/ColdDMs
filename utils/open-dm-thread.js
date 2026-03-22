@@ -235,10 +235,13 @@ async function navigateToDmThread(page, u) {
 
 /**
  * Send one plain text message in the current thread (compose must be visible).
+ * @param {{ idCapture?: { waitForOneIdAfter: (sinceMs: number, opts?: object) => Promise<string | null> } }} [options]
+ *   When `idCapture` is from `attachInstagramSendIdCapture`, successful sends may include `instagramMessageId` (GraphQL item_id).
  */
-async function sendPlainTextInThread(page, text) {
+async function sendPlainTextInThread(page, text, options = {}) {
   const msg = String(text || '').trim();
   if (!msg) return { ok: false, reason: 'empty_message' };
+  const idCapture = options.idCapture;
 
   const composeEl = await page.evaluateHandle(() => {
     const byPlaceholder = (el) => {
@@ -268,9 +271,20 @@ async function sendPlainTextInThread(page, text) {
   await compose.dispose();
   await composeEl.dispose();
   await humanDelay();
+  const sendT0 = Date.now();
   await page.keyboard.press('Enter');
   await delay(1500);
-  return { ok: true };
+  let instagramMessageId;
+  if (idCapture && typeof idCapture.waitForOneIdAfter === 'function') {
+    try {
+      instagramMessageId = await idCapture.waitForOneIdAfter(sendT0, { timeoutMs: 12000 });
+    } catch {
+      /* optional */
+    }
+  }
+  const out = { ok: true };
+  if (instagramMessageId) out.instagramMessageId = instagramMessageId;
+  return out;
 }
 
 module.exports = { navigateToDmThread, sendPlainTextInThread, delay, humanDelay };

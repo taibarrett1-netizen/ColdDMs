@@ -207,6 +207,7 @@ const ENV_KEYS = [
   'FOLLOW_UP_DEBUG_BROWSER_MS',
   'FOLLOW_UP_DEBUG_SCREENSHOTS',
   'FOLLOW_UP_SCREENSHOTS_FULL_PAGE',
+  'FOLLOW_UP_MESSAGE_ID_DEBUG',
   'VOICE_POST_SEND_BROWSER_WAIT_MS',
 ];
 
@@ -338,10 +339,25 @@ app.post('/api/follow-up/send', async (req, res) => {
     const payload = correlationId ? { ...body, correlationId } : body;
     const result = await sendFollowUp(payload);
     if (result.ok) {
+      const hasIds =
+        !!result.instagram_message_id ||
+        (Array.isArray(result.instagram_message_ids) && result.instagram_message_ids.some((x) => x != null));
+      const idPart = hasIds
+        ? ` instagram_message_id=${result.instagram_message_id || '-'} instagram_message_ids=${result.instagram_message_ids ? JSON.stringify(result.instagram_message_ids) : '-'}`
+        : '';
       logger.log(
-        `[API] follow-up/send response ok=true clientId=${cid || '-'} recipient=@${recip || '-'}${corrPart}`
+        `[API] follow-up/send response ok=true clientId=${cid || '-'} recipient=@${recip || '-'}${corrPart}${idPart}`
       );
-      return res.json({ ok: true });
+      const body = { ok: true };
+      if (result.instagram_message_id) {
+        body.instagram_message_id = result.instagram_message_id;
+        body.instagramMessageId = result.instagramMessageId ?? result.instagram_message_id;
+      }
+      if (result.instagram_message_ids && result.instagram_message_ids.length > 0) {
+        body.instagram_message_ids = result.instagram_message_ids;
+        body.instagramMessageIds = result.instagramMessageIds ?? result.instagram_message_ids;
+      }
+      return res.json(body);
     }
     const status = result.statusCode && result.statusCode >= 400 && result.statusCode < 600 ? result.statusCode : 400;
     logger.warn(

@@ -253,6 +253,15 @@ Filter **during** the scrape before inserting into `cold_dm_leads` so lead group
 5. **After send:** Update `cold_dm_campaign_leads` to `sent`/`failed` and `sent_at`; insert `cold_dm_sent_messages` with `campaign_id`, `message_group_id`, **`message_group_message_id`** (the id of the specific message row that was sent); update `cold_dm_daily_stats`. Then call the **cold-dm-on-send** Edge Function (§2a) with `client_id`, `instagram_thread_id`, `username`, and `message_text` so the dashboard creates the conversation with tag `cold-outreach`. GHL will auto-create the contact; add a **Contact Created** trigger in GHL to the same ghl-inbound-webhook URL (§2b) so the contact is linked by name + time.
 6. **Campaign completed:** When a campaign has no remaining pending leads, set `cold_dm_campaigns.status = 'completed'` and set `cold_dm_control.pause = 1` for that campaign's `client_id` so the client stops. The worker keeps running and will simply not pick that client again until the user hits Start.
 
+### 8a. Follow-up send — Instagram message ids (`POST /api/follow-up/send`)
+
+The dashboard stores **`instagram_message_id`** (single bubble) or **`instagram_message_ids`** (multi-line `messages[]`, or caption + voice) so webhook echo handling can dedupe. The VPS should return these when the stack can observe the real **thread item id** (same family as Graph / webhooks).
+
+- **Single text, single voice (no caption), or one-line smart:** `{ "ok": true, "instagram_message_id": "<id>", "instagramMessageId": "<id>" }` (camelCase duplicated for clients that expect it).
+- **Multi-line `messages[]` or caption + voice:** `{ "ok": true, "instagram_message_ids": ["...", ...], "instagramMessageIds": [...] }` — same order as bubbles sent (`messages[]` order; caption then voice when both are sent).
+
+**Implementation (this repo):** `utils/instagram-dm-network-ids.js` listens for Instagram web **GraphQL / direct** responses after send and deep-collects `item_id` / `client_item_id`. If IG changes shapes or filters miss the mutation, ids may be omitted — the send still succeeds with `{ "ok": true }`. Set **`FOLLOW_UP_MESSAGE_ID_DEBUG=1`** for extra logs.
+
 ---
 
 ## 9. Optional: warm behaviour

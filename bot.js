@@ -26,6 +26,7 @@ const {
 } = require('./utils/instagram-voice-note');
 const { dismissInstagramHomeModals } = require('./utils/instagram-modals');
 const { navigateToDmThread, sendPlainTextInThread } = require('./utils/open-dm-thread');
+const { attachInstagramSendIdCapture } = require('./utils/instagram-dm-network-ids');
 puppeteer.use(StealthPlugin());
 
 const DAILY_LIMIT = Math.min(parseInt(process.env.DAILY_SEND_LIMIT, 10) || 100, 200);
@@ -1071,6 +1072,20 @@ function logFollowUpFailure(clientId, instagramSessionId, recipientUsername, err
   return { ok: false, error, statusCode };
 }
 
+/** Success payload for dashboard webhook dedupe (GraphQL `item_id` when captured). */
+function followUpOkWithInstagramIds(payload) {
+  const out = { ok: true };
+  if (payload.instagram_message_id) {
+    out.instagram_message_id = payload.instagram_message_id;
+    out.instagramMessageId = payload.instagram_message_id;
+  }
+  if (payload.instagram_message_ids && payload.instagram_message_ids.length > 0) {
+    out.instagram_message_ids = payload.instagram_message_ids;
+    out.instagramMessageIds = payload.instagram_message_ids;
+  }
+  return out;
+}
+
 async function sendFollowUp(body) {
   const correlationId = (body.correlationId || body.requestId || '').trim();
   const cLog = correlationId ? ` correlationId=${correlationId}` : '';
@@ -1153,9 +1168,11 @@ async function sendFollowUp(body) {
 
   const launchOpts = buildFollowUpLaunchOptions();
   let browser;
+  let idCapture = null;
   try {
     browser = await puppeteer.launch(launchOpts);
     const page = await browser.newPage();
+    idCapture = attachInstagramSendIdCapture(page, { logger });
     if (hasAudio) await grantMicrophoneForInstagram(page, logger);
     await page.setCookie(...cookies);
     if (hasAudio) await applyDesktopEmulation(page);
@@ -1179,32 +1196,45 @@ async function sendFollowUp(body) {
     if (hasAudio) await grantMicrophoneForInstagram(page, logger);
 
     if (textSingle) {
-      const sent = await sendPlainTextInThread(page, String(body.text).trim());
+      const sent = await sendPlainTextInThread(page, String(body.text).trim(), { idCapture });
       if (!sent.ok) {
         return fail(followUpReasonToError(sent.reason), 400);
       }
       logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}${cLog}`);
-      return { ok: true };
+      if (sent.instagramMessageId) {
+        logger.log(`[follow-up] instagram_message_id=${sent.instagramMessageId}${cLog}`);
+      }
+      return followUpOkWithInstagramIds({
+        instagram_message_id: sent.instagramMessageId || undefined,
+      });
     }
 
     if (hasMessages) {
+      const collectedIds = [];
       for (const line of messageLines) {
-        const sent = await sendPlainTextInThread(page, line);
+        const sent = await sendPlainTextInThread(page, line, { idCapture });
         if (!sent.ok) {
           return fail(followUpReasonToError(sent.reason), 400);
         }
+        collectedIds.push(sent.instagramMessageId || null);
         await delay(2000);
       }
       logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}${cLog}`);
-      return { ok: true };
+      const instagram_message_ids = collectedIds.some((x) => x != null) ? collectedIds : undefined;
+      if (instagram_message_ids) {
+        logger.log(`[follow-up] instagram_message_ids=${JSON.stringify(instagram_message_ids)}${cLog}`);
+      }
+      return followUpOkWithInstagramIds({ instagram_message_ids });
     }
 
     if (hasAudio) {
+      const captionIds = [];
       if (hasCaption) {
-        const cap = await sendPlainTextInThread(page, captionRaw);
+        const cap = await sendPlainTextInThread(page, captionRaw, { idCapture });
         if (!cap.ok) {
           return fail(followUpReasonToError(cap.reason), 400);
         }
+        captionIds.push(cap.instagramMessageId || null);
         await delay(1200);
       }
       const prep = await prepareVoiceNoteUi(page, { logger });
@@ -1215,6 +1245,7 @@ async function sendFollowUp(body) {
         logger,
         correlationId,
         voiceSource: { durationSec: voiceDurationSec },
+        idCapture,
       });
       if (!voiceResult.ok) {
         return fail(followUpReasonToError(voiceResult.reason || 'voice_note_failed'), 400);
@@ -1227,7 +1258,19 @@ async function sendFollowUp(body) {
       }
       logger.log(`[follow-up] sent ok clientId=${clientId} recipient=@${recipientUsername} mode=${modeLabel}${cLog}`);
       fs.unlink(CHROME_FAKE_MIC_WAV, () => {});
-      return { ok: true };
+      if (hasCaption) {
+        const pair = [...captionIds, voiceResult.instagramMessageId || null];
+        if (pair.some((x) => x != null)) {
+          logger.log(`[follow-up] instagram_message_ids=${JSON.stringify(pair)}${cLog}`);
+        }
+        return followUpOkWithInstagramIds({ instagram_message_ids: pair });
+      }
+      if (voiceResult.instagramMessageId) {
+        logger.log(`[follow-up] instagram_message_id=${voiceResult.instagramMessageId}${cLog}`);
+      }
+      return followUpOkWithInstagramIds({
+        instagram_message_id: voiceResult.instagramMessageId || undefined,
+      });
     }
 
     return fail('No delivery mode', 400);
@@ -1235,6 +1278,13 @@ async function sendFollowUp(body) {
     logger.warn(`[follow-up] exception clientId=${clientId} recipient=@${recipientUsername} error=${e.message}${cLog}`);
     return { ok: false, error: e.message || 'Send failed', statusCode: 500 };
   } finally {
+    if (idCapture && typeof idCapture.dispose === 'function') {
+      try {
+        idCapture.dispose();
+      } catch {
+        /* ignore */
+      }
+    }
     if (browser) await browser.close().catch(() => {});
   }
 }
