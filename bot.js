@@ -180,7 +180,7 @@ async function coldDmOnSend(payload) {
 function getHourlySent() {
   const { db } = require('./database/db');
   const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-  const row = db.prepare('SELECT COUNT(*) as c FROM sent_messages WHERE sent_at >= ?').get(oneHourAgo);
+  const row = db.prepare("SELECT COUNT(*) as c FROM sent_messages WHERE sent_at >= ? AND status = 'success'").get(oneHourAgo);
   return row ? row.c : 0;
 }
 
@@ -1299,18 +1299,23 @@ async function sendDM(page, username, adapter, options = {}) {
     return { ok: false, reason: 'already_sent' };
   }
 
+  const freshCampaignLimits =
+    campaignId && typeof sb.getCampaignLimitsById === 'function'
+      ? await sb.getCampaignLimitsById(campaignId).catch(() => null)
+      : null;
+  const effectiveDailyLimit = freshCampaignLimits ? freshCampaignLimits.daily_send_limit : dailySendLimit;
+  const effectiveHourlyLimit = freshCampaignLimits ? freshCampaignLimits.hourly_send_limit : hourlySendLimit;
   const stats = await Promise.resolve(adapter.getDailyStats());
-  const dailyLimit = dailySendLimit ?? adapter.dailyLimit ?? DAILY_LIMIT;
-  if (stats.total_sent >= dailyLimit) {
-    logger.warn(`Daily limit reached (${dailyLimit}). Skipping.`);
-    return { ok: false, reason: 'daily_limit' };
-  }
-
   const hourlySent = await Promise.resolve(adapter.getHourlySent());
-  const maxPerHour = hourlySendLimit ?? adapter.maxPerHour ?? MAX_PER_HOUR;
-  if (hourlySent >= maxPerHour) {
-    logger.warn(`Hourly limit reached (${maxPerHour}). Skipping.`);
-    return { ok: false, reason: 'hourly_limit' };
+  const limitState = evaluateCampaignLimitState({
+    sentToday: stats.total_sent,
+    sentThisHour: hourlySent,
+    dailySendLimit: effectiveDailyLimit,
+    hourlySendLimit: effectiveHourlyLimit,
+  });
+  if (limitState.blocked) {
+    logger.warn(limitState.statusMessage);
+    return { ok: false, reason: limitState.reason, statusMessage: limitState.statusMessage };
   }
 
   const messageTemplate = messageOverride || adapter.getRandomMessage();
@@ -1390,6 +1395,24 @@ async function sendDM(page, username, adapter, options = {}) {
   await Promise.resolve(logSent('failed', null));
   if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed').catch(() => {});
   return { ok: false, reason: lastError.message };
+}
+
+function evaluateCampaignLimitState({ sentToday, sentThisHour, dailySendLimit, hourlySendLimit }) {
+  if (dailySendLimit != null && sentToday >= dailySendLimit) {
+    return {
+      blocked: true,
+      reason: 'daily_limit',
+      statusMessage: `daily limit reached (campaign daily=${dailySendLimit}, sentToday=${sentToday}, counting=successful sends only)`,
+    };
+  }
+  if (hourlySendLimit != null && sentThisHour >= hourlySendLimit) {
+    return {
+      blocked: true,
+      reason: 'hourly_limit',
+      statusMessage: `hourly limit reached (campaign hourly=${hourlySendLimit}, sentThisHour=${sentThisHour}, counting=successful sends only)`,
+    };
+  }
+  return { blocked: false, reason: null, statusMessage: null };
 }
 
 function loadLeadsFromCSV(csvPath) {
@@ -1620,12 +1643,14 @@ async function runBotMultiTenant() {
     let delayMs;
     if (!sendResult.ok && sendResult.reason === 'hourly_limit') {
       delayMs = randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
-      logger.log(`Hourly limit reached. Sleeping ${Math.round(delayMs / 60000)} minutes until window resets.`);
-      sb.setClientStatusMessage(clientId, 'Hourly limit reached. Next send in ~60 min.').catch(() => {});
+      const msg = sendResult.statusMessage || 'hourly limit reached';
+      logger.log(`${msg}. Sleeping ${Math.round(delayMs / 60000)} minutes until window resets.`);
+      sb.setClientStatusMessage(clientId, `${msg}. Next send in ~60 min.`).catch(() => {});
     } else if (!sendResult.ok && sendResult.reason === 'daily_limit') {
       delayMs = randomDelay(5 * 60 * 1000, 10 * 60 * 1000);
-      logger.log(`Daily limit reached. Rechecking in ${Math.round(delayMs / 60000)} minutes.`);
-      sb.setClientStatusMessage(clientId, 'Daily limit reached.').catch(() => {});
+      const msg = sendResult.statusMessage || 'daily limit reached';
+      logger.log(`${msg}. Rechecking in ${Math.round(delayMs / 60000)} minutes.`);
+      sb.setClientStatusMessage(clientId, msg).catch(() => {});
     } else {
       delayMs =
         work.minDelaySec != null && work.maxDelaySec != null
@@ -2012,6 +2037,7 @@ module.exports = {
   getDailyStats,
   loadLeadsFromCSV,
   sendDM,
+  evaluateCampaignLimitState,
   sendFollowUp,
   login,
   connectInstagram,

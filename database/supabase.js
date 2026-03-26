@@ -410,9 +410,22 @@ async function getHourlySent(clientId) {
     .from('cold_dm_sent_messages')
     .select('*', { count: 'exact', head: true })
     .eq('client_id', clientId)
+    .eq('status', 'success')
     .gte('sent_at', oneHourAgo);
   if (error) throw error;
   return count || 0;
+}
+
+async function getCampaignLimitsById(campaignId) {
+  const sb = getSupabase();
+  if (!sb || !campaignId) return null;
+  const { data, error } = await sb
+    .from('cold_dm_campaigns')
+    .select('id, daily_send_limit, hourly_send_limit')
+    .eq('id', campaignId)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
 }
 
 async function getControl(clientId) {
@@ -610,18 +623,30 @@ async function getClientNoWorkResumeAt(clientId) {
 
   const clientTz = settings?.timezone ?? null;
   const [stats, hourlySent] = await Promise.all([getDailyStats(clientId), getHourlySent(clientId)]);
-  const dailyLimit = settings?.daily_send_limit ?? 100;
-  const hourlyLimit = settings?.max_sends_per_hour ?? 20;
-  if (stats.total_sent >= dailyLimit) {
+  const pendingCampaignsInSchedule = [];
+  for (const camp of campaigns) {
+    const { count: campPending } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', camp.id)
+      .eq('status', 'pending');
+    if ((campPending ?? 0) === 0) continue;
+    const campaignTz = camp.timezone ?? null;
+    if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz)) continue;
+    pendingCampaignsInSchedule.push(camp);
+  }
+  const blockedDaily = pendingCampaignsInSchedule.find((camp) => camp.daily_send_limit != null && stats.total_sent >= camp.daily_send_limit);
+  if (blockedDaily) {
     return {
-      message: 'Daily limit reached.',
+      message: `daily limit reached (campaign daily=${blockedDaily.daily_send_limit}, sentToday=${stats.total_sent}, counting=successful sends only)`,
       reason: 'daily_limit',
       resumeAt: getNextMidnightInTimezone(clientTz),
     };
   }
-  if (hourlySent >= hourlyLimit) {
+  const blockedHourly = pendingCampaignsInSchedule.find((camp) => camp.hourly_send_limit != null && hourlySent >= camp.hourly_send_limit);
+  if (blockedHourly) {
     return {
-      message: 'Hourly limit reached.',
+      message: `hourly limit reached (campaign hourly=${blockedHourly.hourly_send_limit}, sentThisHour=${hourlySent}, counting=successful sends only)`,
       reason: 'hourly_limit',
       resumeAt: getNextHourStartInTimezone(clientTz),
     };
@@ -1175,7 +1200,6 @@ async function getMessageTemplateById(templateId) {
 async function getNextPendingCampaignLead(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return null;
-  const settings = await getSettings(clientId);
   const campaigns = await getActiveCampaigns(clientId);
   for (const camp of campaigns) {
     const campaignTz = camp.timezone ?? null;
@@ -1265,10 +1289,8 @@ async function getNextPendingCampaignLead(clientId) {
     if (!clRow || !leadRow) continue;
 
     const [stats, hourlySent] = await Promise.all([getDailyStats(clientId), getHourlySent(clientId)]);
-    const dailyLimit = camp.daily_send_limit ?? settings?.daily_send_limit ?? 100;
-    const hourlyLimit = camp.hourly_send_limit ?? settings?.max_sends_per_hour ?? 20;
-    if (stats.total_sent >= dailyLimit) continue;
-    if (hourlySent >= hourlyLimit) continue;
+    if (camp.daily_send_limit != null && stats.total_sent >= camp.daily_send_limit) continue;
+    if (camp.hourly_send_limit != null && hourlySent >= camp.hourly_send_limit) continue;
 
     return {
       campaignLeadId: clRow.id,
@@ -1389,6 +1411,7 @@ module.exports = {
   logSentMessage,
   getDailyStats,
   getHourlySent,
+  getCampaignLimitsById,
   getControl,
   setControl,
   setClientStatusMessage,
