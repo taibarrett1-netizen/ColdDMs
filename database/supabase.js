@@ -579,28 +579,17 @@ async function getClientNoWorkResumeAt(clientId) {
   if (!allCampaigns || allCampaigns.length === 0) {
     return { message: 'No campaigns.', reason: 'no_campaigns', resumeAt: null };
   }
-  const pendingByCampaign = await Promise.all(
-    allCampaigns.map(async (c) => {
-      const { count } = await sb
-        .from('cold_dm_campaign_leads')
-        .select('*', { count: 'exact', head: true })
-        .eq('campaign_id', c.id)
-        .eq('status', 'pending');
-      return { id: c.id, name: c.name, status: c.status, pending: count ?? 0 };
-    })
-  );
-  const pendingAnyCampaign = pendingByCampaign.filter((c) => c.pending > 0);
-  if (pendingAnyCampaign.length > 0) {
-    const inactiveWithPending = pendingAnyCampaign.filter((c) => c.status !== 'active');
-    const activeWithPending = pendingAnyCampaign.filter((c) => c.status === 'active');
-    if (inactiveWithPending.length > 0 && activeWithPending.length === 0) {
-      const names = inactiveWithPending.map((c) => `"${c.name}" (${c.status})`).join(', ');
-      return {
-        message: `Campaign(s) have pending leads but status is not active: ${names}. Set campaign to Active in the dashboard.`,
-        reason: 'inactive_campaign_with_pending',
-        resumeAt: null,
-      };
-    }
+  const allCampaignIds = allCampaigns.map((c) => c.id).filter(Boolean);
+  const { count: totalPendingAcrossCampaigns } =
+    allCampaignIds.length > 0
+      ? await sb
+          .from('cold_dm_campaign_leads')
+          .select('*', { count: 'exact', head: true })
+          .in('campaign_id', allCampaignIds)
+          .eq('status', 'pending')
+      : { count: 0 };
+  if ((totalPendingAcrossCampaigns ?? 0) === 0) {
+    return { message: null, reason: 'no_pending', resumeAt: null };
   }
   const campaigns = await getActiveCampaigns(clientId);
   const campaignIds = (campaigns || []).map((c) => c.id).filter(Boolean);
@@ -614,7 +603,13 @@ async function getClientNoWorkResumeAt(clientId) {
           .eq('status', 'pending')
       : { count: 0 };
   const pendingTotal = pendingCount ?? 0;
-  if (pendingTotal === 0) return { message: null, reason: 'no_pending', resumeAt: null };
+  if (pendingTotal === 0) {
+    return {
+      message: `Pending leads exist (${totalPendingAcrossCampaigns}) but none are currently sendable.`,
+      reason: 'no_sendable_work',
+      resumeAt: null,
+    };
+  }
 
   let earliestScheduleResume = null;
   let firstWindow = null;
@@ -689,7 +684,7 @@ async function getClientNoWorkResumeAt(clientId) {
   return {
     message:
       `Pending leads exist (${pendingTotal}) but none are currently sendable. ` +
-      'Check campaign status=active, lead groups assigned, message group/template configured, and per-campaign limits/schedule.',
+      'Check lead groups assigned, message group/template configured, and per-campaign limits/schedule.',
     reason: 'no_sendable_work',
     resumeAt: null,
   };
@@ -1126,7 +1121,6 @@ async function getActiveCampaigns(clientId) {
         'id, name, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec, send_voice_note, voice_note_storage_path, voice_note_mode'
       )
       .eq('client_id', clientId)
-      .eq('status', 'active')
       .order('created_at', { ascending: true });
     if (error) throw error;
     return data || [];
@@ -1135,7 +1129,6 @@ async function getActiveCampaigns(clientId) {
       .from('cold_dm_campaigns')
       .select('id, name, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec')
       .eq('client_id', clientId)
-      .eq('status', 'active')
       .order('created_at', { ascending: true });
     if (error) throw error;
     return (data || []).map((r) => ({ ...r, send_voice_note: false, voice_note_storage_path: null, voice_note_mode: 'after_text' }));
@@ -1143,7 +1136,7 @@ async function getActiveCampaigns(clientId) {
 }
 
 /**
- * Returns a short hint for why there is no sendable work for this client (e.g. no active campaigns, or campaigns are stopped).
+ * Returns a short hint for why there is no sendable work for this client.
  */
 async function getNoWorkHint(clientId) {
   const sb = getSupabase();
@@ -1163,14 +1156,9 @@ async function getNoWorkHint(clientId) {
       return { name: c.name, status: c.status, pending: count ?? 0 };
     })
   );
-  const activeWithPending = withPending.filter((c) => c.status === 'active' && c.pending > 0);
-  if (activeWithPending.length > 0) return '';
-  const stoppedWithPending = withPending.filter((c) => c.pending > 0 && c.status !== 'active');
-  if (stoppedWithPending.length > 0) {
-    const names = stoppedWithPending.map((c) => `"${c.name}" (${c.status})`).join(', ');
-    return `Campaign(s) have pending leads but status is not active: ${names}. Set campaign to Active in the dashboard.`;
-  }
-  return 'No campaigns with status=active and pending leads.';
+  const campaignsWithPending = withPending.filter((c) => c.pending > 0);
+  if (campaignsWithPending.length > 0) return '';
+  return 'No campaigns with pending leads.';
 }
 
 /**

@@ -603,7 +603,7 @@ app.post('/api/control/start', async (req, res) => {
     } catch (e) {
       console.error('[API] reactivateCampaignsWithPendingLeads', e);
     }
-    setControlSupabase(clientId, 0).catch((e) => console.error('[API] setControlSupabase', e));
+    await setControlSupabase(clientId, 0).catch((e) => console.error('[API] setControlSupabase', e));
     console.log('[API] Start (pause=0) for clientId=', clientId);
     res.json({ ok: true, processRunning: true });
     exec(`pm2 start cli.js --name ${BOT_PM2_NAME} --no-autorestart -- --start`, { cwd: projectRoot }, (err, stdout, stderr) => {
