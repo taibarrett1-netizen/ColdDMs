@@ -1527,9 +1527,13 @@ async function runBotMultiTenant() {
       const clientIds = await sb.getClientIdsWithPauseZero();
       let earliestResumeAt = null;
       let resumeReason = '';
+      const reasonMessageByClient = new Map();
       for (const cid of clientIds) {
         const info = await sb.getClientNoWorkResumeAt(cid).catch(() => ({ message: null, reason: 'no_pending', resumeAt: null }));
-        if (info.message) await sb.setClientStatusMessage(cid, info.message).catch(() => {});
+        if (info.message) {
+          reasonMessageByClient.set(cid, info.message);
+          await sb.setClientStatusMessage(cid, info.message).catch(() => {});
+        }
         if (info.reason === 'no_pending') continue;
         if (info.resumeAt && (!earliestResumeAt || info.resumeAt.getTime() < earliestResumeAt.getTime())) {
           earliestResumeAt = info.resumeAt;
@@ -1538,12 +1542,18 @@ async function runBotMultiTenant() {
       }
       if (!earliestResumeAt) {
         for (const cid of clientIds) {
+          const existingReasonMessage = reasonMessageByClient.get(cid);
+          if (existingReasonMessage) {
+            logger.log('No work: ' + existingReasonMessage);
+            await sb.setClientStatusMessage(cid, existingReasonMessage).catch(() => {});
+          } else {
           const hint = await sb.getNoWorkHint(cid).catch(() => '');
           if (hint) {
             logger.log('No work: ' + hint);
             await sb.setClientStatusMessage(cid, hint).catch(() => {});
           } else {
             await sb.setClientStatusMessage(cid, 'No work. Start again from the dashboard when you have a campaign to run.').catch(() => {});
+          }
           }
           // Keep control flag aligned with worker state so dashboards don't show "running" after an auto-exit.
           await sb.setControl(cid, 1).catch(() => {});
