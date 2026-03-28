@@ -26,6 +26,7 @@ const {
 } = require('./utils/instagram-voice-note');
 const { dismissInstagramHomeModals } = require('./utils/instagram-modals');
 const { navigateToDmThread, sendPlainTextInThread } = require('./utils/open-dm-thread');
+const { clickInstagramDmSearchResult, formatSearchFailurePageSnippet } = require('./utils/instagram-dm-search');
 const { attachInstagramSendIdCapture } = require('./utils/instagram-dm-network-ids');
 puppeteer.use(StealthPlugin());
 
@@ -604,35 +605,17 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   await searchHandle.dispose();
   await delay(2800);
 
-  const userClicked = await page.evaluate((username) => {
-    const needle = username.toLowerCase().replace(/^@/, '');
-    const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
-    const userBtn = buttons.find((b) => {
-      const t = (b.textContent || '').toLowerCase();
-      return t.includes(needle) && !t.includes('more accounts');
-    });
-    if (userBtn) {
-      userBtn.click();
-      return true;
-    }
-    if (buttons.length) buttons[0].click();
-    return false;
-  }, u);
-  if (!userClicked) {
-    const { hint, pageSnippet, searchPreview } = await page.evaluate(() => {
-      const body = (document.body && document.body.innerText) ? document.body.innerText : '';
-      const lower = body.toLowerCase();
-      let hint = 'user_not_found';
-      if (lower.includes('this account is private') || lower.includes('account is private') || lower.includes('private account')) hint = 'account_private';
-      else if (lower.includes("couldn't find") || lower.includes('could not find') || lower.includes('no results') || lower.includes('no users found')) hint = 'user_not_found';
-      else if (lower.includes('try again later') || lower.includes('too many')) hint = 'rate_limited';
-      const snippet = body.replace(/\s+/g, ' ').trim().slice(0, 120);
-      const buttons = Array.from(document.querySelectorAll('div[role="button"]')).filter((b) => !(b.textContent || '').toLowerCase().includes('more accounts'));
-      const preview = buttons.slice(0, 4).map((b) => (b.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)).filter(Boolean);
-      return { hint, pageSnippet: snippet || '(empty)', searchPreview: preview.length ? preview.join(' | ') : '' };
-    }).catch(() => ({ hint: 'user_not_found', pageSnippet: '(unable to read page)', searchPreview: '' }));
-    const extra = searchPreview ? ' First results: ' + searchPreview : '';
-    return { ok: false, reason: hint, pageSnippet: (pageSnippet || '') + extra };
+  const searchPick = await clickInstagramDmSearchResult(page, u).catch((e) => ({
+    ok: false,
+    reason: 'search_result_select_failed',
+    logLine: `evaluate_threw: ${e && e.message ? e.message : String(e)}`,
+  }));
+  if (!searchPick.ok) {
+    return {
+      ok: false,
+      reason: searchPick.reason || 'search_result_select_failed',
+      pageSnippet: formatSearchFailurePageSnippet(u, searchPick),
+    };
   }
   await delay(1500);
 
@@ -1039,6 +1022,7 @@ function scheduleDebugFollowUpBrowser(body) {
 function followUpReasonToError(reason, pageSnippet) {
   const map = {
     user_not_found: 'Recipient not found in Instagram search',
+    search_result_select_failed: 'Search showed results but the bot could not select the correct row (UI/DOM)',
     account_private: 'Instagram account is private or unavailable',
     rate_limited: 'Instagram rate limited. Try again later',
     no_compose: 'Could not open DM compose',
@@ -1365,6 +1349,7 @@ async function sendDM(page, username, adapter, options = {}) {
       }
       const terminalReasons = [
         'user_not_found',
+        'search_result_select_failed',
         'no_compose',
         'account_private',
         'rate_limited',
@@ -1380,8 +1365,8 @@ async function sendDM(page, username, adapter, options = {}) {
       if (terminalReasons.includes(result.reason)) {
         await Promise.resolve(logSent('failed', result.finalMessage, result.reason));
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', result.reason).catch(() => {});
-        const snippet = result.pageSnippet ? '. Search result: ' + result.pageSnippet : '';
-        logger.warn(`Send failed for @${u}: ${result.reason}${snippet}`);
+        const detail = result.pageSnippet ? ` ${result.pageSnippet}` : '';
+        logger.warn(`Send failed for @${u}: ${result.reason}.${detail}`.trim());
         return result;
       }
       lastError = new Error(result.reason);

@@ -75,6 +75,32 @@ function normalizeScheduleTime(value) {
   return s.slice(0, 8) || null;
 }
 
+/**
+ * Current local time in `timezone` as "HH:mm:ss" (24h). Trims IANA ids (trailing spaces break Intl).
+ * Falls back to UTC wall clock if tz is missing/invalid.
+ */
+function getClockTimeHHMMSSInTimezone(now, timezone) {
+  if (!timezone || typeof timezone !== 'string') {
+    return `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
+  }
+  const tz = timezone.trim();
+  if (!tz) {
+    return `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
+  }
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+      hourCycle: 'h23',
+    }).format(now);
+  } catch (e) {
+    return `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
+  }
+}
+
 /** Returns YYYY-MM-DD in the given IANA timezone; falls back to UTC if invalid/missing. */
 function getTodayInTimezone(timezone) {
   if (!timezone || typeof timezone !== 'string') return getToday();
@@ -1193,17 +1219,7 @@ async function getNoWorkHint(clientId) {
 function isWithinSchedule(scheduleStart, scheduleEnd, timezone) {
   if (!scheduleStart && !scheduleEnd) return true;
   const now = new Date();
-  let current;
-  if (timezone) {
-    try {
-      current = now.toLocaleTimeString('en-CA', { timeZone: timezone, hour12: false });
-      if (current.length === 7) current = '0' + current;
-    } catch (e) {
-      current = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
-    }
-  } else {
-    current = `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
-  }
+  const current = getClockTimeHHMMSSInTimezone(now, timezone);
   const start = normalizeScheduleTime(scheduleStart) || '00:00:00';
   const end = normalizeScheduleTime(scheduleEnd) || '23:59:59';
   if (start <= end) return current >= start && current <= end;

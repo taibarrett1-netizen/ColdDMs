@@ -3,6 +3,7 @@
  * @returns {Promise<{ ok: true } | { ok: false, reason: string, pageSnippet?: string }>}
  */
 const logger = require('./logger');
+const { clickInstagramDmSearchResult, formatSearchFailurePageSnippet } = require('./instagram-dm-search');
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -130,37 +131,17 @@ async function navigateToDmThread(page, u) {
   await searchHandle.dispose();
   await delay(2800);
 
-  const userClicked = await page.evaluate((username) => {
-    const needle = username.toLowerCase().replace(/^@/, '');
-    const buttons = Array.from(document.querySelectorAll('div[role="button"]'));
-    const userBtn = buttons.find((b) => {
-      const t = (b.textContent || '').toLowerCase();
-      return t.includes(needle) && !t.includes('more accounts');
-    });
-    if (userBtn) {
-      userBtn.click();
-      return true;
-    }
-    if (buttons.length) buttons[0].click();
-    return false;
-  }, u);
-  if (!userClicked) {
-    const { hint, pageSnippet, searchPreview } = await page
-      .evaluate(() => {
-        const body = document.body && document.body.innerText ? document.body.innerText : '';
-        const lower = body.toLowerCase();
-        let hint = 'user_not_found';
-        if (lower.includes('this account is private') || lower.includes('account is private') || lower.includes('private account')) hint = 'account_private';
-        else if (lower.includes("couldn't find") || lower.includes('could not find') || lower.includes('no results') || lower.includes('no users found')) hint = 'user_not_found';
-        else if (lower.includes('try again later') || lower.includes('too many')) hint = 'rate_limited';
-        const snippet = body.replace(/\s+/g, ' ').trim().slice(0, 120);
-        const buttons = Array.from(document.querySelectorAll('div[role="button"]')).filter((b) => !(b.textContent || '').toLowerCase().includes('more accounts'));
-        const preview = buttons.slice(0, 4).map((b) => (b.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)).filter(Boolean);
-        return { hint, pageSnippet: snippet || '(empty)', searchPreview: preview.length ? preview.join(' | ') : '' };
-      })
-      .catch(() => ({ hint: 'user_not_found', pageSnippet: '(unable to read page)', searchPreview: '' }));
-    const extra = searchPreview ? ' First results: ' + searchPreview : '';
-    return { ok: false, reason: hint, pageSnippet: (pageSnippet || '') + extra };
+  const searchPick = await clickInstagramDmSearchResult(page, u).catch((e) => ({
+    ok: false,
+    reason: 'search_result_select_failed',
+    logLine: `evaluate_threw: ${e && e.message ? e.message : String(e)}`,
+  }));
+  if (!searchPick.ok) {
+    return {
+      ok: false,
+      reason: searchPick.reason || 'search_result_select_failed',
+      pageSnippet: formatSearchFailurePageSnippet(u, searchPick),
+    };
   }
   await delay(1500);
 
