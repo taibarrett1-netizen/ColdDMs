@@ -854,78 +854,19 @@ app.post('/api/campaigns/add-leads-from-groups', async (req, res) => {
   }
 });
 
-// --- Scraper API (same login + 2FA flow as Instagram connect) ---
-app.post('/api/scraper/connect', connectLimiter, async (req, res) => {
-  const { username, password, clientId } = req.body || {};
-  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
-    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
-  }
-  if (!username || !password || !clientId) {
-    return res.status(400).json({ ok: false, error: 'username, password, and clientId are required' });
-  }
-  if (!isSupabaseConfigured()) {
-    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
-  }
-  try {
-    const result = await connectInstagram(username, password, null);
-    if (result.twoFactorRequired) {
-      cleanupExpiredScraper2FA();
-      const pendingId = require('crypto').randomBytes(16).toString('hex');
-      pendingScraper2FAMap.set(pendingId, {
-        page: result.page,
-        browser: result.browser,
-        username: result.username,
-        clientId,
-        createdAt: Date.now(),
-      });
-      return res.status(200).json({
-        ok: false,
-        code: 'two_factor_required',
-        message: 'Enter the 6-digit code from your app or WhatsApp.',
-        pending2FAId: pendingId,
-      });
-    }
-    await saveScraperSession(clientId, { cookies: result.cookies }, result.username);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[API] Scraper connect failed', e);
-    if (e.code === 'TWO_FACTOR_REQUIRED') {
-      return res.status(200).json({ ok: false, code: 'two_factor_required', message: e.message || 'Enter the 6-digit code from your app or WhatsApp.' });
-    }
-    res.status(500).json({ ok: false, error: e.message || 'Login failed' });
-  }
+// --- Scraper account connect has moved to Admin Scraper Pool (platform accounts only). ---
+app.post('/api/scraper/connect', connectLimiter, async (_req, res) => {
+  return res.status(410).json({
+    ok: false,
+    error: 'Deprecated endpoint. Scraper accounts are now managed from Admin Panel -> Scraper Pool.',
+  });
 });
 
-app.post('/api/scraper/connect/2fa', connectLimiter, async (req, res) => {
-  const { pending2FAId, twoFactorCode, clientId } = req.body || {};
-  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
-    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
-  }
-  if (!pending2FAId || !twoFactorCode || !clientId) {
-    return res.status(400).json({ ok: false, error: 'pending2FAId, twoFactorCode, and clientId are required' });
-  }
-  const pending = pendingScraper2FAMap.get(pending2FAId);
-  if (!pending) {
-    return res.status(400).json({ ok: false, error: 'Session expired. Start Scraper Connect again and enter the new code when the popup appears.' });
-  }
-  if (String(pending.clientId) !== String(clientId)) {
-    return res.status(403).json({ ok: false, error: 'Forbidden: pending 2FA session does not belong to this clientId' });
-  }
-  if (Date.now() - pending.createdAt > PENDING_2FA_TTL_MS) {
-    pendingScraper2FAMap.delete(pending2FAId);
-    if (pending.browser) pending.browser.close().catch(() => {});
-    return res.status(400).json({ ok: false, error: 'Session expired. Start Scraper Connect again and enter the new code when the popup appears.' });
-  }
-  pendingScraper2FAMap.delete(pending2FAId);
-  try {
-    const result = await completeInstagram2FA(pending.page, pending.browser, twoFactorCode, pending.username);
-    await saveScraperSession(clientId, { cookies: result.cookies }, result.username);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[API] Scraper 2FA complete failed', e);
-    if (pending.browser) pending.browser.close().catch(() => {});
-    res.status(500).json({ ok: false, error: e.message || '2FA failed' });
-  }
+app.post('/api/scraper/connect/2fa', connectLimiter, async (_req, res) => {
+  return res.status(410).json({
+    ok: false,
+    error: 'Deprecated endpoint. Scraper accounts are now managed from Admin Panel -> Scraper Pool.',
+  });
 });
 
 app.get('/api/scraper/status', async (req, res) => {

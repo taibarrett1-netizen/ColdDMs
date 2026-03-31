@@ -1,4 +1,4 @@
--- Same as remix 20260331190000_vps_idempotency_and_follow_up_retry.sql
+-- VPS follow-up idempotency (dedupe retries / double cron) + cold outreach follow-up retry counter.
 
 CREATE TABLE IF NOT EXISTS public.cold_dm_vps_idempotency (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -14,4 +14,5 @@ CREATE INDEX IF NOT EXISTS idx_cold_dm_vps_idem_created ON public.cold_dm_vps_id
 ALTER TABLE public.cold_dm_follow_up_queue
   ADD COLUMN IF NOT EXISTS retry_count integer NOT NULL DEFAULT 0;
 
+-- Deny direct client access; VPS uses service role only.
 ALTER TABLE public.cold_dm_vps_idempotency ENABLE ROW LEVEL SECURITY;

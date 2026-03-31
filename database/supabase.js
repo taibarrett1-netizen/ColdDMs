@@ -563,14 +563,14 @@ async function getClientIdsWithPauseZero() {
  * then cold_dm_campaign_leads with status = 'pending', schedule/timezone/limits applied.
  * @returns {Promise<{ clientId: string, work: object } | null>}
  */
-async function getNextPendingWorkAnyClient() {
+async function getNextPendingWorkAnyClient(workerId = null, leaseSeconds = 600) {
   const clientIds = await getClientIdsWithPauseZero();
   if (clientIds.length === 0) {
     logNoWorkDebug('No clients with pause=0.');
     return null;
   }
   for (const clientId of clientIds) {
-    const work = await getNextPendingCampaignLead(clientId);
+    const work = await getNextPendingCampaignLead(clientId, workerId, leaseSeconds);
     if (work) {
       logNoWorkDebug('Selected work for client.', { clientId, campaignId: work.campaignId, campaignLeadId: work.campaignLeadId, username: work.username });
       return { clientId, work };
@@ -1519,7 +1519,27 @@ async function getMessageTemplateById(templateId) {
   return data?.message_text || null;
 }
 
-async function getNextPendingCampaignLead(clientId) {
+async function claimCampaignLeadLease(campaignLeadId, workerId, leaseSeconds = 600) {
+  const sb = getSupabase();
+  if (!sb || !campaignLeadId || !workerId) return false;
+  const nowIso = new Date().toISOString();
+  const leaseUntil = new Date(Date.now() + Math.max(60, parseInt(leaseSeconds, 10) || 600) * 1000).toISOString();
+  const { data, error } = await sb
+    .from('cold_dm_campaign_leads')
+    .update({
+      leased_by_worker: workerId,
+      leased_until: leaseUntil,
+      lease_heartbeat_at: nowIso,
+    })
+    .eq('id', campaignLeadId)
+    .eq('status', 'pending')
+    .or(`leased_until.is.null,leased_until.lte.${nowIso}`)
+    .select('id')
+    .limit(1);
+  return !error && !!(data && data.length > 0);
+}
+
+async function getNextPendingCampaignLead(clientId, workerId = null, leaseSeconds = 600) {
   const sb = getSupabase();
   if (!sb || !clientId) return null;
   const campaigns = await getActiveCampaigns(clientId);
@@ -1614,11 +1634,13 @@ async function getNextPendingCampaignLead(clientId) {
     let clRow = null;
     let leadRow = null;
     for (;;) {
+      const nowIso = new Date().toISOString();
       const { data: pendingRow, error } = await sb
         .from('cold_dm_campaign_leads')
         .select('id, lead_id')
         .eq('campaign_id', camp.id)
         .eq('status', 'pending')
+        .or(`leased_until.is.null,leased_until.lte.${nowIso}`)
         .order('id', { ascending: true })
         .limit(1)
         .maybeSingle();
@@ -1663,6 +1685,15 @@ async function getNextPendingCampaignLead(clientId) {
       dbg.reason = 'hourly_limit_reached';
       campaignDebug.push(dbg);
       continue;
+    }
+
+    if (workerId) {
+      const leased = await claimCampaignLeadLease(clRow.id, workerId, leaseSeconds);
+      if (!leased) {
+        dbg.reason = 'lease_race_lost';
+        campaignDebug.push(dbg);
+        continue;
+      }
     }
 
     logNoWorkDebug('Campaign selected for send.', {
@@ -1805,7 +1836,7 @@ async function reactivateCampaignsWithPendingLeads(clientId, campaignId = null) 
   return reactivated;
 }
 
-async function updateCampaignLeadStatus(campaignLeadId, status, failureReason = null) {
+async function updateCampaignLeadStatus(campaignLeadId, status, failureReason = null, workerId = null) {
   const sb = getSupabase();
   if (!sb || !campaignLeadId) throw new Error('Supabase or campaignLeadId missing');
   const { data: row } = await sb
@@ -1816,7 +1847,12 @@ async function updateCampaignLeadStatus(campaignLeadId, status, failureReason = 
   const payload = { status };
   if (status === 'sent' || status === 'failed') payload.sent_at = new Date().toISOString();
   if (status === 'failed' && failureReason) payload.failure_reason = failureReason;
-  const { error } = await sb.from('cold_dm_campaign_leads').update(payload).eq('id', campaignLeadId);
+  payload.leased_by_worker = null;
+  payload.leased_until = null;
+  payload.lease_heartbeat_at = new Date().toISOString();
+  let q = sb.from('cold_dm_campaign_leads').update(payload).eq('id', campaignLeadId);
+  if (workerId) q = q.eq('leased_by_worker', workerId);
+  const { error } = await q;
   if (error) throw error;
 
   if (row && row.campaign_id && (status === 'sent' || status === 'failed')) {

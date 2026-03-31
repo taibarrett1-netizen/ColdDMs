@@ -39,6 +39,8 @@ const MIN_DELAY_MS = (parseInt(process.env.MIN_DELAY_MINUTES, 10) || 5) * 60 * 1
 const MAX_DELAY_MS = (parseInt(process.env.MAX_DELAY_MINUTES, 10) || 30) * 60 * 1000;
 const MAX_PER_HOUR = parseInt(process.env.MAX_SENDS_PER_HOUR, 10) || 20;
 const HEADLESS = process.env.HEADLESS_MODE !== 'false';
+const SEND_LEASE_SECONDS = Math.max(120, parseInt(process.env.SEND_LEASE_SECONDS || '600', 10) || 600);
+const SEND_WORKER_ID = process.env.SEND_WORKER_ID || `send-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 /** When set (e.g. 80), slows Puppeteer operations for debugging voice/UI (all launch paths that use applyPuppeteerSlowMo). */
 function getPuppeteerSlowMo() {
   const n = parseInt(process.env.PUPPETEER_SLOW_MO_MS, 10);
@@ -1287,11 +1289,12 @@ async function sendFollowUp(body) {
 
 async function sendDM(page, username, adapter, options = {}) {
   const { messageOverride, campaignId, campaignLeadId, messageGroupId, messageGroupMessageId, dailySendLimit, hourlySendLimit } = options;
+  const sendWorkerId = options.sendWorkerId || null;
   const u = normalizeUsername(username);
   const sent = await Promise.resolve(adapter.alreadySent(u));
   if (sent) {
     logger.warn(`Already sent to @${u}, skipping.`);
-    if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed').catch(() => {});
+    if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', null, sendWorkerId).catch(() => {});
     return { ok: false, reason: 'already_sent' };
   }
 
@@ -1342,7 +1345,7 @@ async function sendDM(page, username, adapter, options = {}) {
       if (result.ok) {
         const finalMessage = result.finalMessage != null ? result.finalMessage : (resolvedVoiceMode === 'voice_only' ? '' : messageTemplate);
         await Promise.resolve(logSent('success', finalMessage));
-        if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent').catch(() => {});
+        if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent', null, sendWorkerId).catch(() => {});
         if (options.clientId && result.instagramThreadId) {
           const payload = {
             client_id: options.clientId,
@@ -1376,7 +1379,7 @@ async function sendDM(page, username, adapter, options = {}) {
       ];
       if (terminalReasons.includes(result.reason)) {
         await Promise.resolve(logSent('failed', result.finalMessage, result.reason));
-        if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', result.reason).catch(() => {});
+        if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', result.reason, sendWorkerId).catch(() => {});
         const detail = result.pageSnippet ? ` ${result.pageSnippet}` : '';
         logger.warn(`Send failed for @${u}: ${result.reason}.${detail}`.trim());
         return result;
@@ -1390,7 +1393,7 @@ async function sendDM(page, username, adapter, options = {}) {
   }
   logger.error(`Error sending to @${u} after ${MAX_SEND_RETRIES} retries`, lastError);
   await Promise.resolve(logSent('failed', null));
-  if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed').catch(() => {});
+  if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', null, sendWorkerId).catch(() => {});
   return { ok: false, reason: lastError.message };
 }
 
@@ -1519,7 +1522,7 @@ async function runBotMultiTenant() {
 
   for (;;) {
     // Fresh DB read every iteration (no cache). After PM2 restart, first run sees current cold_dm_control, cold_dm_campaigns.status, and cold_dm_campaign_leads.
-    const next = await sb.getNextPendingWorkAnyClient();
+    const next = await sb.getNextPendingWorkAnyClient(SEND_WORKER_ID, SEND_LEASE_SECONDS);
     if (!next) {
       const clientIds = await sb.getClientIdsWithPauseZero();
       let earliestResumeAt = null;
@@ -1582,7 +1585,7 @@ async function runBotMultiTenant() {
     const sessions = await sb.getSessionsForCampaign(clientId, work.campaignId);
     if (!sessions || sessions.length === 0) {
       logger.warn('No sessions for campaign ' + work.campaignId + ', failing lead.');
-      await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed').catch(() => {});
+      await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', null, SEND_WORKER_ID).catch(() => {});
       await delay(randomDelay(2000, 5000));
       continue;
     }
@@ -1596,13 +1599,14 @@ async function runBotMultiTenant() {
     const ok = await ensurePageSession(page, session);
     if (!ok) {
       logger.warn('Could not load session for campaign, failing lead.');
-      await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed').catch(() => {});
+      await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', null, SEND_WORKER_ID).catch(() => {});
       await delay(randomDelay(2000, 5000));
       continue;
     }
 
     const options = {
       clientId,
+      sendWorkerId: SEND_WORKER_ID,
       messageOverride: work.messageText,
       campaignId: work.campaignId,
       campaignLeadId: work.campaignLeadId,
