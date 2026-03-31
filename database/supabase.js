@@ -1260,6 +1260,30 @@ async function heartbeatScrapeJobLease(jobId, workerId, leaseSeconds = 240) {
   return !uerr && rows && rows.length > 0;
 }
 
+/**
+ * Insert idempotency key for VPS routes (follow-up dedupe on Edge retries).
+ * @returns {Promise<boolean>} true if this is the first time (caller should proceed), false if duplicate.
+ */
+async function tryVpsIdempotencyOnce(clientId, route, idempotencyKey) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !route || !idempotencyKey) return true;
+  const key = String(idempotencyKey).trim().slice(0, 256);
+  if (!key) return true;
+  const { error } = await sb.from('cold_dm_vps_idempotency').insert({
+    client_id: clientId,
+    route: String(route).slice(0, 120),
+    idempotency_key: key,
+  });
+  if (error && error.code === '23505') return false;
+  if (error) {
+    if (String(error.message || '').includes('cold_dm_vps_idempotency') || error.code === '42P01') {
+      return true;
+    }
+    throw error;
+  }
+  return true;
+}
+
 async function workerHeartbeat(workerId, workerType, meta = {}) {
   const sb = getSupabase();
   if (!sb || !workerId || !workerType) return;
@@ -1859,6 +1883,7 @@ module.exports = {
   claimColdDmScrapeJob,
   heartbeatScrapeJobLease,
   workerHeartbeat,
+  tryVpsIdempotencyOnce,
   upsertLead,
   upsertLeadsBatch,
   getActiveCampaigns,

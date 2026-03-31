@@ -34,6 +34,7 @@ const {
   addCampaignLeadsFromGroups,
   getNoWorkHint,
   reactivateCampaignsWithPendingLeads,
+  tryVpsIdempotencyOnce,
 } = require('./database/supabase');
 const {
   loadLeadsFromCSV,
@@ -104,6 +105,28 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
 });
 app.use('/api', apiLimiter);
+
+const followUpLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: Math.max(10, parseInt(process.env.FOLLOW_UP_RATE_LIMIT_PER_MIN || '60', 10) || 60),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const id = (req.body?.clientId || '').toString().trim();
+    return id ? `fu:${id}` : `fu:ip:${req.ip || 'unknown'}`;
+  },
+});
+
+const connectLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: Math.max(5, parseInt(process.env.IG_CONNECT_RATE_LIMIT_PER_15MIN || '20', 10) || 20),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    const id = (req.body?.clientId || '').toString().trim();
+    return id ? `ig:${id}` : `ig:ip:${req.ip || 'unknown'}`;
+  },
+});
 
 function getPresentedApiKey(req) {
   const auth = req.headers.authorization;
@@ -446,23 +469,19 @@ app.post('/api/leads/upload', upload.single('file'), (req, res) => {
  * Body: { clientId, instagramSessionId, recipientUsername, text? | messages? | audioUrl?, caption? }
  * Voice: `audioUrl` = HTTPS URL the worker GETs; optional `caption` = text in-thread before voice. Correlation: X-Correlation-ID / X-Request-ID / body correlationId | requestId.
  */
-app.post('/api/follow-up/send', async (req, res) => {
-  if (!tryAcquire('followUp')) {
-    return res.status(429).json({ ok: false, error: 'Too many concurrent follow-up sends. Try again shortly.' });
-  }
-  if (!isSupabaseConfigured()) {
-    logger.warn('[API] follow-up/send 503 Supabase not configured');
-    release('followUp');
-    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
-  }
+app.post('/api/follow-up/send', followUpLimiter, async (req, res) => {
   const body = req.body || {};
   const cid = (body.clientId || '').trim();
   if (req.authClientId && cid !== req.authClientId) {
-    release('followUp');
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
-  const sid = (body.instagramSessionId || '').trim();
-  const recip = (body.recipientUsername || '').trim().replace(/^@/, '');
+  if (!cid) {
+    return res.status(400).json({ ok: false, error: 'clientId is required' });
+  }
+  if (!isSupabaseConfigured()) {
+    logger.warn('[API] follow-up/send 503 Supabase not configured');
+    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
+  }
   const correlationId = (
     req.get('x-correlation-id') ||
     req.get('x-request-id') ||
@@ -470,6 +489,22 @@ app.post('/api/follow-up/send', async (req, res) => {
     (body.requestId && String(body.requestId).trim()) ||
     ''
   ).trim();
+  if (correlationId) {
+    try {
+      const proceed = await tryVpsIdempotencyOnce(cid, 'follow-up/send', correlationId);
+      if (!proceed) {
+        logger.log(`[API] follow-up/send idempotent duplicate correlationId=${correlationId}`);
+        return res.json({ ok: true, duplicate: true, correlationId });
+      }
+    } catch (e) {
+      logger.warn('[API] follow-up/send idempotency error (continuing)', e.message || e);
+    }
+  }
+  if (!tryAcquire('followUp')) {
+    return res.status(429).json({ ok: false, error: 'Too many concurrent follow-up sends. Try again shortly.' });
+  }
+  const sid = (body.instagramSessionId || '').trim();
+  const recip = (body.recipientUsername || '').trim().replace(/^@/, '');
   let mode = 'unknown';
   if (body.text != null && String(body.text).trim() !== '') mode = 'text';
   else if (Array.isArray(body.messages) && body.messages.some((m) => String(m).trim())) {
@@ -655,7 +690,7 @@ function cleanupExpiredScraper2FA() {
 
 // --- API: Instagram connect (one-time; password never stored) ---
 // If account has 2FA, returns { ok: false, code: 'two_factor_required', pending2FAId }. Submit code to POST /api/instagram/connect/2fa with same clientId.
-app.post('/api/instagram/connect', async (req, res) => {
+app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
   const { username, password, clientId } = req.body || {};
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
@@ -697,7 +732,7 @@ app.post('/api/instagram/connect', async (req, res) => {
   }
 });
 
-app.post('/api/instagram/connect/2fa', async (req, res) => {
+app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
   const { pending2FAId, twoFactorCode, clientId } = req.body || {};
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
@@ -820,7 +855,7 @@ app.post('/api/campaigns/add-leads-from-groups', async (req, res) => {
 });
 
 // --- Scraper API (same login + 2FA flow as Instagram connect) ---
-app.post('/api/scraper/connect', async (req, res) => {
+app.post('/api/scraper/connect', connectLimiter, async (req, res) => {
   const { username, password, clientId } = req.body || {};
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
@@ -861,7 +896,7 @@ app.post('/api/scraper/connect', async (req, res) => {
   }
 });
 
-app.post('/api/scraper/connect/2fa', async (req, res) => {
+app.post('/api/scraper/connect/2fa', connectLimiter, async (req, res) => {
   const { pending2FAId, twoFactorCode, clientId } = req.body || {};
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
@@ -1116,7 +1151,7 @@ app.post('/api/scraper/stop', async (req, res) => {
   }
 });
 
-app.post('/api/scraper/connect-platform', async (req, res) => {
+app.post('/api/scraper/connect-platform', connectLimiter, async (req, res) => {
   const { username, password, daily_actions_limit } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ ok: false, error: 'username and password are required' });
