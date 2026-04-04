@@ -1,7 +1,8 @@
 /**
  * Replaces {{variable}} placeholders in message text with lead data.
- * Supported: {{username}}, {{first_name}}, {{last_name}}, {{full_name}}. {{instagram_username}} = {{username}}.
- * First name: from display_name (first word, including single-word names like "CHARLIE") or lead.first_name only.
+ * Lead: {{username}}, {{first_name}}, {{last_name}}, {{full_name}}; {{instagram_username}} = {{username}}.
+ * Account (SkeduleMore user, from users.name): {{sender_name}}, {{sender_first_name}}.
+ * First name: from display_name (first word) or lead.first_name only.
  * Never derived from username; if no name is available, first_name/full_name are empty.
  */
 function normalizeName(str) {
@@ -18,7 +19,7 @@ function normalizeName(str) {
 /**
  * @param {string} text - Message template with {{variable}} placeholders.
  * @param {object} lead - { username, first_name?, last_name?, display_name? }.
- * @param {{ firstNameBlocklist?: Set<string>, onFirstNameEmpty?: (reason: string) => void }} [opts] - Optional. If first_name (resolved) is in blocklist (lowercase), it is cleared. onFirstNameEmpty(reason) called when template uses {{first_name}}/{{full_name}} but first_name is empty.
+ * @param {{ firstNameBlocklist?: Set<string>, onFirstNameEmpty?: (reason: string) => void, senderName?: string }} [opts] - Optional. senderName = SkeduleMore account display name (users.name) for {{sender_name}} / {{sender_first_name}}.
  */
 function substituteVariables(text, lead = {}, opts = {}) {
   if (!text || typeof text !== 'string') return text;
@@ -53,12 +54,21 @@ function substituteVariables(text, lead = {}, opts = {}) {
 
   const fullName = [first, last].filter(Boolean).join(' ');
 
+  const senderFull = typeof opts.senderName === 'string' ? opts.senderName.trim() : '';
+  let senderFirst = '';
+  if (senderFull) {
+    const fw = senderFull.split(/\s+/)[0] || '';
+    senderFirst = normalizeName(fw);
+  }
+
   const vars = {
     username,
     instagram_username: username,
     first_name: first,
     last_name: last,
     full_name: fullName,
+    sender_name: senderFull,
+    sender_first_name: senderFirst,
   };
 
   let out = text.replace(/\{\{\s*(\w+)\s*\}\}/gi, (_, key) => vars[key.toLowerCase()] ?? `{{${key}}}`);

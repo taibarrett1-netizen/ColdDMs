@@ -243,6 +243,16 @@ async function getFirstNameBlocklist(clientId) {
   return (data || []).map((r) => (r.first_name_lower || '').toLowerCase()).filter(Boolean);
 }
 
+/** Display name on the SkeduleMore account (public.users.name) for {{sender_name}} / {{sender_first_name}} in templates. */
+async function getUserAccountName(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return null;
+  const { data, error } = await sb.from('users').select('name').eq('id', clientId).maybeSingle();
+  if (error || !data) return null;
+  const n = typeof data.name === 'string' ? data.name.trim() : '';
+  return n || null;
+}
+
 async function getMessageTemplates(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return [];
@@ -1933,6 +1943,7 @@ module.exports = {
   getClientNoWorkResumeAt,
   getNoWorkHint,
   getFirstNameBlocklist,
+  getUserAccountName,
   addCampaignLeadsFromGroups,
   reactivateCampaignsWithPendingLeads,
 };

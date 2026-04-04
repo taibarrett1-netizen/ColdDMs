@@ -758,6 +758,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   const msg = substituteVariables(messageTemplate, leadFromPage, {
     firstNameBlocklist: sendOpts.firstNameBlocklist || new Set(),
     onFirstNameEmpty: (reason) => logger.warn(`First name empty for @${u}: ${reason}`),
+    senderName: sendOpts.senderName || '',
   });
   const shouldSendText = voiceCfg.mode !== 'voice_only';
   const shouldSendVoice = wantsVoiceNotes(voiceCfg);
@@ -1334,10 +1335,15 @@ async function sendDM(page, username, adapter, options = {}) {
     const list = await sb.getFirstNameBlocklist(options.clientId).catch(() => []);
     list.forEach((n) => firstNameBlocklist.add(n.toLowerCase()));
   }
+  let senderAccountName = '';
+  if (options.clientId && sb.getUserAccountName) {
+    senderAccountName = (await sb.getUserAccountName(options.clientId).catch(() => null)) || '';
+  }
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
       const result = await sendDMOnce(page, u, messageTemplate, nameFallback, {
         firstNameBlocklist,
+        senderName: senderAccountName,
         voiceNotePath: resolvedVoicePath,
         voiceNoteMode: resolvedVoiceMode,
         voiceDurationSec: options.voiceDurationSec,
