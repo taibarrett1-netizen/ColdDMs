@@ -29,7 +29,12 @@ const {
   VOICE_NOTE_STRICT_VERIFY,
 } = require('./utils/instagram-voice-note');
 const { dismissInstagramHomeModals } = require('./utils/instagram-modals');
-const { navigateToDmThread, sendPlainTextInThread } = require('./utils/open-dm-thread');
+const {
+  navigateToDmThread,
+  sendPlainTextInThread,
+  typeInstagramDmPlainTextInComposer,
+  typeInstagramDmPlainTextWithKeyboard,
+} = require('./utils/open-dm-thread');
 const { clickInstagramDmSearchResult, formatSearchFailurePageSnippet } = require('./utils/instagram-dm-search');
 const { attachInstagramSendIdCapture } = require('./utils/instagram-dm-network-ids');
 puppeteer.use(StealthPlugin());
@@ -826,7 +831,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     if (compose && shouldSendText) {
       await delay(500);
       await compose.click();
-      await compose.type(msg, { delay: 60 + Math.floor(Math.random() * 40) });
+      await typeInstagramDmPlainTextInComposer(page, compose, msg, {
+        delay: 60 + Math.floor(Math.random() * 40),
+      });
       await compose.dispose();
       await composeEl.dispose();
       await humanDelay();
@@ -863,7 +870,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   }, msg) : false;
   if (keyboardSent) {
     await delay(300);
-    await page.keyboard.type(msg, { delay: 60 + Math.floor(Math.random() * 40) });
+    await typeInstagramDmPlainTextWithKeyboard(page, msg, { delay: 60 + Math.floor(Math.random() * 40) });
     await humanDelay();
     await page.keyboard.press('Enter');
     await delay(1500);

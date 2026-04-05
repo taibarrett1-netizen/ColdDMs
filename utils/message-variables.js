@@ -3,6 +3,7 @@
  * Lead: {{username}}, {{first_name}}, {{last_name}}, {{full_name}}; {{instagram_username}} = {{username}}.
  * Account (SkeduleMore user, from users.name): {{sender_name}}, {{sender_first_name}}.
  * First name: from display_name (first word) or lead.first_name only.
+ * full_name: full display_name (all words), normalized; if no display_name, first_name + last_name.
  * Never derived from username; if no name is available, first_name/full_name are empty.
  */
 function normalizeName(str) {
@@ -14,6 +15,22 @@ function normalizeName(str) {
   s = s.trim();
   if (!s) return '';
   return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+}
+
+/** Full display string (e.g. "AI Setter Test") for {{full_name}} — not just the first word. */
+function normalizeFullDisplayName(str) {
+  if (!str || typeof str !== 'string') return '';
+  let s = str.trim();
+  if (!s) return '';
+  s = s.replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F000}-\u{1F02F}\u{1F0A0}-\u{1F0FF}\u{1F600}-\u{1F64F}\u{1F680}-\u{1F6FF}]/gu, '');
+  s = s.replace(/[^\p{L}\p{N}\s-]/gu, '');
+  s = s.trim().replace(/\s+/g, ' ');
+  if (!s) return '';
+  return s
+    .split(/\s+/)
+    .map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : ''))
+    .filter(Boolean)
+    .join(' ');
 }
 
 /**
@@ -52,7 +69,13 @@ function substituteVariables(text, lead = {}, opts = {}) {
     opts.onFirstNameEmpty(firstEmptyReason);
   }
 
-  const fullName = [first, last].filter(Boolean).join(' ');
+  let fullName = '';
+  if (lead.display_name && typeof lead.display_name === 'string' && lead.display_name.trim()) {
+    fullName = normalizeFullDisplayName(lead.display_name);
+  }
+  if (!fullName) {
+    fullName = [first, last].filter(Boolean).join(' ');
+  }
 
   const senderFull = typeof opts.senderName === 'string' ? opts.senderName.trim() : '';
   let senderFirst = '';
@@ -77,4 +100,4 @@ function substituteVariables(text, lead = {}, opts = {}) {
   return out;
 }
 
-module.exports = { substituteVariables, normalizeName };
+module.exports = { substituteVariables, normalizeName, normalizeFullDisplayName };

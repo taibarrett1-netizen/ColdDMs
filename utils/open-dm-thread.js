@@ -13,6 +13,38 @@ async function humanDelay() {
   await delay(500 + Math.floor(Math.random() * 1500));
 }
 
+/**
+ * Instagram Web sends the composer on Enter. Puppeteer type() turns \\n into Enter → multiple DMs.
+ * Use Shift+Enter between lines; caller sends with Enter once.
+ */
+async function typeInstagramDmPlainTextInComposer(page, composeHandle, msg, delayOpts) {
+  const lines = String(msg).split('\n');
+  const d = delayOpts || { delay: 60 };
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].length) await composeHandle.type(lines[i], d);
+    if (i < lines.length - 1) {
+      await page.keyboard.down('Shift');
+      await page.keyboard.press('Enter');
+      await page.keyboard.up('Shift');
+      await delay(50 + Math.floor(Math.random() * 40));
+    }
+  }
+}
+
+async function typeInstagramDmPlainTextWithKeyboard(page, msg, delayOpts) {
+  const lines = String(msg).split('\n');
+  const d = delayOpts || { delay: 60 };
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].length) await page.keyboard.type(lines[i], d);
+    if (i < lines.length - 1) {
+      await page.keyboard.down('Shift');
+      await page.keyboard.press('Enter');
+      await page.keyboard.up('Shift');
+      await delay(50 + Math.floor(Math.random() * 40));
+    }
+  }
+}
+
 async function navigateToDmThread(page, u) {
   await page.goto('https://www.instagram.com/direct/new/', { waitUntil: 'networkidle2', timeout: 20000 });
   await humanDelay();
@@ -248,7 +280,7 @@ async function sendPlainTextInThread(page, text, options = {}) {
   }
   await delay(400);
   await compose.click();
-  await compose.type(msg, { delay: 55 + Math.floor(Math.random() * 35) });
+  await typeInstagramDmPlainTextInComposer(page, compose, msg, { delay: 55 + Math.floor(Math.random() * 35) });
   await compose.dispose();
   await composeEl.dispose();
   await humanDelay();
@@ -268,4 +300,11 @@ async function sendPlainTextInThread(page, text, options = {}) {
   return out;
 }
 
-module.exports = { navigateToDmThread, sendPlainTextInThread, delay, humanDelay };
+module.exports = {
+  navigateToDmThread,
+  sendPlainTextInThread,
+  typeInstagramDmPlainTextInComposer,
+  typeInstagramDmPlainTextWithKeyboard,
+  delay,
+  humanDelay,
+};
