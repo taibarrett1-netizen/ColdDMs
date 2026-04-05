@@ -38,7 +38,8 @@ async function processOneJob(workerId, job) {
       } else {
         const hint = await sb.describePlatformScraperPoolForLogs().catch(() => '');
         logger.error(
-          `[scrape-worker] could not reserve a platform scraper for job ${job.id} (need Puppeteer cookies on pool rows). ${hint}`
+          `[scrape-worker] could not reserve a platform scraper for job ${job.id} (need Puppeteer cookies on pool rows). ${hint} ` +
+            `Check PM2 stderr for [platform-scraper-reserve] (set PLATFORM_SCRAPER_RESERVE_DEBUG=1 for per-attempt success logs).`
         );
       }
     }

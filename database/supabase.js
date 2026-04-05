@@ -28,6 +28,29 @@ function logNoWorkDebug(message, details = null) {
   }
 }
 
+function platformScraperReserveDebugEnabled() {
+  return (
+    process.env.PLATFORM_SCRAPER_RESERVE_DEBUG === '1' ||
+    process.env.PLATFORM_SCRAPER_RESERVE_DEBUG === 'true'
+  );
+}
+
+/** Logs why a compare-and-swap reserve did not return a row (always) or verbose success (when PLATFORM_SCRAPER_RESERVE_DEBUG=1). */
+function logPlatformScraperReserve(message, details = null, opts = {}) {
+  const { always = false } = opts;
+  if (!always && !platformScraperReserveDebugEnabled()) return;
+  const prefix = '[platform-scraper-reserve] ';
+  if (details == null) {
+    console.error(prefix + message);
+    return;
+  }
+  try {
+    console.error(prefix + message + ' ' + JSON.stringify(details));
+  } catch {
+    console.error(prefix + message);
+  }
+}
+
 function getSupabase() {
   if (_client) return _client;
   const url = process.env.SUPABASE_URL;
@@ -1001,27 +1024,70 @@ async function reservePlatformScraperSessionForWorker(workerId, leaseSec = 180) 
       return (usage[a.id] || 0) - (usage[b.id] || 0);
     });
 
+  const updatePayload = {
+    leased_until: leaseUntil,
+    leased_by_worker: workerId,
+    lease_heartbeat_at: nowIso,
+    updated_at: nowIso,
+  };
+
   for (const candidate of eligible) {
-    const { data, error } = await sb
-      .from('cold_dm_platform_scraper_sessions')
-      .update({
-        leased_until: leaseUntil,
-        leased_by_worker: workerId,
-        lease_heartbeat_at: nowIso,
-        updated_at: nowIso,
-      })
-      .eq('id', candidate.id)
-      .or(`leased_until.is.null,leased_until.lte.${nowIso}`)
-      .select('id, session_data, instagram_username')
-      .limit(1);
-    if (!error && data && data.length > 0) {
-      return {
-        id: data[0].id,
-        session_data: data[0].session_data,
-        instagram_username: data[0].instagram_username,
-      };
+    // Do not use a single .or(`leased_until.is.null,leased_until.lte.${nowIso}`): raw ISO in the filter
+    // breaks PostgREST parsing (colons/dots), so the UPDATE matches 0 rows while JS still shows "eligible".
+    const attempts = [
+      { name: 'leased_until_is_null', build: (q) => q.is('leased_until', null) },
+      { name: 'leased_until_lte_now', build: (q) => q.lte('leased_until', nowIso) },
+    ];
+
+    for (const attempt of attempts) {
+      let query = sb
+        .from('cold_dm_platform_scraper_sessions')
+        .update(updatePayload)
+        .eq('id', candidate.id);
+      query = attempt.build(query);
+      const { data, error } = await query.select('id, session_data, instagram_username').limit(1);
+
+      if (error) {
+        logPlatformScraperReserve('update failed', {
+          workerId,
+          candidateId: candidate.id,
+          attempt: attempt.name,
+          message: error.message,
+          code: error.code,
+          details: error.details,
+          hint: error.hint,
+        }, { always: true });
+        continue;
+      }
+
+      const rowCount = data?.length ?? 0;
+      if (rowCount > 0) {
+        logPlatformScraperReserve('reserved session', {
+          workerId,
+          candidateId: candidate.id,
+          attempt: attempt.name,
+        });
+        return {
+          id: data[0].id,
+          session_data: data[0].session_data,
+          instagram_username: data[0].instagram_username,
+        };
+      }
+
+      logPlatformScraperReserve('update matched 0 rows (lost race or stale eligible list)', {
+        workerId,
+        candidateId: candidate.id,
+        attempt: attempt.name,
+        nowIso,
+      }, { always: true });
     }
   }
+
+  logPlatformScraperReserve('no session reserved after trying all eligible candidates', {
+    workerId,
+    eligibleCount: eligible.length,
+    candidateIds: eligible.map((c) => c.id),
+  }, { always: true });
   return null;
 }
 
