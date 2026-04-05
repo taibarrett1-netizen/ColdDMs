@@ -26,6 +26,7 @@ const {
   getPlatformScraperSessionById,
   reservePlatformScraperSessionForWorker,
   describePlatformScraperPoolForLogs,
+  normalizePlatformSessionRowForPuppeteer,
   recordScraperActions,
 } = require('./database/supabase');
 const logger = require('./utils/logger');
@@ -48,8 +49,9 @@ async function resolvePuppeteerSessionForScrapeJob(jobId, leaseOptions) {
 
   if (job?.platform_scraper_session_id) {
     const platformSession = await getPlatformScraperSessionById(job.platform_scraper_session_id);
-    if (platformSession && Array.isArray(platformSession.session_data?.cookies) && platformSession.session_data.cookies.length > 0) {
-      session = platformSession;
+    const normalized = normalizePlatformSessionRowForPuppeteer(platformSession);
+    if (normalized) {
+      session = normalized;
       platformSessionId = job.platform_scraper_session_id;
     }
   }
@@ -57,10 +59,14 @@ async function resolvePuppeteerSessionForScrapeJob(jobId, leaseOptions) {
   if (!session && leaseOptions?.workerId) {
     const sec = Math.max(60, parseInt(leaseOptions.leaseSec || process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
     const reserved = await reservePlatformScraperSessionForWorker(leaseOptions.workerId, sec);
-    if (reserved && Array.isArray(reserved.session_data?.cookies) && reserved.session_data.cookies.length > 0) {
+    const normalizedReserved = normalizePlatformSessionRowForPuppeteer({
+      session_data: reserved?.session_data,
+      instagram_username: reserved?.instagram_username,
+    });
+    if (reserved && normalizedReserved) {
       session = {
-        session_data: reserved.session_data,
-        instagram_username: reserved.instagram_username,
+        session_data: normalizedReserved.session_data,
+        instagram_username: normalizedReserved.instagram_username,
       };
       platformSessionId = reserved.id;
       await updateScrapeJob(jobId, { platform_scraper_session_id: reserved.id });

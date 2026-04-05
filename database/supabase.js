@@ -897,10 +897,47 @@ function computeLeaseUntil(leaseSec = 180) {
   return new Date(Date.now() + sec * 1000).toISOString();
 }
 
-/** Puppeteer scrape jobs need session_data.cookies (Instagram login); pool rows without cookies must not be reserved. */
+/**
+ * Extract Puppeteer-style cookie array from JSONB (shape varies by VPS / proxy).
+ * Supports: { cookies: [...] }, nested session.cookies, stringified JSON, raw array.
+ */
+function getPuppeteerCookiesFromSessionData(sessionData) {
+  if (sessionData == null) return null;
+  let sd = sessionData;
+  if (typeof sd === 'string') {
+    try {
+      sd = JSON.parse(sd);
+    } catch {
+      return null;
+    }
+  }
+  if (Array.isArray(sd)) return sd.length ? sd : null;
+  if (typeof sd !== 'object') return null;
+  if (Array.isArray(sd.cookies) && sd.cookies.length) return sd.cookies;
+  if (sd.session && typeof sd.session === 'object' && Array.isArray(sd.session.cookies) && sd.session.cookies.length) {
+    return sd.session.cookies;
+  }
+  return null;
+}
+
+/** Pool rows must have at least one usable cookie for Puppeteer (see getPuppeteerCookiesFromSessionData). */
 function platformSessionHasPuppeteerCookies(s) {
-  const c = s && s.session_data && s.session_data.cookies;
+  const c = getPuppeteerCookiesFromSessionData(s && s.session_data);
   return Array.isArray(c) && c.length > 0;
+}
+
+/** Normalize to { cookies } for page.setCookie / scraper checks. */
+function normalizeSessionDataForPuppeteer(sessionData) {
+  const cookies = getPuppeteerCookiesFromSessionData(sessionData);
+  if (!cookies) return null;
+  return { cookies };
+}
+
+function normalizePlatformSessionRowForPuppeteer(row) {
+  if (!row) return null;
+  const norm = normalizeSessionDataForPuppeteer(row.session_data);
+  if (!norm) return null;
+  return { ...row, session_data: norm };
 }
 
 /**
@@ -1947,6 +1984,8 @@ module.exports = {
   saveScraperSession,
   getPlatformScraperSessions,
   getPlatformScraperSessionById,
+  getPuppeteerCookiesFromSessionData,
+  normalizePlatformSessionRowForPuppeteer,
   pickScraperSessionForJob,
   describePlatformScraperPoolForLogs,
   reservePlatformScraperSessionForWorker,
