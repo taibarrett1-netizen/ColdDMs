@@ -975,8 +975,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       logger.warn('[Scraper] Post-scrape warm skipped: ' + e.message);
     }
     if (platformSessionId && totalScraped > 0) {
-      const actionCount = Math.max(20, totalScraped + 10);
-      await recordScraperActions(platformSessionId, actionCount).catch(() => {});
+      await recordScraperActions(platformSessionId, totalScraped).catch(() => {});
     }
   } catch (err) {
     logger.error('[Scraper] Follower scrape failed', err);
@@ -1308,8 +1307,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     }
 
     if (platformSessionId && totalScraped > 0) {
-      const actionCount = Math.max(20, totalScraped + 10);
-      await recordScraperActions(platformSessionId, actionCount).catch(() => {});
+      await recordScraperActions(platformSessionId, totalScraped).catch(() => {});
     }
 
     await updateScrapeJob(jobId, { status: 'completed', scraped_count: totalScraped });

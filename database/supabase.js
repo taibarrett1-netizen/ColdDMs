@@ -1159,6 +1159,7 @@ async function pickScraperSessionForJob(clientId) {
   };
 }
 
+/** Adds `count` to today's cold_dm_scraper_daily_usage for this platform session. Count is leads actually scraped (job completion), not abstract "actions". */
 async function recordScraperActions(platformSessionId, count) {
   if (!platformSessionId || count <= 0) return;
   const sb = getSupabase();
