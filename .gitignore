@@ -17,6 +17,7 @@ database/*.db-journal
 # Admin Cold Outreach Lab (session + CSV output)
 admin_lab/.sessions/
 admin_lab/.out/
+admin_lab/.cache/
 
 # Logs
 logs/*.log

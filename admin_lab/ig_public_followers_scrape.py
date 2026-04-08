@@ -89,7 +89,11 @@ def walk_find_page_info(obj: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def fetch_profile_user_id(client: httpx.AsyncClient, username: str) -> str:
+async def fetch_profile_user_id(
+    client: httpx.AsyncClient,
+    username: str,
+    cookie_header: Optional[str] = None,
+) -> str:
     urls = [
         f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
         f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
@@ -100,6 +104,11 @@ async def fetch_profile_user_id(client: httpx.AsyncClient, username: str) -> str
             try:
                 headers = base_headers()
                 headers["Referer"] = f"https://www.instagram.com/{username}/"
+                if cookie_header:
+                    headers["Cookie"] = cookie_header
+                    csrf = csrf_from_cookie_header(cookie_header)
+                    if csrf:
+                        headers["X-CSRFToken"] = csrf
                 r = await client.get(url, headers=headers, timeout=45.0)
                 if r.status_code == 429:
                     last_err = RuntimeError(f"HTTP 429 from web_profile_info ({url})")
@@ -171,6 +180,42 @@ async def graphql_followers_page(
             last_err = e
             await asyncio.sleep(1.2 ** attempt + random.uniform(0.3, 1.2))
     raise RuntimeError(f"graphql followers failed: {last_err}")
+
+
+def _user_id_cache_file() -> str:
+    return os.path.join(os.path.dirname(__file__), ".cache", "user_ids.json")
+
+
+def load_cached_user_id(username: str) -> Optional[str]:
+    path = _user_id_cache_file()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        key = username.strip().lstrip("@").lower()
+        uid = data.get(key) if isinstance(data, dict) else None
+        return str(uid) if uid else None
+    except Exception:
+        return None
+
+
+def save_cached_user_id(username: str, uid: str) -> None:
+    cache_dir = os.path.join(os.path.dirname(__file__), ".cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    path = _user_id_cache_file()
+    data: Dict[str, str] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                data = {str(k): str(v) for k, v in raw.items()}
+        except Exception:
+            data = {}
+    data[username.strip().lstrip("@").lower()] = str(uid)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 
 def load_cookie_header() -> str:
@@ -304,9 +349,19 @@ async def run_scrape(username: str, proxy: str, max_users: int, output: str, use
         follow_redirects=True,
         timeout=httpx.Timeout(90.0),
     ) as client:
+        cookie_header = load_cookie_header()
         uid = user_id.strip() if isinstance(user_id, str) and user_id.strip() else None
         if not uid:
-            uid = await fetch_profile_user_id(client, username)
+            uid = load_cached_user_id(username)
+            if uid:
+                sys.stderr.write(f"[admin-lab] Using cached user id for @{username} -> {uid}\n")
+        if not uid:
+            uid = await fetch_profile_user_id(
+                client,
+                username,
+                cookie_header if cookie_header else None,
+            )
+            save_cached_user_id(username, uid)
         sys.stderr.write(f"[admin-lab] Resolved @{username} -> id={uid}\n")
 
         after: Optional[str] = None
@@ -314,7 +369,6 @@ async def run_scrape(username: str, proxy: str, max_users: int, output: str, use
         collected = 0
         buffer: List[Dict[str, str]] = []
         header_written = bool(os.path.exists(output) and os.path.getsize(output) > 0)
-        cookie_header = load_cookie_header()
         if mode in ("api_v1", "auto") and not cookie_header:
             raise RuntimeError(
                 "ADMIN_LAB_SCRAPE_MODE=api_v1 requires authenticated cookies. "
