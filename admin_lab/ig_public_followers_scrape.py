@@ -89,27 +89,40 @@ def walk_find_page_info(obj: Any, depth: int = 0) -> Optional[Dict[str, Any]]:
 
 
 async def fetch_profile_user_id(client: httpx.AsyncClient, username: str) -> str:
-    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    urls = [
+        f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
+        f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
+    ]
     last_err: Optional[Exception] = None
-    for attempt in range(4):
-        try:
-            r = await client.get(url, headers=base_headers(), timeout=45.0)
-            if r.status_code == 429:
-                await asyncio.sleep(2 ** attempt + random.uniform(1, 4))
-                continue
-            r.raise_for_status()
-            data = r.json()
-            uid = (
-                data.get("data", {})
-                .get("user", {})
-                .get("id")
-            )
-            if not uid:
-                raise RuntimeError(f"Unexpected web_profile_info shape: {json.dumps(data)[:400]}")
-            return str(uid)
-        except Exception as e:
-            last_err = e
-            await asyncio.sleep(1.5 ** attempt + random.uniform(0.2, 1))
+    for url in urls:
+        for attempt in range(4):
+            try:
+                headers = base_headers()
+                headers["Referer"] = f"https://www.instagram.com/{username}/"
+                r = await client.get(url, headers=headers, timeout=45.0)
+                if r.status_code == 429:
+                    last_err = RuntimeError(f"HTTP 429 from web_profile_info ({url})")
+                    await asyncio.sleep(2 ** attempt + random.uniform(1, 4))
+                    continue
+                if r.status_code >= 400:
+                    body_preview = r.text[:240].replace("\n", " ")
+                    raise RuntimeError(
+                        f"HTTP {r.status_code} from web_profile_info ({url}) body={body_preview}"
+                    )
+                data = r.json()
+                uid = (
+                    data.get("data", {})
+                    .get("user", {})
+                    .get("id")
+                )
+                if not uid:
+                    raise RuntimeError(
+                        f"Unexpected web_profile_info shape from {url}: {json.dumps(data)[:500]}"
+                    )
+                return str(uid)
+            except Exception as e:
+                last_err = e
+                await asyncio.sleep(1.5 ** attempt + random.uniform(0.2, 1))
     raise RuntimeError(f"web_profile_info failed: {last_err}")
 
 
