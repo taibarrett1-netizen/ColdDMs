@@ -44,6 +44,26 @@ function httpsJson(method, path, headers, bodyObj) {
         if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
           resolve({ status: res.statusCode, body: parsed });
         } else {
+          if (process.env.DECODO_DEBUG === '1') {
+            const debugPath = u.pathname + u.search;
+            const payload =
+              parsed && typeof parsed === 'object'
+                ? parsed
+                : { _nonJson: String(data ?? '') };
+            console.error('[decodoProvision] HTTP response (error)', {
+              method,
+              path: debugPath,
+              statusCode: res.statusCode,
+              headers: {
+                'content-type': res.headers['content-type'],
+                'content-length': res.headers['content-length'],
+              },
+              body: payload,
+            });
+            if (parsed && typeof parsed === 'object' && parsed._raw != null) {
+              console.error('[decodoProvision] HTTP response (non-JSON)', String(parsed._raw));
+            }
+          }
           const detail =
             parsed && typeof parsed === 'object' ? JSON.stringify(parsed) : String(data || '');
           const err = new Error(`Decodo HTTP ${res.statusCode}: ${detail.slice(0, 2000)}`);
