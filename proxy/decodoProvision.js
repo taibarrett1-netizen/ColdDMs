@@ -43,9 +43,9 @@ function httpsJson(method, path, headers, bodyObj) {
         if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
           resolve({ status: res.statusCode, body: parsed });
         } else {
-          const err = new Error(
-            `Decodo HTTP ${res.statusCode}: ${typeof parsed === 'object' ? JSON.stringify(parsed).slice(0, 400) : data.slice(0, 400)}`
-          );
+          const detail =
+            parsed && typeof parsed === 'object' ? JSON.stringify(parsed) : String(data || '');
+          const err = new Error(`Decodo HTTP ${res.statusCode}: ${detail.slice(0, 2000)}`);
           err.statusCode = res.statusCode;
           err.body = parsed;
           reject(err);
@@ -112,23 +112,32 @@ function stableSubuserUsername(clientId, instagramUsername) {
   return `skm_${h}`;
 }
 
-/** Decodo: 9+ chars, ≥1 upper, ≥1 digit; no @ or : */
+/**
+ * Decodo v2: ≥9 chars, ≥1 upper, ≥1 number, no @ or : (docs). Many accounts also enforce a lowercase letter.
+ * Use alphanumeric only so proxy URL encoding never breaks.
+ */
 function randomSubuserPassword() {
   const lower = 'abcdefghijklmnopqrstuvwxyz';
   const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
   const digits = '0123456789';
-  const safe = lower + upper + digits;
-  let s = '';
-  s += upper[crypto.randomInt(upper.length)];
-  s += digits[crypto.randomInt(digits.length)];
-  const extra = 14 + crypto.randomInt(10);
-  for (let i = 0; i < extra; i++) s += safe[crypto.randomInt(safe.length)];
-  const arr = s.split('');
-  for (let i = arr.length - 1; i > 0; i--) {
-    const j = crypto.randomInt(i + 1);
-    [arr[i], arr[j]] = [arr[j], arr[i]];
+  const all = lower + upper + digits;
+  const len = 20 + crypto.randomInt(8);
+  const chars = [];
+  chars.push(upper[crypto.randomInt(upper.length)]);
+  chars.push(lower[crypto.randomInt(lower.length)]);
+  chars.push(digits[crypto.randomInt(digits.length)]);
+  for (let i = chars.length; i < len; i++) {
+    chars.push(all[crypto.randomInt(all.length)]);
   }
-  return arr.join('').slice(0, 64);
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [chars[i], chars[j]] = [chars[j], chars[i]];
+  }
+  const out = chars.join('').slice(0, 64);
+  if (!/[A-Z]/.test(out) || !/[a-z]/.test(out) || !/[0-9]/.test(out) || out.length < 9) {
+    return 'Aa9' + out.replace(/[^A-Za-z0-9]/g, 'x').slice(0, 61);
+  }
+  return out;
 }
 
 function buildProxyUrlFromCredentials(username, password) {
@@ -139,8 +148,22 @@ function buildProxyUrlFromCredentials(username, password) {
   return `http://${u}:${p}@${host}:${port}`;
 }
 
+/** @returns {Promise<Array<{ id?: number, username?: string }>>} */
+async function listDecodoSubUsers(authHeaders, serviceType) {
+  const q = new URLSearchParams({ service_type: serviceType }).toString();
+  const { body } = await httpsJson('GET', `${API_BASE}/v2/sub-users?${q}`, authHeaders, null);
+  return Array.isArray(body) ? body : [];
+}
+
+async function putDecodoSubUserPassword(authHeaders, subUserId, password) {
+  await httpsJson('PUT', `${API_BASE}/v2/sub-users/${encodeURIComponent(subUserId)}`, authHeaders, {
+    password,
+  });
+}
+
 /**
- * Create a new Decodo sub-user and return proxy URL + provider_ref for storage.
+ * Create or reuse a Decodo sub-user (stable username per client+IG) and return proxy URL + provider_ref.
+ * If the sub-user already exists (e.g. orphaned from a failed DB write), we rotate password via PUT.
  */
 async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
   const authHeaders = getDecodoAuthHeaders();
@@ -148,19 +171,61 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
   const subPassword = randomSubuserPassword();
   const serviceType = (process.env.DECODO_SUBUSER_SERVICE_TYPE || 'residential_proxies').trim();
 
-  try {
-    await httpsJson('POST', `${API_BASE}/v2/sub-users`, authHeaders, {
-      username: subUsername,
-      password: subPassword,
-      service_type: serviceType,
-    });
-  } catch (e) {
-    if (e && e.statusCode === 401) {
+  const enrichError = (e) => {
+    if (!e || e.decodoEnriched) return e;
+    e.decodoEnriched = true;
+    if (e.statusCode === 401) {
       const extra =
         ' Decodo expects the raw key in Authorization by default. If you still see 401, try DECODO_AUTH_SCHEME=bearer, or paste the exact header into DECODO_AUTHORIZATION. Confirm the key is the Proxy Public API key (Settings → API keys), not a scraper-only key.';
       e.message = (e.message || 'Decodo 401') + extra;
     }
-    throw e;
+    if (e.statusCode === 400) {
+      const extra400 =
+        ' Read the JSON above: an "error" field often names username/password/service_type. Try DECODO_SUBUSER_SERVICE_TYPE=shared_proxies if you do not have residential. If the sub-user already existed, we retry with PUT; otherwise fix validation or remove the conflicting user in the Decodo dashboard.';
+      e.message = (e.message || 'Decodo 400') + extra400;
+    }
+    return e;
+  };
+
+  try {
+    let rows = [];
+    try {
+      rows = await listDecodoSubUsers(authHeaders, serviceType);
+    } catch (_) {
+      rows = [];
+    }
+    const existing = rows.find((r) => r && String(r.username) === subUsername);
+
+    if (existing && existing.id != null) {
+      await putDecodoSubUserPassword(authHeaders, existing.id, subPassword);
+    } else {
+      try {
+        await httpsJson('POST', `${API_BASE}/v2/sub-users`, authHeaders, {
+          username: subUsername,
+          password: subPassword,
+          service_type: serviceType,
+        });
+      } catch (postErr) {
+        if (postErr && postErr.statusCode === 400) {
+          let rows2 = [];
+          try {
+            rows2 = await listDecodoSubUsers(authHeaders, serviceType);
+          } catch (_) {
+            rows2 = [];
+          }
+          const found = rows2.find((r) => r && String(r.username) === subUsername);
+          if (found && found.id != null) {
+            await putDecodoSubUserPassword(authHeaders, found.id, subPassword);
+          } else {
+            throw enrichError(postErr);
+          }
+        } else {
+          throw enrichError(postErr);
+        }
+      }
+    }
+  } catch (e) {
+    throw enrichError(e);
   }
 
   const proxyUrl = buildProxyUrlFromCredentials(subUsername, subPassword);
