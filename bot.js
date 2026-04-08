@@ -37,6 +37,7 @@ const {
 } = require('./utils/open-dm-thread');
 const { clickInstagramDmSearchResult, formatSearchFailurePageSnippet } = require('./utils/instagram-dm-search');
 const { attachInstagramSendIdCapture } = require('./utils/instagram-dm-network-ids');
+const { applyProxyToLaunchOptions, authenticatePageForProxy } = require('./utils/proxy-puppeteer');
 puppeteer.use(StealthPlugin());
 
 const DAILY_LIMIT = Math.min(parseInt(process.env.DAILY_SEND_LIMIT, 10) || 100, 200);
@@ -898,7 +899,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   return { ok: false, reason: noComposeReason || 'no_compose' };
 }
 
-function buildFollowUpLaunchOptions(fakeMicPath = DEFAULT_CHROME_FAKE_MIC_WAV) {
+function buildFollowUpLaunchOptions(fakeMicPath = DEFAULT_CHROME_FAKE_MIC_WAV, proxyUrl = null) {
   // NEW: Chrome fake mic with file injection (no PulseAudio needed).
   ensureChromeFakeMicPlaceholder(logger, fakeMicPath);
   const opts = {
@@ -913,6 +914,7 @@ function buildFollowUpLaunchOptions(fakeMicPath = DEFAULT_CHROME_FAKE_MIC_WAV) {
   appendChromeFakeMicArgs(opts.args, fakeMicPath);
   applyPuppeteerSlowMo(opts);
   applyHeadedChromeWindowToLaunchOpts(opts);
+  applyProxyToLaunchOptions(opts, proxyUrl);
   return opts;
 }
 
@@ -952,9 +954,10 @@ async function debugOpenFollowUpBrowserForManualTest(body) {
       return { ok: false, error: 'Session has no cookies; reconnect Instagram' };
     }
 
-    const launchOpts = buildFollowUpLaunchOptions();
+    const launchOpts = buildFollowUpLaunchOptions(DEFAULT_CHROME_FAKE_MIC_WAV, session.proxy_url);
     browser = await puppeteer.launch(launchOpts);
     const page = await browser.newPage();
+    await authenticatePageForProxy(page, session.proxy_url);
     await grantMicrophoneForInstagram(page, logger);
     await applyDesktopEmulation(page);
     await page.setCookie(...cookies);
@@ -1169,12 +1172,13 @@ async function sendFollowUp(body) {
     await resolved.cleanup();
   }
 
-  const launchOpts = buildFollowUpLaunchOptions(followUpFakeMicPath);
+  const launchOpts = buildFollowUpLaunchOptions(followUpFakeMicPath, session.proxy_url);
   let browser;
   let idCapture = null;
   try {
     browser = await puppeteer.launch(launchOpts);
     const page = await browser.newPage();
+    await authenticatePageForProxy(page, session.proxy_url);
     idCapture = attachInstagramSendIdCapture(page, { logger });
     if (hasAudio) await grantMicrophoneForInstagram(page, logger);
     await page.setCookie(...cookies);
@@ -1476,35 +1480,63 @@ async function runBotMultiTenant() {
   logger.log('Starting multi-tenant sender loop (always-on).');
   // NEW: Chrome fake mic with file injection (no PulseAudio needed).
   ensureChromeFakeMicPlaceholder(logger);
-  const launchOpts = {
-    headless: HEADLESS,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--autoplay-policy=no-user-gesture-required',
-    ],
-  };
-  appendChromeFakeMicArgs(launchOpts.args);
-  applyPuppeteerSlowMo(launchOpts);
-  applyHeadedChromeWindowToLaunchOpts(launchOpts);
-  if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
-  let browser;
-  try {
-    browser = await puppeteer.launch(launchOpts);
-  } catch (e) {
-    logger.error('Browser launch failed', e);
-    throw e;
-  }
-  let page;
+  let browser = null;
+  let page = null;
+  /** @type {string|null|undefined} undefined = never launched; '' = no proxy */
+  let currentProxyKey = undefined;
   let currentSessionId = null;
   const campaignRoundRobin = new Map();
   /** Retries when cold_dm_control has no pause=0 yet (race right after dashboard Start). */
   let noPauseZeroEmptyRounds = 0;
 
-  async function ensurePageSession(pg, session) {
+  function proxyKeyForSession(session) {
+    return session && session.proxy_url ? String(session.proxy_url).trim() : '';
+  }
+
+  async function ensureBrowserForSession(session) {
+    const key = proxyKeyForSession(session);
+    const needLaunch = !browser || currentProxyKey !== key;
+    if (!needLaunch) return;
+    if (browser) {
+      await browser.close().catch(() => {});
+      browser = null;
+      page = null;
+      currentSessionId = null;
+    }
+    currentProxyKey = key;
+    const launchOpts = {
+      headless: HEADLESS,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--autoplay-policy=no-user-gesture-required',
+      ],
+    };
+    appendChromeFakeMicArgs(launchOpts.args);
+    applyPuppeteerSlowMo(launchOpts);
+    applyHeadedChromeWindowToLaunchOpts(launchOpts);
+    applyProxyToLaunchOptions(launchOpts, session.proxy_url || null);
+    if (launchOpts.slowMo) logger.log(`Puppeteer slowMo=${launchOpts.slowMo}ms (PUPPETEER_SLOW_MO_MS)`);
+    try {
+      browser = await puppeteer.launch(launchOpts);
+    } catch (e) {
+      logger.error('Browser launch failed', e);
+      throw e;
+    }
+    page = await browser.newPage();
+    await authenticatePageForProxy(page, session.proxy_url);
+    await grantMicrophoneForInstagram(page, logger);
+    if (VOICE_NOTE_FILE) await applyDesktopEmulation(page);
+    else await applyMobileEmulation(page);
+  }
+
+  async function ensurePageSession(session) {
     const cookies = session?.session_data?.cookies;
     if (!cookies?.length) return false;
+    await ensureBrowserForSession(session);
+    const pg = page;
+    if (!pg) return false;
     if (currentSessionId === session.id) return true;
     try {
       const existing = await pg.cookies();
@@ -1524,17 +1556,6 @@ async function runBotMultiTenant() {
     }
   }
 
-  try {
-    page = await browser.newPage();
-    await grantMicrophoneForInstagram(page, logger);
-    if (VOICE_NOTE_FILE) await applyDesktopEmulation(page);
-    else await applyMobileEmulation(page);
-  } catch (err) {
-    logger.error('Page setup failed', err);
-    await browser.close().catch(() => {});
-    throw err;
-  }
-
   for (;;) {
     // Fresh DB read every iteration (no cache). After PM2 restart, first run sees current cold_dm_control, cold_dm_campaigns.status, and cold_dm_campaign_leads.
     const next = await sb.getNextPendingWorkAnyClient(SEND_WORKER_ID, SEND_LEASE_SECONDS);
@@ -1550,7 +1571,7 @@ async function runBotMultiTenant() {
           continue;
         }
         logger.error('[send-worker] Giving up: still no pause=0 clients after ~6 min.');
-        await browser.close().catch(() => {});
+        await browser?.close().catch(() => {});
         process.exit(0);
       }
       noPauseZeroEmptyRounds = 0;
@@ -1588,7 +1609,7 @@ async function runBotMultiTenant() {
           await sb.setControl(cid, 1).catch(() => {});
         }
         logger.log('No work. Exiting. Start again from the dashboard when you have a campaign to run.');
-        await browser.close().catch(() => {});
+        await browser?.close().catch(() => {});
         process.exit(0);
       }
       const sleepMs = Math.max(1000, earliestResumeAt.getTime() - Date.now());
@@ -1632,7 +1653,7 @@ async function runBotMultiTenant() {
     }
     state.lastIndex = (state.lastIndex + 1) % sessions.length;
     const session = sessions[state.lastIndex];
-    const ok = await ensurePageSession(page, session);
+    const ok = await ensurePageSession(session);
     if (!ok) {
       logger.warn('Could not load session for campaign, failing lead.');
       await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', null, SEND_WORKER_ID).catch(() => {});
@@ -1670,13 +1691,11 @@ async function runBotMultiTenant() {
           const conv = convertToChromeFakeMicWav(resolved.localPath, logger);
           options.voiceDurationSec = conv.durationSec;
           await browser.close().catch(() => {});
-          browser = await puppeteer.launch(launchOpts);
-          page = await browser.newPage();
-          await grantMicrophoneForInstagram(page, logger);
-          await applyDesktopEmulation(page);
+          browser = null;
+          page = null;
           currentSessionId = null;
-          const ok = await ensurePageSession(page, session);
-          if (!ok) {
+          const okVoice = await ensurePageSession(session);
+          if (!okVoice) {
             logger.warn('Could not restore session after voice browser restart.');
           }
         }
@@ -1916,7 +1935,8 @@ async function runBot() {
  * If the account has 2FA and no code is provided, returns { twoFactorRequired: true, page, browser, username }
  * so the server can keep the session and the user can submit the code to POST /api/instagram/connect/2fa.
  */
-async function connectInstagram(instagramUsername, instagramPassword, twoFactorCode = null) {
+async function connectInstagram(instagramUsername, instagramPassword, twoFactorCode = null, options = {}) {
+  const proxyUrl = options && options.proxyUrl;
   const useMobile = process.env.DISABLE_MOBILE_LOGIN !== '1' && process.env.DISABLE_MOBILE_LOGIN !== 'true';
   if (!useMobile) logger.log('Using desktop view for login (DISABLE_MOBILE_LOGIN is set).');
   // NEW: Chrome fake mic with file injection (no PulseAudio needed).
@@ -1932,10 +1952,12 @@ async function connectInstagram(instagramUsername, instagramPassword, twoFactorC
   };
   appendChromeFakeMicArgs(connectLaunch.args);
   applyPuppeteerSlowMo(connectLaunch);
+  applyProxyToLaunchOptions(connectLaunch, proxyUrl);
   const browser = await puppeteer.launch(connectLaunch);
   let keepBrowserOpen = false;
   try {
     const page = await browser.newPage();
+    await authenticatePageForProxy(page, proxyUrl);
     if (useMobile && !VOICE_NOTE_FILE) await applyMobileEmulation(page);
     else await applyDesktopEmulation(page);
     await login(page, {

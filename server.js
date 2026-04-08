@@ -35,6 +35,7 @@ const {
   getNoWorkHint,
   reactivateCampaignsWithPendingLeads,
   tryVpsIdempotencyOnce,
+  getOrResolveColdDmProxyUrl,
 } = require('./database/supabase');
 const {
   loadLeadsFromCSV,
@@ -707,7 +708,20 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
   }
   try {
-    const result = await connectInstagram(username, password, null);
+    const igKey = String(username)
+      .trim()
+      .replace(/^@/, '')
+      .toLowerCase();
+    let proxyMeta = { proxyUrl: null, proxyAssignmentId: null };
+    try {
+      proxyMeta = await getOrResolveColdDmProxyUrl(clientId, igKey);
+    } catch (pe) {
+      return res.status(503).json({
+        ok: false,
+        error: pe instanceof Error ? pe.message : String(pe) || 'Could not allocate proxy (check Decodo API and credits)',
+      });
+    }
+    const result = await connectInstagram(username, password, null, { proxyUrl: proxyMeta.proxyUrl });
     if (result.twoFactorRequired) {
       cleanupExpired2FA();
       const pendingId = require('crypto').randomBytes(16).toString('hex');
@@ -717,6 +731,8 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
         username: result.username,
         clientId,
         createdAt: Date.now(),
+        proxyUrl: proxyMeta.proxyUrl,
+        proxyAssignmentId: proxyMeta.proxyAssignmentId,
       });
       return res.status(200).json({
         ok: false,
@@ -725,7 +741,10 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
         pending2FAId: pendingId,
       });
     }
-    await saveSession(clientId, { cookies: result.cookies }, result.username);
+    await saveSession(clientId, { cookies: result.cookies }, result.username, {
+      proxyUrl: proxyMeta.proxyUrl,
+      proxyAssignmentId: proxyMeta.proxyAssignmentId,
+    });
     await updateSettingsInstagramUsername(clientId, result.username);
     res.json({ ok: true });
   } catch (e) {
@@ -760,7 +779,10 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
   pending2FAMap.delete(pending2FAId);
   try {
     const result = await completeInstagram2FA(pending.page, pending.browser, twoFactorCode, pending.username);
-    await saveSession(clientId, { cookies: result.cookies }, result.username);
+    await saveSession(clientId, { cookies: result.cookies }, result.username, {
+      proxyUrl: pending.proxyUrl,
+      proxyAssignmentId: pending.proxyAssignmentId,
+    });
     await updateSettingsInstagramUsername(clientId, result.username);
     res.json({ ok: true });
   } catch (e) {

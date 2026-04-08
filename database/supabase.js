@@ -6,6 +6,8 @@ const { createClient } = require('@supabase/supabase-js');
 const path = require('path');
 const fs = require('fs');
 
+const decodoProvision = require('../proxy/decodoProvision');
+
 const CLIENT_ID_FILE = path.join(process.cwd(), '.cold_dm_client_id');
 
 let _client = null;
@@ -317,7 +319,7 @@ async function getSession(clientId) {
   if (!sb || !clientId) return null;
   const { data, error } = await sb
     .from('cold_dm_instagram_sessions')
-    .select('id, session_data, instagram_username')
+    .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id')
     .eq('client_id', clientId)
     .maybeSingle();
   if (error) throw error;
@@ -330,7 +332,7 @@ async function getInstagramSessionByIdForClient(clientId, sessionId) {
   if (!sb || !clientId || !sessionId) return null;
   const { data, error } = await sb
     .from('cold_dm_instagram_sessions')
-    .select('id, client_id, session_data, instagram_username')
+    .select('id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id')
     .eq('id', sessionId)
     .eq('client_id', clientId)
     .maybeSingle();
@@ -344,7 +346,7 @@ async function getSessions(clientId) {
   if (!sb || !clientId) return [];
   const { data, error } = await sb
     .from('cold_dm_instagram_sessions')
-    .select('id, session_data, instagram_username')
+    .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id')
     .eq('client_id', clientId)
     .order('id', { ascending: true });
   if (error) throw error;
@@ -370,7 +372,7 @@ async function getSessionsForCampaign(clientId, campaignId) {
     if (ids.length === 0) return getSessions(clientId);
     const { data: sessions, error: sessErr } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, session_data, instagram_username')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id')
       .eq('client_id', clientId)
       .in('id', ids)
       .order('id', { ascending: true });
@@ -381,23 +383,86 @@ async function getSessionsForCampaign(clientId, campaignId) {
   }
 }
 
-async function saveSession(clientId, sessionData, instagramUsername) {
+function normalizeInstagramKey(instagramUsername) {
+  return (instagramUsername || '').trim().replace(/^@/, '').toLowerCase() || null;
+}
+
+/**
+ * Resolve or create Decodo sub-user proxy for this client + IG handle. Reuses cold_dm_proxy_assignments after session delete.
+ * @returns {{ proxyUrl: string|null, proxyAssignmentId: string|null }}
+ */
+async function getOrResolveColdDmProxyUrl(clientId, instagramUsername) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
-  const username = (instagramUsername || '').trim().replace(/^@/, '');
-  const { error } = await sb
-    .from('cold_dm_instagram_sessions')
-    .upsert(
-      {
-        client_id: clientId,
-        session_data: sessionData,
-        instagram_username: username || null,
-        updated_at: new Date().toISOString(),
-      },
-      // Unique constraint is (client_id), so the conflict target must match
-      // or Postgres will treat this like a plain insert and throw 23505.
-      { onConflict: 'client_id' }
-    );
+  const ig = normalizeInstagramKey(instagramUsername);
+  if (!ig) throw new Error('instagram username required for proxy resolution');
+
+  const { data: existing, error: selErr } = await sb
+    .from('cold_dm_proxy_assignments')
+    .select('id, proxy_url')
+    .eq('client_id', clientId)
+    .eq('instagram_username', ig)
+    .maybeSingle();
+  if (selErr) throw selErr;
+  if (existing?.proxy_url) {
+    return { proxyUrl: existing.proxy_url, proxyAssignmentId: existing.id };
+  }
+
+  if (!decodoProvision.isDecodoAutoConfigured()) {
+    return { proxyUrl: null, proxyAssignmentId: null };
+  }
+
+  const { proxyUrl, providerRef } = await decodoProvision.provisionDecodoSubuserProxy(clientId, ig);
+  const { data: inserted, error: insErr } = await sb
+    .from('cold_dm_proxy_assignments')
+    .insert({
+      client_id: clientId,
+      instagram_username: ig,
+      proxy_url: proxyUrl,
+      provider: 'decodo',
+      provider_ref: providerRef,
+      updated_at: new Date().toISOString(),
+    })
+    .select('id')
+    .maybeSingle();
+
+  if (insErr && insErr.code === '23505') {
+    const { data: again } = await sb
+      .from('cold_dm_proxy_assignments')
+      .select('id, proxy_url')
+      .eq('client_id', clientId)
+      .eq('instagram_username', ig)
+      .maybeSingle();
+    if (again?.proxy_url) {
+      return { proxyUrl: again.proxy_url, proxyAssignmentId: again.id };
+    }
+    throw insErr;
+  }
+  if (insErr) throw insErr;
+  return { proxyUrl, proxyAssignmentId: inserted?.id || null };
+}
+
+/**
+ * @param {object} proxyOpts
+ * @param {string|null} [proxyOpts.proxyUrl]
+ * @param {string|null} [proxyOpts.proxyAssignmentId]
+ */
+async function saveSession(clientId, sessionData, instagramUsername, proxyOpts = {}) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const username = normalizeInstagramKey(instagramUsername);
+  const row = {
+    client_id: clientId,
+    session_data: sessionData,
+    instagram_username: username || null,
+    updated_at: new Date().toISOString(),
+  };
+  if (proxyOpts.proxyUrl) row.proxy_url = proxyOpts.proxyUrl;
+  if (proxyOpts.proxyAssignmentId) row.proxy_assignment_id = proxyOpts.proxyAssignmentId;
+
+  const { error } = await sb.from('cold_dm_instagram_sessions').upsert(row, {
+    onConflict: 'client_id,instagram_username',
+  });
   if (error) throw error;
 }
 
@@ -2156,6 +2221,7 @@ module.exports = {
   updateCampaignLeadStatus,
   getClientIdsWithPauseZero,
   getNextPendingWorkAnyClient,
+  getOrResolveColdDmProxyUrl,
   getClientOutsideScheduleStatus,
   getClientNoWorkReason,
   getClientNoWorkResumeAt,
