@@ -426,6 +426,13 @@ function registerAdminLabRoutes(app) {
     child.stderr.on('data', (d) => {
       stderrBuf += d.toString();
       if (stderrBuf.length > 12000) stderrBuf = stderrBuf.slice(-8000);
+      const prev = resolveJobs.get(jobId);
+      if (prev && prev.status === 'running') {
+        resolveJobs.set(jobId, {
+          ...prev,
+          stderrTail: stderrBuf.slice(-2000),
+        });
+      }
     });
 
     const killTimer = setTimeout(() => {
