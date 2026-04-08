@@ -1456,7 +1456,7 @@ async function workerHeartbeat(workerId, workerType, meta = {}) {
   }
 }
 
-/** Returns Set of normalised usernames in cold_dm_scrape_blocklist (do not scrape as leads). */
+/** Returns Set of normalised usernames in cold_dm_scrape_blocklist (do not scrape as leads or cold-DM). */
 async function getScrapeBlocklistUsernames(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return new Set();
@@ -1701,6 +1701,7 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
   const sb = getSupabase();
   if (!sb || !clientId) return null;
   const campaigns = await getActiveCampaigns(clientId);
+  const scrapeBlocklistSet = await getScrapeBlocklistUsernames(clientId);
   const campaignDebug = [];
   for (const camp of campaigns) {
     const dbg = {
@@ -1713,6 +1714,7 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
       pendingCount: 0,
       skippedMissingLeadRow: 0,
       skippedAlreadySent: 0,
+      skippedBlocklist: 0,
       blockedBy: null,
       reason: null,
     };
@@ -1818,6 +1820,12 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
       if (!leadData?.username) {
         dbg.skippedMissingLeadRow += 1;
         await updateCampaignLeadStatus(pendingRow.id, 'failed').catch(() => {});
+        continue;
+      }
+      const unameNorm = normalizeUsername(leadData.username).toLowerCase();
+      if (scrapeBlocklistSet.has(unameNorm)) {
+        dbg.skippedBlocklist += 1;
+        await updateCampaignLeadStatus(pendingRow.id, 'failed', 'blocklist').catch(() => {});
         continue;
       }
       const sent = await alreadySent(clientId, leadData.username);
