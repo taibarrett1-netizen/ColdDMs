@@ -1,13 +1,11 @@
 /**
- * Decodo API: create a sub-user per Cold DM IG connect, build http://user:pass@gate:port URL.
- * Docs: https://github.com/Decodo/Decodo-API — POST /v1/auth (Basic), POST /v1/users/:userId/sub-users (Token).
+ * Decodo Public API v2: create sub-users with dashboard API key (Authorization header).
+ * OpenAPI: https://help.decodo.com/reference — POST /v2/sub-users (no /v1/auth; that flow was removed).
  */
 const crypto = require('crypto');
 const https = require('https');
 
 const API_BASE = (process.env.DECODO_API_BASE || 'https://api.decodo.com').replace(/\/$/, '');
-
-let authCache = { token: null, userId: null, expiresAt: 0 };
 
 function httpsJson(method, path, headers, bodyObj) {
   return new Promise((resolve, reject) => {
@@ -60,38 +58,31 @@ function httpsJson(method, path, headers, bodyObj) {
   });
 }
 
-async function decodoAuth() {
-  const now = Date.now();
-  if (authCache.token && authCache.userId && now < authCache.expiresAt - 60_000) {
-    return { userId: authCache.userId, token: authCache.token };
+/**
+ * @returns {Record<string, string>}
+ */
+function getDecodoAuthHeaders() {
+  const full = (process.env.DECODO_AUTHORIZATION || '').trim();
+  if (full) {
+    return { Authorization: full };
   }
-  const user = (process.env.DECODO_API_USER || '').trim();
-  const pass = (process.env.DECODO_API_PASSWORD || '').trim();
-  const apiKey = (process.env.DECODO_API_KEY || '').trim();
-  /** Official examples use dashboard "username:password" (often email + account password). API key–only accounts: Basic `key:` (empty password). */
-  let basic;
-  if (user && pass) {
-    basic = Buffer.from(`${user}:${pass}`, 'utf8').toString('base64');
-  } else if (apiKey) {
-    basic = Buffer.from(`${apiKey}:`, 'utf8').toString('base64');
-  } else {
+  const key = (process.env.DECODO_API_KEY || process.env.DECODO_API_TOKEN || '').trim();
+  if (!key) {
     throw new Error(
-      'Decodo auth: set DECODO_API_USER + DECODO_API_PASSWORD (dashboard login / account credentials per Decodo docs), or set DECODO_API_KEY alone'
+      'Decodo: set DECODO_API_KEY (dashboard → API / Public API key). Legacy POST /v1/auth was removed; see https://help.decodo.com/reference/public-api-key-authentication'
     );
   }
-  // No trailing slash — api.decodo.com returns 404 "Route not found" for /v1/auth/
-  const { body } = await httpsJson('POST', `${API_BASE}/v1/auth`, { Authorization: `Basic ${basic}` }, null);
-  const token = body && (body.token || body.access_token);
-  const userId = body && (body.user_id || body.userId);
-  if (!token || !userId) {
-    throw new Error('Decodo auth response missing user_id or token');
+  const scheme = (process.env.DECODO_AUTH_SCHEME || 'bearer').toLowerCase();
+  if (scheme === 'raw') {
+    return { Authorization: key };
   }
-  authCache = {
-    token,
-    userId: String(userId),
-    expiresAt: now + 50 * 60 * 1000,
-  };
-  return { userId: authCache.userId, token: authCache.token };
+  if (scheme === 'token') {
+    return { Authorization: `Token ${key}` };
+  }
+  if (key.toLowerCase().startsWith('bearer ')) {
+    return { Authorization: key };
+  }
+  return { Authorization: `Bearer ${key}` };
 }
 
 function stableSubuserUsername(clientId, instagramUsername) {
@@ -105,8 +96,23 @@ function stableSubuserUsername(clientId, instagramUsername) {
   return `skm_${h}`;
 }
 
+/** Decodo: 9+ chars, ≥1 upper, ≥1 digit; no @ or : */
 function randomSubuserPassword() {
-  return crypto.randomBytes(16).toString('base64url').replace(/[^a-zA-Z0-9]/g, '').slice(0, 24);
+  const lower = 'abcdefghijklmnopqrstuvwxyz';
+  const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  const digits = '0123456789';
+  const safe = lower + upper + digits;
+  let s = '';
+  s += upper[crypto.randomInt(upper.length)];
+  s += digits[crypto.randomInt(digits.length)];
+  const extra = 14 + crypto.randomInt(10);
+  for (let i = 0; i < extra; i++) s += safe[crypto.randomInt(safe.length)];
+  const arr = s.split('');
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr.join('').slice(0, 64);
 }
 
 function buildProxyUrlFromCredentials(username, password) {
@@ -121,21 +127,16 @@ function buildProxyUrlFromCredentials(username, password) {
  * Create a new Decodo sub-user and return proxy URL + provider_ref for storage.
  */
 async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
-  const { userId, token } = await decodoAuth();
+  const authHeaders = getDecodoAuthHeaders();
   const subUsername = stableSubuserUsername(clientId, instagramUsername);
   const subPassword = randomSubuserPassword();
   const serviceType = (process.env.DECODO_SUBUSER_SERVICE_TYPE || 'residential_proxies').trim();
 
-  await httpsJson(
-    'POST',
-    `${API_BASE}/v1/users/${encodeURIComponent(userId)}/sub-users`,
-    { Authorization: `Token ${token}` },
-    {
-      username: subUsername,
-      password: subPassword,
-      service_type: serviceType,
-    }
-  );
+  await httpsJson('POST', `${API_BASE}/v2/sub-users`, authHeaders, {
+    username: subUsername,
+    password: subPassword,
+    service_type: serviceType,
+  });
 
   const proxyUrl = buildProxyUrlFromCredentials(subUsername, subPassword);
   const providerRef = {
@@ -143,16 +144,16 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
     gate_host: process.env.DECODO_GATE_HOST || 'gate.decodo.com',
     gate_port: process.env.DECODO_GATE_PORT || '10001',
     service_type: serviceType,
+    api: 'v2',
   };
   return { proxyUrl, providerRef };
 }
 
 function isDecodoAutoConfigured() {
   if (process.env.DECODO_DISABLE_AUTO === '1' || process.env.DECODO_DISABLE_AUTO === 'true') return false;
-  const user = (process.env.DECODO_API_USER || '').trim();
-  const pass = (process.env.DECODO_API_PASSWORD || '').trim();
-  const apiKey = (process.env.DECODO_API_KEY || '').trim();
-  return (user && pass) || !!apiKey;
+  const key = (process.env.DECODO_API_KEY || process.env.DECODO_API_TOKEN || '').trim();
+  const auth = (process.env.DECODO_AUTHORIZATION || '').trim();
+  return !!(key || auth);
 }
 
 module.exports = {
