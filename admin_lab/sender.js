@@ -8,9 +8,9 @@ const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { login, sendDM, completeInstagram2FA } = require('../bot');
 const { applyMobileEmulation, applyDesktopEmulation } = require('../utils/mobile-viewport');
+const { ensureChromeFakeMicPlaceholder } = require('../utils/voice-note-audio');
 const {
   appendChromeFakeMicArgs,
-  ensureChromeFakeMicPlaceholder,
 } = require('../utils/chrome-fake-mic');
 const logger = require('../utils/logger');
 
