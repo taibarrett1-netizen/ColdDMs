@@ -16,6 +16,7 @@ import os
 import random
 import sys
 import time
+from http.cookies import SimpleCookie
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -172,6 +173,98 @@ async def graphql_followers_page(
     raise RuntimeError(f"graphql followers failed: {last_err}")
 
 
+def load_cookie_header() -> str:
+    """
+    Option A (api_v1) generally requires authenticated cookies.
+    Priority:
+    1) ADMIN_LAB_IG_COOKIE_HEADER (raw Cookie header string)
+    2) sender session cookie JSON (ADMIN_LAB_SESSION_PATH or default admin_lab/.sessions/sender.json)
+    """
+    env_cookie = (os.getenv("ADMIN_LAB_IG_COOKIE_HEADER") or "").strip()
+    if env_cookie:
+        return env_cookie
+
+    session_path = (os.getenv("ADMIN_LAB_SESSION_PATH") or "").strip()
+    if not session_path:
+        session_path = os.path.join(os.path.dirname(__file__), ".sessions", "sender.json")
+    try:
+        with open(session_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cookies = data.get("cookies") if isinstance(data, dict) else None
+        if not isinstance(cookies, list):
+            return ""
+        parts: List[str] = []
+        for c in cookies:
+            if not isinstance(c, dict):
+                continue
+            name = str(c.get("name") or "").strip()
+            value = str(c.get("value") or "")
+            if not name:
+                continue
+            parts.append(f"{name}={value}")
+        return "; ".join(parts)
+    except Exception:
+        return ""
+
+
+def csrf_from_cookie_header(cookie_header: str) -> str:
+    if not cookie_header:
+        return ""
+    jar = SimpleCookie()
+    try:
+        jar.load(cookie_header)
+    except Exception:
+        return ""
+    morsel = jar.get("csrftoken")
+    return morsel.value if morsel else ""
+
+
+async def api_v1_followers_page(
+    client: httpx.AsyncClient,
+    username: str,
+    user_id: str,
+    count: int,
+    max_id: Optional[str],
+    cookie_header: str,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    url = f"https://www.instagram.com/api/v1/friendships/{user_id}/followers/"
+    params: Dict[str, str] = {
+        "count": str(count),
+        "search_surface": "follow_list_page",
+    }
+    if max_id:
+        params["max_id"] = max_id
+    headers = base_headers()
+    headers["Referer"] = f"https://www.instagram.com/{username}/followers/"
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+        csrf = csrf_from_cookie_header(cookie_header)
+        if csrf:
+            headers["X-CSRFToken"] = csrf
+    last_err: Optional[Exception] = None
+    for attempt in range(5):
+        try:
+            r = await client.get(url, params=params, headers=headers, timeout=60.0)
+            if r.status_code == 429:
+                last_err = RuntimeError("api_v1 followers HTTP 429")
+                await asyncio.sleep(min(90.0, 2 ** attempt + random.uniform(2, 8)))
+                continue
+            if r.status_code >= 400:
+                raise RuntimeError(f"api_v1 followers HTTP {r.status_code}: {r.text[:500]}")
+            data = r.json()
+            users = data.get("users")
+            if not isinstance(users, list):
+                raise RuntimeError(f"api_v1 response missing users array: {json.dumps(data)[:500]}")
+            next_max_id = data.get("next_max_id")
+            if next_max_id is not None:
+                next_max_id = str(next_max_id)
+            return users, next_max_id
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(1.2 ** attempt + random.uniform(0.3, 1.2))
+    raise RuntimeError(f"api_v1 followers failed: {last_err}")
+
+
 def append_rows_csv(path: str, rows: List[Dict[str, str]], write_header: bool) -> None:
     fieldnames = ["username", "full_name", "id", "is_private"]
     with open(path, "a", newline="", encoding="utf-8") as f:
@@ -199,7 +292,10 @@ async def run_scrape(username: str, proxy: str, max_users: int, output: str, use
         print("ADMIN_LAB_IG_DOC_ID_FOLLOWERS is required", file=sys.stderr)
         sys.exit(2)
 
+    mode = (os.getenv("ADMIN_LAB_SCRAPE_MODE") or "graphql").strip().lower()
+    # When using api_v1, keep counts modest.
     first = min(40, max(12, int(os.getenv("ADMIN_LAB_GRAPHQL_FIRST", "40"))))
+    api_count = min(50, max(12, int(os.getenv("ADMIN_LAB_API_V1_COUNT", "24"))))
 
     transport = httpx.AsyncHTTPTransport(retries=1)
     async with httpx.AsyncClient(
@@ -214,37 +310,95 @@ async def run_scrape(username: str, proxy: str, max_users: int, output: str, use
         sys.stderr.write(f"[admin-lab] Resolved @{username} -> id={uid}\n")
 
         after: Optional[str] = None
+        max_id: Optional[str] = None
         collected = 0
         buffer: List[Dict[str, str]] = []
         header_written = bool(os.path.exists(output) and os.path.getsize(output) > 0)
+        cookie_header = load_cookie_header()
+        if mode in ("api_v1", "auto") and not cookie_header:
+            raise RuntimeError(
+                "ADMIN_LAB_SCRAPE_MODE=api_v1 requires authenticated cookies. "
+                "Set ADMIN_LAB_IG_COOKIE_HEADER or connect sender so admin_lab/.sessions/sender.json exists."
+            )
 
         while collected < max_users:
-            edges, page_info = await graphql_followers_page(client, doc_id, uid, first, after)
-            await asyncio.sleep(random.uniform(0.8, 2.2))
-
-            for edge in edges:
-                if collected >= max_users:
-                    break
-                node = edge.get("node") if isinstance(edge, dict) else None
-                if not isinstance(node, dict):
-                    continue
-                buffer.append(node_to_row(node))
-                collected += 1
-                if len(buffer) >= CHECKPOINT_EVERY:
+            if mode == "api_v1":
+                users, max_id = await api_v1_followers_page(
+                    client, username=username, user_id=uid, count=api_count, max_id=max_id, cookie_header=cookie_header
+                )
+                await asyncio.sleep(random.uniform(1.0, 2.8))
+                for node in users:
+                    if collected >= max_users:
+                        break
+                    if not isinstance(node, dict):
+                        continue
+                    buffer.append(node_to_row(node))
+                    collected += 1
+                    if len(buffer) >= CHECKPOINT_EVERY:
+                        append_rows_csv(output, buffer, write_header=not header_written)
+                        header_written = True
+                        buffer.clear()
+                        sys.stderr.write(f"[admin-lab] checkpoint {collected} rows\n")
+                if buffer:
                     append_rows_csv(output, buffer, write_header=not header_written)
                     header_written = True
                     buffer.clear()
-                    sys.stderr.write(f"[admin-lab] checkpoint {collected} rows\n")
+                if not max_id:
+                    break
+            else:
+                try:
+                    edges, page_info = await graphql_followers_page(client, doc_id, uid, first, after)
+                except Exception:
+                    if mode == "auto":
+                        users, max_id = await api_v1_followers_page(
+                            client, username=username, user_id=uid, count=api_count, max_id=max_id, cookie_header=cookie_header
+                        )
+                        await asyncio.sleep(random.uniform(1.0, 2.8))
+                        for node in users:
+                            if collected >= max_users:
+                                break
+                            if not isinstance(node, dict):
+                                continue
+                            buffer.append(node_to_row(node))
+                            collected += 1
+                            if len(buffer) >= CHECKPOINT_EVERY:
+                                append_rows_csv(output, buffer, write_header=not header_written)
+                                header_written = True
+                                buffer.clear()
+                                sys.stderr.write(f"[admin-lab] checkpoint {collected} rows\n")
+                        if buffer:
+                            append_rows_csv(output, buffer, write_header=not header_written)
+                            header_written = True
+                            buffer.clear()
+                        if not max_id:
+                            break
+                        continue
+                    raise
 
-            if buffer:
-                append_rows_csv(output, buffer, write_header=not header_written)
-                header_written = True
-                buffer.clear()
+                await asyncio.sleep(random.uniform(0.8, 2.2))
+                for edge in edges:
+                    if collected >= max_users:
+                        break
+                    node = edge.get("node") if isinstance(edge, dict) else None
+                    if not isinstance(node, dict):
+                        continue
+                    buffer.append(node_to_row(node))
+                    collected += 1
+                    if len(buffer) >= CHECKPOINT_EVERY:
+                        append_rows_csv(output, buffer, write_header=not header_written)
+                        header_written = True
+                        buffer.clear()
+                        sys.stderr.write(f"[admin-lab] checkpoint {collected} rows\n")
 
-            has_next = bool(page_info.get("has_next_page"))
-            after = page_info.get("end_cursor")
-            if not has_next or not after:
-                break
+                if buffer:
+                    append_rows_csv(output, buffer, write_header=not header_written)
+                    header_written = True
+                    buffer.clear()
+
+                has_next = bool(page_info.get("has_next_page"))
+                after = page_info.get("end_cursor")
+                if not has_next or not after:
+                    break
 
         if buffer:
             append_rows_csv(output, buffer, write_header=not header_written)

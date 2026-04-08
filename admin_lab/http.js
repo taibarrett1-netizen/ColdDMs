@@ -190,7 +190,7 @@ function registerAdminLabRoutes(app) {
   });
 
   app.post('/api/admin-lab/scrape/followers', requireAdminLabSecret, (req, res) => {
-    const { targetUsername, maxUsers, proxyUrl } = req.body || {};
+    const { targetUsername, targetUserId, maxUsers, proxyUrl } = req.body || {};
     const un = typeof targetUsername === 'string' ? targetUsername.trim().replace(/^@/, '') : '';
     if (!un) {
       return res.status(400).json({ ok: false, error: 'targetUsername is required' });
@@ -233,6 +233,9 @@ function registerAdminLabRoutes(app) {
 
     const py = process.env.ADMIN_LAB_PYTHON || 'python3';
     const args = [PYTHON_SCRIPT, '--username', un, '--proxy', proxy, '--max_users', String(max), '--output', outFile];
+    if (targetUserId != null && String(targetUserId).trim()) {
+      args.push('--user_id', String(targetUserId).trim());
+    }
 
     adminLabScrapeRunning = true;
     const startedAt = Date.now();
