@@ -1925,6 +1925,8 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
 /**
  * Add all leads from the campaign's lead groups into cold_dm_campaign_leads (status pending).
  * Only inserts when no row exists (ignores existing sent/failed). Returns count of rows inserted.
+ *
+ * PostgREST returns at most ~1000 rows per request; we page lead ids and batch upserts.
  */
 async function addCampaignLeadsFromGroups(clientId, campaignId) {
   const sb = getSupabase();
@@ -1945,28 +1947,54 @@ async function addCampaignLeadsFromGroups(clientId, campaignId) {
   const leadGroupIds = (leadGroupRows || []).map((r) => r.lead_group_id).filter(Boolean);
   if (leadGroupIds.length === 0) return 0;
 
-  const { data: leadRows } = await sb
-    .from('cold_dm_leads')
-    .select('id')
-    .eq('client_id', clientId)
-    .in('lead_group_id', leadGroupIds);
-  if (!leadRows || leadRows.length === 0) return 0;
-
-  let added = 0;
-  for (const lead of leadRows) {
-    const { data: existing } = await sb
-      .from('cold_dm_campaign_leads')
+  const pageSize = 1000;
+  const leadIds = [];
+  let from = 0;
+  for (;;) {
+    const { data: chunk, error: leErr } = await sb
+      .from('cold_dm_leads')
       .select('id')
+      .eq('client_id', clientId)
+      .in('lead_group_id', leadGroupIds)
+      .order('id', { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (leErr) throw leErr;
+    const rows = chunk || [];
+    for (const r of rows) leadIds.push(r.id);
+    if (rows.length < pageSize) break;
+    from += pageSize;
+  }
+  if (leadIds.length === 0) return 0;
+
+  const existing = new Set();
+  from = 0;
+  for (;;) {
+    const { data: exChunk, error: exErr } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('lead_id')
       .eq('campaign_id', campaignId)
-      .eq('lead_id', lead.id)
-      .maybeSingle();
-    if (!existing) {
-      const { error } = await sb.from('cold_dm_campaign_leads').upsert(
-        { campaign_id: campaignId, lead_id: lead.id, status: 'pending' },
-        { onConflict: 'campaign_id,lead_id', ignoreDuplicates: true }
-      );
-      if (!error) added += 1;
-    }
+      .order('lead_id', { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (exErr) throw exErr;
+    const rows = exChunk || [];
+    for (const r of rows) existing.add(r.lead_id);
+    if (rows.length < pageSize) break;
+    from += pageSize;
+  }
+
+  const toAdd = leadIds.filter((id) => !existing.has(id));
+  if (toAdd.length === 0) return 0;
+
+  const insertChunk = 500;
+  let added = 0;
+  for (let i = 0; i < toAdd.length; i += insertChunk) {
+    const batch = toAdd.slice(i, i + insertChunk);
+    const { error } = await sb.from('cold_dm_campaign_leads').upsert(
+      batch.map((lead_id) => ({ campaign_id: campaignId, lead_id, status: 'pending' })),
+      { onConflict: 'campaign_id,lead_id', ignoreDuplicates: true }
+    );
+    if (error) throw error;
+    added += batch.length;
   }
   return added;
 }
