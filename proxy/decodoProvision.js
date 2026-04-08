@@ -187,10 +187,13 @@ function extractSubscriptionFields(body) {
   const p = pickSubscriptionPayload(body);
   if (!p || typeof p !== 'object') return { service_type: undefined, users_limit: undefined, _payloadKeys: [] };
   const st = p.service_type ?? p.serviceType ?? p.type;
-  const ul = p.users_limit ?? p.usersLimit ?? p.user_limit;
+  /** Residential trials use `proxy_users_limit`; older docs used `users_limit`. */
+  const ul =
+    p.users_limit ?? p.usersLimit ?? p.user_limit ?? p.proxy_users_limit ?? p.proxyUsersLimit ?? p.proxy_user_limit;
+  const n = ul != null && ul !== '' ? parseInt(String(ul), 10) : NaN;
   return {
     service_type: st != null && st !== '' ? String(st).trim() : undefined,
-    users_limit: ul != null && ul !== '' ? parseInt(String(ul), 10) : undefined,
+    users_limit: Number.isFinite(n) ? n : undefined,
     _payloadKeys: Object.keys(p),
   };
 }
@@ -248,6 +251,7 @@ async function appendDecodoDiagnostics(err, authHeaders, serviceType, subscripti
   } else if (subscription) {
     parts.push(`subscription.service_type=${subscription.service_type}`);
     parts.push(`users_limit=${subscription.users_limit}`);
+    parts.push(`proxy_users_limit=${subscription.proxy_users_limit != null ? subscription.proxy_users_limit : 'n/a'}`);
     if (subscription._subscriptionPayloadKeys && subscription._subscriptionPayloadKeys.length) {
       parts.push(`subscription_payload_keys=${subscription._subscriptionPayloadKeys.join(',')}`);
     }
@@ -356,7 +360,14 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
     if (existing && existing.id != null) {
       await putDecodoSubUserPassword(authHeaders, existing.id, subPassword);
     } else {
-      if (Number.isFinite(usersLimit) && rows.length >= usersLimit) {
+      if (Number.isFinite(usersLimit) && usersLimit === 0) {
+        const err = new Error(
+          'Decodo: subscription reports 0 proxy users allowed (proxy_users_limit / users_limit). Auto-create is blocked. Upgrade the plan, or create one user in the dashboard (Residential → Authentication → Users) and set DECODO_DISABLE_AUTO=1 with a manual proxy flow.'
+        );
+        err.statusCode = 400;
+        throw await enrichError(err);
+      }
+      if (Number.isFinite(usersLimit) && usersLimit > 0 && rows.length >= usersLimit) {
         const err = new Error(
           `Decodo: sub-user limit reached (${rows.length}/${usersLimit}) for ${serviceType}. Remove a sub-user in the Decodo dashboard (Proxy → Sub-users) or upgrade the plan, then retry.`
         );
