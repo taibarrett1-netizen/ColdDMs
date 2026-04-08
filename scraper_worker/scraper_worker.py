@@ -242,6 +242,139 @@ def scrape_followers(conn, job: dict):
   update_scrape_job(conn, job["id"], status="completed", scraped_count=scraped_new)
 
 
+def scrape_following(conn, job: dict):
+  """Scrape accounts the target user follows (parallel to scrape_followers)."""
+  client_id = job["client_id"]
+  target_username = (job.get("target_username") or "").strip().lstrip("@").lower()
+  if not target_username:
+    raise RuntimeError("target_username missing on scrape job.")
+
+  logger.info("Following scrape started: target=@%s job_id=%s", target_username, job.get("id"))
+
+  if _should_cancel(conn, job["id"]):
+    logger.info("Job cancelled before start. Exiting without API calls.")
+    update_scrape_job(conn, job["id"], status="cancelled", scraped_count=int(job.get("scraped_count") or 0))
+    return
+
+  _sleep_warmup()
+
+  platform_session_id = job.get("platform_scraper_session_id")
+  session_row = fetch_scraper_session(conn, client_id, platform_session_id)
+  if not session_row or not (session_row.get("session_data") or {}).get("cookies"):
+    raise RuntimeError("Scraper session not found or expired for this job.")
+
+  logger.info("Session loaded (platform_session_id=%s), building instagrapi client", platform_session_id)
+  cl = build_client_from_session(
+    session_row["session_data"], session_row.get("instagram_username")
+  )
+  logger.info("Client ready, resolving user_id for @%s", target_username)
+
+  lead_group_id = job.get("lead_group_id")
+  source = f"following:{target_username}"
+
+  (
+    in_conversations,
+    sent_usernames,
+    blocklist_usernames,
+    existing_leads,
+  ) = load_filter_sets(conn, client_id)
+
+  scraped_new = int(job.get("scraped_count") or 0)
+
+  max_leads = job.get("max_leads") or None
+  if max_leads is not None:
+    try:
+      max_leads = int(max_leads)
+    except (TypeError, ValueError):
+      max_leads = None
+  if max_leads is not None:
+    logger.info(
+      "Job has max_leads=%s (already scraped=%d). Will stop when new leads reach this count.",
+      max_leads,
+      scraped_new,
+    )
+  else:
+    logger.info("Job has no max_leads; will scrape all available following.")
+
+  _sleep_before_first()
+  try:
+    user_id = cl.user_id_from_username(target_username)
+  except ClientError as e:
+    raise RuntimeError(f"Failed to resolve user_id for @{target_username}: {e}") from e
+
+  _sleep_between_calls()
+
+  SAFE_FETCH_CAP = int(_float_env("SCRAPER_SAFE_FETCH_CAP", 800.0))
+  if SAFE_FETCH_CAP <= 0:
+    SAFE_FETCH_CAP = 800
+  if max_leads is not None and max_leads > 0:
+    amount = min(int(max_leads * 2), SAFE_FETCH_CAP)
+  else:
+    amount = SAFE_FETCH_CAP
+
+  logger.info(
+    "Requesting up to %d following for @%s this job (SAFE_FETCH_CAP=%d, max_leads=%s)",
+    amount,
+    target_username,
+    SAFE_FETCH_CAP,
+    max_leads,
+  )
+  following_dict = cl.user_following(user_id, amount=amount)
+  following = list(following_dict.values())
+  logger.info("Fetched %d following for @%s", len(following), target_username)
+
+  batch_new = 0
+  for idx, user in enumerate(following, start=1):
+    username = (getattr(user, "username", None) or "").strip().lstrip("@").lower()
+    if not username:
+      continue
+
+    if (
+      username in existing_leads
+      or username in in_conversations
+      or username in sent_usernames
+      or username in blocklist_usernames
+      or username == target_username
+    ):
+      continue
+
+    is_new = insert_lead_if_new(conn, client_id, username, source, lead_group_id)
+    if is_new:
+      existing_leads.add(username)
+      scraped_new += 1
+      batch_new += 1
+
+    if max_leads is not None and scraped_new >= max_leads:
+      logger.info("Reached max_leads=%s, completing job. Total new leads: %d", max_leads, scraped_new)
+      update_scrape_job(conn, job["id"], status="completed", scraped_count=scraped_new)
+      return
+
+    _sleep_per_item()
+
+    chunk_every = max(1, int(_float_env("SCRAPER_CHUNK_COOLDOWN_EVERY", 200.0)))
+    jitter_every = max(1, int(_float_env("SCRAPER_JITTER_EVERY", 500.0)))
+    if idx > 0 and idx % chunk_every == 0:
+      if _should_cancel(conn, job["id"]):
+        logger.info("Job cancelled during cooldown. Scraped %d new leads", scraped_new)
+        update_scrape_job(conn, job["id"], status="cancelled", scraped_count=scraped_new)
+        return
+      _sleep_chunk_cooldown()
+    if idx > 0 and idx % jitter_every == 0:
+      _sleep_jitter()
+
+    if idx % 50 == 0:
+      update_scrape_job(conn, job["id"], scraped_count=scraped_new)
+      logger.info("Progress: %d/%d following processed, %d new leads so far", idx, len(following), scraped_new)
+      if _should_cancel(conn, job["id"]):
+        logger.info("Job cancelled, stopping. Scraped %d new leads", scraped_new)
+        update_scrape_job(conn, job["id"], status="cancelled", scraped_count=scraped_new)
+        return
+      _sleep_between_batches()
+
+  logger.info("Following scrape completed: %d new leads for @%s", scraped_new, target_username)
+  update_scrape_job(conn, job["id"], status="completed", scraped_count=scraped_new)
+
+
 def _sleep_graphql_page_delay():
   """
   Long delay between GraphQL page requests.
@@ -674,11 +807,11 @@ def main(argv: List[str]) -> int:
   parser.add_argument(
     "--scrape-type",
     required=True,
-    choices=["followers", "comments"],
+    choices=["followers", "following", "comments"],
     help="Type of scrape to run",
   )
   # Optional CLI overrides; normally the worker uses job row fields.
-  parser.add_argument("--target-username", help="Target username for follower scrape")
+  parser.add_argument("--target-username", help="Target username for follower or following scrape")
   parser.add_argument(
     "--post-urls",
     help="JSON array of post URLs for comment scrape (fallback if job.post_urls missing)",
@@ -716,7 +849,7 @@ def main(argv: List[str]) -> int:
       job["max_leads"] = args.max_leads
     if args.lead_group_id is not None:
       job["lead_group_id"] = args.lead_group_id
-    if args.scrape_type == "followers" and args.target_username:
+    if args.scrape_type in ("followers", "following") and args.target_username:
       job["target_username"] = args.target_username
     if args.scrape_type == "comments" and args.post_urls and not job.get("post_urls"):
       try:
@@ -732,6 +865,8 @@ def main(argv: List[str]) -> int:
           scrape_followers_via_graphql(conn, job)
         else:
           scrape_followers(conn, job)
+      elif args.scrape_type == "following":
+        scrape_following(conn, job)
       else:
         scrape_comments(conn, job)
       logger.info("Job %s finished successfully", job["id"])

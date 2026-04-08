@@ -179,6 +179,8 @@ const uploadVoice = multer({ dest: voiceNotesDir, limits: { fileSize: 25 * 1024 
 
 const BOT_PM2_NAME = 'ig-dm-bot';
 const SEND_WORKER_ENTRY = process.env.SEND_WORKER_ENTRY || 'workers/send-worker.js';
+/** After the worker exits (--no-autorestart), PM2 keeps a stopped app with this name. `pm2 start script --name` then fails as duplicate; `pm2 restart name` starts the stopped process. Fallback creates the app if missing. */
+const PM2_ENSURE_SEND_WORKER_CMD = `pm2 restart ${BOT_PM2_NAME} || pm2 start ${SEND_WORKER_ENTRY} --name ${BOT_PM2_NAME} --no-autorestart`;
 const MAX_CONCURRENT_FOLLOW_UPS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_FOLLOW_UPS || '3', 10) || 3);
 const MAX_CONCURRENT_SCRAPERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_SCRAPERS || '2', 10) || 2);
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
@@ -796,19 +798,19 @@ app.post('/api/control/start', async (req, res) => {
     console.log('[API] Start (pause=0) for clientId=', clientId);
     res.json({ ok: true, processRunning: true });
     exec(
-      `pm2 start ${SEND_WORKER_ENTRY} --name ${BOT_PM2_NAME} --no-autorestart`,
+      PM2_ENSURE_SEND_WORKER_CMD,
       { cwd: projectRoot },
       (err, stdout, stderr) => {
         const out = ((stdout || '') + (stderr || '')).trim();
-        const alreadyRunning = /already (running|launched)|online/i.test(out);
+        const alreadyRunning = /already (running|launched)|online|restart|Process successfully started/i.test(out);
         if (err && !alreadyRunning) {
-          console.error('[API] pm2 start failed', err, stderr);
+          console.error('[API] pm2 ensure send worker failed', err, stderr);
           const detail = (stderr || err.message || 'pm2 error').toString().slice(0, 220);
           setClientStatusMessage(clientId, `Send worker did not start: ${detail}`).catch(() => {});
           return;
         }
-        if (out && !alreadyRunning) console.log('[API] pm2 start output:', out.slice(0, 600));
-        else if (!alreadyRunning) console.log('[API] Worker start command finished.');
+        if (out) console.log('[API] pm2 ensure send worker:', out.slice(0, 800));
+        else if (!err) console.log('[API] pm2 ensure send worker finished (no stdout).');
       }
     );
     return;
@@ -816,9 +818,11 @@ app.post('/api/control/start', async (req, res) => {
   setControl('pause', '0');
   console.log('[API] Start bot requested (legacy)');
   res.json({ ok: true, processRunning: true });
-  exec(`pm2 start ${SEND_WORKER_ENTRY} --name ${BOT_PM2_NAME} --no-autorestart`, { cwd: projectRoot }, (err, stdout, stderr) => {
-    if (err) console.error('[API] pm2 start failed', err, stderr);
-    else console.log('[API] Bot start command executed.');
+  exec(PM2_ENSURE_SEND_WORKER_CMD, { cwd: projectRoot }, (err, stdout, stderr) => {
+    const out = ((stdout || '') + (stderr || '')).trim();
+    if (err) console.error('[API] pm2 ensure send worker failed (legacy)', err, stderr);
+    else if (out) console.log('[API] pm2 ensure send worker (legacy):', out.slice(0, 800));
+    else console.log('[API] Bot start command finished (legacy).');
   });
 });
 
@@ -948,15 +952,21 @@ app.post('/api/scraper/start', async (req, res) => {
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
-  const scrapeType = scrape_type === 'comments' ? 'comments' : 'followers';
+  const rawType = String(scrape_type || 'followers')
+    .trim()
+    .toLowerCase();
+  const scrapeType =
+    rawType === 'comments' ? 'comments' : rawType === 'following' ? 'following' : 'followers';
   let workerId = null;
   let reservedPlatformSession = null;
 
   if (!clientId) {
     return res.status(400).json({ ok: false, error: 'clientId is required' });
   }
-  if (scrapeType === 'followers' && !target_username) {
-    return res.status(400).json({ ok: false, error: 'target_username is required for follower scrape' });
+  if ((scrapeType === 'followers' || scrapeType === 'following') && !target_username) {
+    return res
+      .status(400)
+      .json({ ok: false, error: 'target_username is required for follower or following scrape' });
   }
   if (scrapeType === 'comments') {
     if (!post_urls || !Array.isArray(post_urls) || post_urls.length === 0) {
@@ -969,7 +979,8 @@ app.post('/api/scraper/start', async (req, res) => {
 
   if (SCRAPE_DEFER_TO_WORKER) {
     try {
-      const targetForJob = scrapeType === 'followers' ? target_username.trim().replace(/^@/, '') : '_comment_scrape';
+      const targetForJob =
+        scrapeType === 'comments' ? '_comment_scrape' : target_username.trim().replace(/^@/, '');
       const requestedMaxLeads = max_leads != null && max_leads > 0 ? max_leads : null;
       const effectiveMaxLeads = requestedMaxLeads != null && requestedMaxLeads > 0 ? requestedMaxLeads : null;
       const jobId = await createScrapeJob(
@@ -1003,7 +1014,8 @@ app.post('/api/scraper/start', async (req, res) => {
     reservedPlatformSession = await reservePlatformScraperSessionForWorker(workerId, SCRAPER_SESSION_LEASE_SEC).catch(
       () => null
     );
-    const targetForJob = scrapeType === 'followers' ? target_username.trim().replace(/^@/, '') : '_comment_scrape';
+    const targetForJob =
+      scrapeType === 'comments' ? '_comment_scrape' : target_username.trim().replace(/^@/, '');
 
     const requestedMaxLeads = max_leads != null && max_leads > 0 ? max_leads : null;
     const effectiveMaxLeads = requestedMaxLeads != null && requestedMaxLeads > 0 ? requestedMaxLeads : null;
@@ -1034,11 +1046,12 @@ app.post('/api/scraper/start', async (req, res) => {
       platformSessionId: reservedPlatformSession?.id || null,
     };
 
-    if (scrapeType === 'followers') {
+    if (scrapeType === 'followers' || scrapeType === 'following') {
       runFollowerScrape(String(clientId), String(jobId), targetForJob, {
         maxLeads: effectiveMaxLeads,
         leadGroupId: lead_group_id || null,
         leaseOptions: scrapeLeaseOpts,
+        listKind: scrapeType === 'following' ? 'following' : 'followers',
       }).catch((err) => {
         console.error('[API] runFollowerScrape error', err);
       }).finally(async () => {

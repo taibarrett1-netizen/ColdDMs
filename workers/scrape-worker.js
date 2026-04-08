@@ -51,18 +51,19 @@ async function processOneJob(workerId, job) {
       platformSessionId: job.platform_scraper_session_id || null,
     };
 
-    const scrapeType = job.scrape_type === 'comments' ? 'comments' : 'followers';
+    const scrapeType = job.scrape_type === 'comments' ? 'comments' : job.scrape_type === 'following' ? 'following' : 'followers';
     logger.log(
       `[scrape-worker] begin scrape job=${job.id} type=${scrapeType} max_leads=${job.max_leads ?? '—'} ` +
-        (scrapeType === 'followers'
-          ? `target=@${String(job.target_username || '').replace(/^@/, '')}`
-          : `posts=${Array.isArray(job.post_urls) ? job.post_urls.length : 0}`)
+        (scrapeType === 'comments'
+          ? `posts=${Array.isArray(job.post_urls) ? job.post_urls.length : 0}`
+          : `target=@${String(job.target_username || '').replace(/^@/, '')}`)
     );
-    if (scrapeType === 'followers') {
+    if (scrapeType === 'followers' || scrapeType === 'following') {
       await runFollowerScrape(String(job.client_id), String(job.id), normalizeTarget(job), {
         maxLeads: job.max_leads,
         leadGroupId: job.lead_group_id,
         leaseOptions: leaseOpts,
+        listKind: scrapeType === 'following' ? 'following' : 'followers',
       });
     } else {
       const urls = Array.isArray(job.post_urls) ? job.post_urls : [];

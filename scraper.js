@@ -122,12 +122,14 @@ async function connectScraper(instagramUsername, instagramPassword) {
 }
 
 /**
- * Run follower scrape in the background. Call from API without awaiting.
- * Loads scraper session, navigates to profile, paginates followers, upserts leads.
+ * Run follower or following list scrape in the background. Call from API without awaiting.
+ * Loads scraper session, navigates to profile, paginates the modal list, upserts leads.
  * @param {number} [options.maxLeads] - Optional. Stop when this many NEW leads have been added. Omit for no limit.
+ * @param {'followers'|'following'} [options.listKind] - Default 'followers'. Use 'following' for accounts the target follows.
  */
 async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) {
   const maxLeads = options.maxLeads != null ? Math.max(1, parseInt(options.maxLeads, 10) || 0) : null;
+  const listKind = options.listKind === 'following' ? 'following' : 'followers';
   const leadGroupId = options.leadGroupId || null;
   const leaseOptions = options.leaseOptions || null;
   const sbMod = require('./database/supabase');
@@ -166,7 +168,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       return;
     }
 
-    logger.log(`[Scraper] Job ${jobId} session OK; launching browser for follower scrape`);
+    logger.log(`[Scraper] Job ${jobId} session OK; launching browser for ${listKind} scrape`);
 
     browser = await puppeteer.launch({
       headless: HEADLESS,
@@ -179,7 +181,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       logger.log('[Scraper] Using mobile viewport (SCRAPER_USE_MOBILE=1)');
     } else {
       await page.setViewport({ width: 1280, height: 800 });
-      logger.log('[Scraper] Using desktop viewport for follower scrape (mobile scroll fails)');
+      logger.log('[Scraper] Using desktop viewport for profile list scrape (mobile scroll fails)');
     }
     await page.setCookie(...session.session_data.cookies);
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
@@ -209,9 +211,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     if (liked) await delay(5000 + Math.floor(Math.random() * 10000));
     logger.log('[Scraper] Warm behaviour done.');
 
-    const source = `followers:${targetUsername}`;
+    const source = `${listKind}:${targetUsername}`;
     const cleanTarget = targetUsername.replace(/^@/, '').trim().toLowerCase();
-    logger.log(`[Scraper] Starting follower scrape for @${cleanTarget}${maxLeads ? ` (max ${maxLeads})` : ''}`);
+    logger.log(`[Scraper] Starting ${listKind} scrape for @${cleanTarget}${maxLeads ? ` (max ${maxLeads})` : ''}`);
 
     await page.goto(`https://www.instagram.com/${encodeURIComponent(cleanTarget)}/`, {
       waitUntil: 'networkidle2',
@@ -278,7 +280,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     const jobCheck = await getScrapeJob(jobId);
     if (jobCheck?.status === 'cancelled') return;
 
-    const profileFollowerCount = await page.evaluate((target) => {
+    const profileStatCount = await page.evaluate((target, kind) => {
       function parseCount(str) {
         if (!str || typeof str !== 'string') return null;
         const raw = str.replace(/,/g, '').trim();
@@ -289,13 +291,19 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         else if (m[2] === 'm' || m[2] === 'M') n *= 1000000;
         return Math.floor(n);
       }
-      const links = Array.from(document.querySelectorAll('a[href*="/followers"]'));
-      const followersLink = links.find(function (a) {
+      const following = kind === 'following';
+      const links = Array.from(
+        document.querySelectorAll(following ? 'a[href*="/following"]' : 'a[href*="/followers"]')
+      );
+      const statLink = links.find(function (a) {
         const href = (a.getAttribute('href') || '').toLowerCase();
+        if (following) {
+          return href.indexOf('/' + target + '/following') !== -1;
+        }
         return href.indexOf('/' + target + '/followers') !== -1;
       });
-      if (!followersLink) return null;
-      const container = followersLink.closest('li') || followersLink.parentElement;
+      if (!statLink) return null;
+      const container = statLink.closest('li') || statLink.parentElement;
       if (!container) return null;
       const titleEl = container.querySelector('[title]');
       const span = container.querySelector('span');
@@ -304,47 +312,55 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       const txt = (container.textContent || '').replace(/,/g, '');
       n = parseCount(txt);
       if (n != null) return n;
-      n = parseCount(followersLink.getAttribute('aria-label'));
+      n = parseCount(statLink.getAttribute('aria-label'));
       if (n != null) return n;
-      return parseCount(followersLink.textContent);
-    }, cleanTarget);
+      return parseCount(statLink.textContent);
+    }, cleanTarget, listKind);
 
     const effectiveMax =
-      profileFollowerCount != null && profileFollowerCount > 0
-        ? (maxLeads ? Math.min(maxLeads, profileFollowerCount) : profileFollowerCount)
+      profileStatCount != null && profileStatCount > 0
+        ? (maxLeads ? Math.min(maxLeads, profileStatCount) : profileStatCount)
         : maxLeads;
-    if (profileFollowerCount != null) {
-      logger.log('[Scraper] Profile has ' + profileFollowerCount + ' followers; capping at ' + effectiveMax);
+    if (profileStatCount != null) {
+      logger.log(
+        `[Scraper] Profile has ${profileStatCount} ${listKind === 'following' ? 'following' : 'followers'}; capping at ${effectiveMax}`
+      );
     } else {
-      logger.log('[Scraper] Could not parse follower count from profile; using max_leads only');
+      logger.log('[Scraper] Could not parse stat count from profile; using max_leads only');
     }
 
-    async function tryOpenFollowers(page, target) {
-      return page.evaluate((targetUsername) => {
+    async function tryOpenProfileList(page, target, kind) {
+      return page.evaluate((targetUsername, listKind) => {
         const lower = (s) => (s || '').toLowerCase();
+        const wantFollowing = listKind === 'following';
 
-        // 1) Original href-based logic.
         const links = Array.from(document.querySelectorAll('a[href*="/followers"], a[href*="/following"]'));
-        const followersLink = links.find((a) => {
+        const picked = links.find((a) => {
           const href = lower(a.getAttribute('href') || '');
+          if (wantFollowing) {
+            return (
+              href.includes(`/${targetUsername}/following`) ||
+              (href.includes('/following') && !href.includes('/followers'))
+            );
+          }
           return (
             href.includes(`/${targetUsername}/followers`) ||
             (href.includes('/followers') && !href.includes('/following'))
           );
         });
-        if (followersLink) {
-          followersLink.click();
+        if (picked) {
+          picked.click();
           return true;
         }
 
-        // 2) Fallback: stats row text (e.g. "1,128 followers").
         const candidates = Array.from(
           document.querySelectorAll('a, span, div, button, [role="button"]')
         );
+        const needle = wantFollowing ? 'following' : 'followers';
         const statsLike = candidates.find((el) => {
           const text = (el.textContent || '').trim();
           const l = lower(text);
-          return l.includes('followers') && /\d/.test(text);
+          return l.includes(needle) && /\d/.test(text);
         });
         if (statsLike) {
           const clickable =
@@ -355,60 +371,62 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           }
         }
 
-        // 3) Last resort: any button-like element that mentions followers.
         const roleButtons = Array.from(
           document.querySelectorAll('[role="button"], button, a')
         );
         for (const btn of roleButtons) {
           const t = lower(btn.textContent || '');
-          if (t.includes('followers') || /\d+\s*followers/.test(t)) {
+          if (wantFollowing) {
+            if (t.includes('following') || /\d+\s*following/.test(t)) {
+              btn.click();
+              return true;
+            }
+          } else if (t.includes('followers') || /\d+\s*followers/.test(t)) {
             btn.click();
             return true;
           }
         }
 
         return false;
-      }, target);
+      }, target, kind);
     }
 
-    let followersLinkClicked = await tryOpenFollowers(page, cleanTarget);
-    if (!followersLinkClicked) {
-      // If first attempt fails, try to clear any remaining dialogs and retry once.
+    let profileListOpened = await tryOpenProfileList(page, cleanTarget, listKind);
+    if (!profileListOpened) {
       try {
         const handled = await dismissReviewDialogs(page);
         if (handled) {
-          logger.log('[Scraper] Dismissed additional Review/Terms dialog before retrying followers modal');
+          logger.log(`[Scraper] Dismissed additional Review/Terms dialog before retrying ${listKind} modal`);
           await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
         }
       } catch (e) {
         logger.warn('[Scraper] Failed to handle Review/Terms dialog on retry: ' + e.message);
       }
-      followersLinkClicked = await tryOpenFollowers(page, cleanTarget);
+      profileListOpened = await tryOpenProfileList(page, cleanTarget, listKind);
     }
 
-    if (!followersLinkClicked) {
-      // Capture a screenshot to debug new layouts/popups blocking the followers modal.
+    if (!profileListOpened) {
       try {
         const debugDir = path.join(process.cwd(), 'scraper-debug');
         if (!fs.existsSync(debugDir)) {
           fs.mkdirSync(debugDir, { recursive: true });
         }
-        const screenshotPath = path.join(
-          debugDir,
-          `followers_modal_fail_${String(jobId)}.png`
-        );
+        const tag = listKind === 'following' ? 'following' : 'followers';
+        const screenshotPath = path.join(debugDir, `${tag}_modal_fail_${String(jobId)}.png`);
         await page.screenshot({ path: screenshotPath, fullPage: true });
-        logger.error('[Scraper] Could not open followers modal – screenshot saved at %s', screenshotPath);
+        logger.error('[Scraper] Could not open %s modal – screenshot saved at %s', tag, screenshotPath);
       } catch (screenshotErr) {
-        logger.error('[Scraper] Failed to capture screenshot on followers modal error: %s', screenshotErr.message);
+        logger.error('[Scraper] Failed to capture screenshot on modal error: %s', screenshotErr.message);
       }
       const modalFailMsg =
-        'Could not open followers list. Profile may be private or link not found.';
+        listKind === 'following'
+          ? 'Could not open following list. Profile may be private or link not found.'
+          : 'Could not open followers list. Profile may be private or link not found.';
       await failScrapeJob(jobId, modalFailMsg);
       return;
     }
 
-    logger.log('[Scraper] Followers modal opened, extracting...');
+    logger.log(`[Scraper] ${listKind === 'following' ? 'Following' : 'Followers'} modal opened, extracting...`);
     await delay(randomDelay(2500, 5000));
     await page.evaluate(() => {
       function countProfileLinks(el) {
@@ -483,7 +501,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     const COOLDOWN_MIN_MS = 45 * 60 * 1000;
     const COOLDOWN_MAX_MS = 70 * 60 * 1000;
     let scrapedSinceCooldown = 0;
-    const MAX_NO_NEW = profileFollowerCount != null && profileFollowerCount > 100 ? 12 : 6;
+    const MAX_NO_NEW = profileStatCount != null && profileStatCount > 100 ? 12 : 6;
     const [inConvos, sentUsernames, blocklistUsernames] = await Promise.all([
       getConversationParticipantUsernames(clientId),
       getSentUsernames(clientId),
@@ -963,7 +981,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     }
 
     await updateScrapeJob(jobId, { status: 'completed', scraped_count: totalScraped });
-    logger.log(`[Scraper] Job ${jobId} completed. Scraped ${totalScraped} followers from @${cleanTarget}`);
+    logger.log(
+      `[Scraper] Job ${jobId} completed. Scraped ${totalScraped} ${listKind === 'following' ? 'following' : 'followers'} from @${cleanTarget}`
+    );
 
     try {
       await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -978,7 +998,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       await recordScraperActions(platformSessionId, totalScraped).catch(() => {});
     }
   } catch (err) {
-    logger.error('[Scraper] Follower scrape failed', err);
+    logger.error(`[Scraper] ${listKind === 'following' ? 'Following' : 'Follower'} scrape failed`, err);
     try {
       const { updateScrapeJob: updateJob } = require('./database/supabase');
       await updateJob(jobId, {
@@ -992,6 +1012,10 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     if (leaseHbTimer) clearInterval(leaseHbTimer);
     if (browser) await browser.close().catch(() => {});
   }
+}
+
+async function runFollowingScrape(clientId, jobId, targetUsername, options = {}) {
+  return runFollowerScrape(clientId, jobId, targetUsername, { ...options, listKind: 'following' });
 }
 
 /**
@@ -1417,6 +1441,7 @@ async function fetchCommentsViaGraphQL(page, shortcode, afterCursor = null, firs
 module.exports = {
   connectScraper,
   runFollowerScrape,
+  runFollowingScrape,
   runCommentScrape,
   // Optional GraphQL-based fallbacks (not wired into the API by default)
   fetchFollowersViaGraphQL,
