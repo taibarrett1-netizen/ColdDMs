@@ -79,7 +79,8 @@ async function decodoAuth() {
       'Decodo auth: set DECODO_API_USER + DECODO_API_PASSWORD (dashboard login / account credentials per Decodo docs), or set DECODO_API_KEY alone'
     );
   }
-  const { body } = await httpsJson('POST', `${API_BASE}/v1/auth/`, { Authorization: `Basic ${basic}` }, null);
+  // No trailing slash — api.decodo.com returns 404 "Route not found" for /v1/auth/
+  const { body } = await httpsJson('POST', `${API_BASE}/v1/auth`, { Authorization: `Basic ${basic}` }, null);
   const token = body && (body.token || body.access_token);
   const userId = body && (body.user_id || body.userId);
   if (!token || !userId) {
