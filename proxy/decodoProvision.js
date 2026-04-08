@@ -157,19 +157,22 @@ function stableSubuserUsername(clientId, instagramUsername) {
 }
 
 /**
- * Decodo v2: ≥9 chars, ≥1 upper, ≥1 number, no @ or : (docs). Many accounts also enforce a lowercase letter.
- * Use alphanumeric only so proxy URL encoding never breaks.
+ * Decodo v2: ≥12 chars; ≥1 upper, ≥1 lower, ≥1 digit; ≥1 symbol from `_~+=` only.
+ * Other symbols (e.g. !) or alphanumeric-only passwords tend to yield generic 400 "Can not process request".
+ * Password is passed through encodeURIComponent in the proxy URL.
  */
 function randomSubuserPassword() {
   const lower = 'abcdefghijklmnopqrstuvwxyz';
   const upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
   const digits = '0123456789';
-  const all = lower + upper + digits;
-  const len = 20 + crypto.randomInt(8);
+  const symbols = '_~+=';
+  const all = lower + upper + digits + symbols;
+  const len = 12 + crypto.randomInt(17);
   const chars = [];
   chars.push(upper[crypto.randomInt(upper.length)]);
   chars.push(lower[crypto.randomInt(lower.length)]);
   chars.push(digits[crypto.randomInt(digits.length)]);
+  chars.push(symbols[crypto.randomInt(symbols.length)]);
   for (let i = chars.length; i < len; i++) {
     chars.push(all[crypto.randomInt(all.length)]);
   }
@@ -178,8 +181,19 @@ function randomSubuserPassword() {
     [chars[i], chars[j]] = [chars[j], chars[i]];
   }
   const out = chars.join('').slice(0, 64);
-  if (!/[A-Z]/.test(out) || !/[a-z]/.test(out) || !/[0-9]/.test(out) || out.length < 9) {
-    return 'Aa9' + out.replace(/[^A-Za-z0-9]/g, 'x').slice(0, 61);
+  const valid =
+    out.length >= 12 &&
+    /[A-Z]/.test(out) &&
+    /[a-z]/.test(out) &&
+    /[0-9]/.test(out) &&
+    /[_~+=]/.test(out);
+  if (!valid) {
+    const sym = symbols[crypto.randomInt(symbols.length)];
+    let filler = '';
+    for (let k = 0; k < 8; k++) {
+      filler += all[crypto.randomInt(all.length)];
+    }
+    return (`Aa9${sym}${filler}`).slice(0, 64);
   }
   return out;
 }
@@ -397,7 +411,7 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
     if (e.statusCode === 400) {
       e.message =
         (e.message || 'Decodo 400') +
-        ' Common causes: wrong service_type (we retry alternate when env service type is unset), username length (default max 32 chars for compact — set DECODO_SUBUSER_USERNAME_MAX_LEN), password rules, or trial/API restrictions. With DECODO_DEBUG=1, error response bodies and POST lengths are logged.';
+        ' Common causes: wrong service_type (we retry alternate when env service type is unset), username length (set DECODO_SUBUSER_USERNAME_MAX_LEN), or password rules (Decodo: ≥12 chars, upper+lower+digit, and one of _ ~ + = only). With DECODO_DEBUG=1, error response bodies and POST lengths are logged.';
       await appendDecodoDiagnostics(e, authHeaders, serviceType, subscription);
     }
     return e;
