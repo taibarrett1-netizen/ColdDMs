@@ -184,8 +184,22 @@ async function assertHealthyInstagramSessionOrThrow(page, contextLabel) {
   }
   const hasSession = await pageHasInstagramSessionCookie(page);
   if (!hasSession) {
+    if (process.env.LOGIN_DEBUG === '1' || process.env.LOGIN_DEBUG === 'true') {
+      const ck = await page.cookies();
+      logger.error(
+        `[login] Missing sessionid after ${contextLabel || 'login'}; cookie names=${ck.length ? ck.map((c) => c.name).join(', ') : '(none)'} url=${url}`
+      );
+      const snippet = await page
+        .evaluate(() => ((document.body && document.body.innerText) || '').slice(0, 500))
+        .catch(() => '');
+      logger.error('[login] Body snippet: ' + String(snippet).replace(/\n/g, ' '));
+    }
     throw new Error(
-      `No Instagram session cookie after ${contextLabel || 'login'}. The session was not established (blocked, incomplete, or verification required).`
+      `No Instagram session cookie after ${contextLabel || 'login'}. Instagram never issued a web session (Meta blocked or left the flow incomplete — not a false positive from our checker). ` +
+        `Why VPS often works: same datacenter IP + browser fingerprint may already be trusted. Residential is a new IP/device every time until sticky + warmup. ` +
+        `Try: (1) Default proxy geo is UK (gb); set DECODO_GATE_COUNTRY=us (etc.) or none if wrong for that account. Reconnect so proxy_url updates. ` +
+        `(2) Log in once in Chrome/Firefox using the exact proxy_url from Supabase, finish any checkpoint, then Connect on the VPS. ` +
+        `(3) Use 2FA on Connect if the account has it.`
     );
   }
 }

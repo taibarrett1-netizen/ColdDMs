@@ -219,10 +219,33 @@ function stickySessionKeyForAssignment(clientId, instagramUsername) {
   return crypto.createHash('sha256').update(`${clientId}:${ig}`).digest('hex').slice(0, 12);
 }
 
+/** ISO 3166-1 alpha-2 for Decodo `-country-xx` (must come before `-session-` in username). */
+function normalizeDecodoGateCountryCode(code) {
+  const c = String(code || '')
+    .trim()
+    .toLowerCase()
+    .replace(/^country-/, '');
+  return /^[a-z]{2}$/.test(c) ? c : '';
+}
+
+/**
+ * Fixed geo default: **UK (`gb`)** for residential (1 IG account → 1 sticky session; align exit with account locale).
+ * Override: `DECODO_GATE_COUNTRY=us` (any ISO2). Disable country pin: `DECODO_GATE_COUNTRY=none`.
+ */
+function getDecodoGateCountryCodeEffective() {
+  const raw = process.env.DECODO_GATE_COUNTRY;
+  if (raw === undefined || raw === null) return 'gb';
+  const t = String(raw).trim().toLowerCase();
+  if (t === '' || t === 'none' || t === 'off' || t === '-' || t === 'any') return '';
+  return normalizeDecodoGateCountryCode(t);
+}
+
 /**
  * @param {string} username - Decodo sub-user name (API), without gate prefix
  * @param {object} [opts]
  * @param {string} [opts.gateUsernamePrefix] - override env prefix
+ * @param {string} [opts.countryCode] - optional alpha-2, inserts -country-xx before sticky params (Decodo order)
+ * @param {boolean} [opts.useResidentialDefaultCountry] - when true, unset env defaults to UK (gb); when false (e.g. shared), only env/explicit country applies
  * @param {string|null} [opts.stickySessionId] - if set with stickyDurationMinutes, appends -session-{id}-sessionduration-{m}
  * @param {number|null} [opts.stickyDurationMinutes] - 1–1440
  */
@@ -235,6 +258,13 @@ function buildProxyUrlFromCredentials(username, password, opts = {}) {
     const pref = prefixRaw.endsWith('-') ? prefixRaw : `${prefixRaw}-`;
     if (!user.startsWith(pref)) user = `${pref}${user}`;
   }
+  const explicitCc = normalizeDecodoGateCountryCode(opts.countryCode);
+  const cc =
+    explicitCc ||
+    (opts.useResidentialDefaultCountry !== false
+      ? getDecodoGateCountryCodeEffective()
+      : normalizeDecodoGateCountryCode(process.env.DECODO_GATE_COUNTRY));
+  if (cc) user = `${user}-country-${cc}`;
   const sid = opts.stickySessionId;
   let mins = opts.stickyDurationMinutes;
   if (mins != null) mins = parseInt(String(mins), 10);
@@ -544,18 +574,24 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
 
   const stickyOff = process.env.DECODO_STICKY_SESSION === '0' || process.env.DECODO_STICKY_SESSION === 'false';
   const useSticky = !stickyOff && serviceType === 'residential_proxies';
-  let stickyMins = parseInt(process.env.DECODO_STICKY_SESSION_DURATION_MINUTES || '180', 10);
-  if (!Number.isFinite(stickyMins)) stickyMins = 180;
-  stickyMins = Math.min(1440, Math.max(1, stickyMins));
+  let stickyMins = parseInt(process.env.DECODO_STICKY_SESSION_DURATION_MINUTES || '60', 10);
+  if (!Number.isFinite(stickyMins)) stickyMins = 60;
+  stickyMins = Math.min(1440, Math.max(30, stickyMins));
   const stickyKey = useSticky ? stickySessionKeyForAssignment(clientId, instagramUsername) : null;
   const proxyUrl = buildProxyUrlFromCredentials(subUsername, subPassword, {
+    useResidentialDefaultCountry: serviceType === 'residential_proxies',
     stickySessionId: stickyKey,
     stickyDurationMinutes: stickyKey ? stickyMins : null,
   });
   const legacyMode = (process.env.DECODO_SUBUSER_USERNAME_MODE || 'compact').toLowerCase() === 'legacy';
+  const gateCountry =
+    serviceType === 'residential_proxies'
+      ? getDecodoGateCountryCodeEffective()
+      : normalizeDecodoGateCountryCode(process.env.DECODO_GATE_COUNTRY) || undefined;
   const providerRef = {
     decodo_subuser: subUsername,
     gate_username_prefix: getDecodoGateUsernamePrefix() || undefined,
+    gate_country: gateCountry || undefined,
     sticky_session: stickyKey ? stickyKey : undefined,
     sticky_session_duration_minutes: stickyKey ? stickyMins : undefined,
     gate_host: process.env.DECODO_GATE_HOST || 'gate.decodo.com',
@@ -583,4 +619,6 @@ module.exports = {
   buildProxyUrlFromCredentials,
   getDecodoGateUsernamePrefix,
   stickySessionKeyForAssignment,
+  normalizeDecodoGateCountryCode,
+  getDecodoGateCountryCodeEffective,
 };
