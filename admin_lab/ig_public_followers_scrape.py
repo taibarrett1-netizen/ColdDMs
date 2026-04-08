@@ -4,6 +4,10 @@ Login-less public follower scrape via Instagram web_profile_info + GraphQL (doc_
 Uses a single sticky proxy for the whole run. Rotate ADMIN_LAB_IG_DOC_ID_FOLLOWERS from DevTools
 (Network tab -> graphql/query -> doc_id) every few weeks when pagination breaks.
 
+User ids are cached under admin_lab/.cache/user_ids.json with ADMIN_LAB_USER_ID_CACHE_TTL_SEC (default 30d).
+Use --resolve_only for a dedicated resolver path; web_profile_info 429s use minute-scale backoffs
+(ADMIN_LAB_WEB_PROFILE_429_BACKOFF_SEC).
+
 Bandwidth: keep --max_users modest; trial proxies (~100MB) burn quickly on retries.
 """
 from __future__ import annotations
@@ -11,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import datetime
 import json
 import os
 import random
@@ -135,26 +140,37 @@ async def fetch_user_id_from_profile_html(
         return None
 
 
+def _web_profile_429_backoffs_sec() -> List[float]:
+    raw = (os.getenv("ADMIN_LAB_WEB_PROFILE_429_BACKOFF_SEC") or "60,180,600").strip()
+    parts = [float(x.strip()) for x in raw.split(",") if x.strip()]
+    return parts if parts else [60.0, 180.0, 600.0]
+
+
 async def fetch_profile_user_id(
     client: httpx.AsyncClient,
     username: str,
     cookie_header: Optional[str] = None,
 ) -> str:
+    """
+    Resolve numeric user id via web_profile_info (and optional HTML fallback).
+    On HTTP 429, uses minute-scale backoffs from ADMIN_LAB_WEB_PROFILE_429_BACKOFF_SEC
+    (default 60,180,600 seconds) instead of tight retry loops.
+    """
+    backoffs = _web_profile_429_backoffs_sec()
     # With session cookies, www-only tends to 429 less than i.instagram.com.
     if cookie_header:
         urls = [
             f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
         ]
-        max_attempts = 7
     else:
         urls = [
             f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}",
             f"https://i.instagram.com/api/v1/users/web_profile_info/?username={username}",
         ]
-        max_attempts = 4
     last_err: Optional[Exception] = None
     for url in urls:
-        for attempt in range(max_attempts):
+        i429 = 0
+        for soft_try in range(8):
             try:
                 headers = base_headers()
                 headers["Referer"] = f"https://www.instagram.com/{username}/"
@@ -166,11 +182,17 @@ async def fetch_profile_user_id(
                 r = await client.get(url, headers=headers, timeout=45.0)
                 if r.status_code == 429:
                     last_err = RuntimeError(f"HTTP 429 from web_profile_info ({url})")
-                    # Longer cool-off — IG rate-limits this endpoint aggressively.
-                    wait = min(120.0, 8.0 * (1.6**attempt) + random.uniform(2, 12))
-                    sys.stderr.write(f"[admin-lab] web_profile_info 429, sleeping {wait:.1f}s\n")
-                    await asyncio.sleep(wait)
-                    continue
+                    if i429 < len(backoffs):
+                        w = backoffs[i429] + random.uniform(10.0, 45.0)
+                        sys.stderr.write(
+                            f"[admin-lab] web_profile_info 429, sleeping {w:.0f}s "
+                            f"(backoff {i429 + 1}/{len(backoffs)})\n"
+                        )
+                        await asyncio.sleep(w)
+                        i429 += 1
+                        continue
+                    sys.stderr.write(f"[admin-lab] web_profile_info 429 retries exhausted for {url}\n")
+                    break
                 if r.status_code >= 400:
                     body_preview = r.text[:240].replace("\n", " ")
                     raise RuntimeError(
@@ -189,7 +211,10 @@ async def fetch_profile_user_id(
                 return str(uid)
             except Exception as e:
                 last_err = e
-                await asyncio.sleep(1.5 ** attempt + random.uniform(0.2, 1))
+                if soft_try < 5:
+                    await asyncio.sleep(1.8 ** soft_try + random.uniform(0.3, 1.4))
+                    continue
+                break
     if cookie_header:
         sys.stderr.write("[admin-lab] web_profile_info exhausted; trying profile HTML parse for user id\n")
         html_uid = await fetch_user_id_from_profile_html(client, username, cookie_header)
@@ -214,17 +239,29 @@ async def graphql_followers_page(
         "variables": json.dumps(variables, separators=(",", ":")),
     }
     url = "https://www.instagram.com/graphql/query/"
+    gql_backoffs = [
+        float(x.strip())
+        for x in (os.getenv("ADMIN_LAB_GRAPHQL_429_BACKOFF_SEC") or "45,120,300").split(",")
+        if x.strip()
+    ] or [45.0, 120.0, 300.0]
     last_err: Optional[Exception] = None
-    for attempt in range(5):
+    i429 = 0
+    for attempt in range(8):
         try:
             headers = base_headers()
             headers["Content-Type"] = "application/x-www-form-urlencoded"
             r = await client.post(url, data=body, headers=headers, timeout=60.0)
             if r.status_code == 429:
-                wait = min(90.0, 2 ** attempt + random.uniform(2, 8))
-                sys.stderr.write(f"[admin-lab] rate limited, sleeping {wait:.1f}s\n")
-                await asyncio.sleep(wait)
-                continue
+                last_err = RuntimeError(f"GraphQL HTTP 429")
+                if i429 < len(gql_backoffs):
+                    wait = gql_backoffs[i429] + random.uniform(5.0, 25.0)
+                    sys.stderr.write(
+                        f"[admin-lab] graphql rate limited, sleeping {wait:.0f}s ({i429 + 1}/{len(gql_backoffs)})\n"
+                    )
+                    await asyncio.sleep(wait)
+                    i429 += 1
+                    continue
+                raise RuntimeError("GraphQL HTTP 429: backoff exhausted")
             if r.status_code >= 400:
                 raise RuntimeError(f"GraphQL HTTP {r.status_code}: {r.text[:500]}")
             data = r.json()
@@ -238,6 +275,11 @@ async def graphql_followers_page(
                 )
             page_info = walk_find_page_info(data) or {}
             return edges, page_info
+        except RuntimeError as e:
+            if "backoff exhausted" in str(e):
+                raise
+            last_err = e
+            await asyncio.sleep(1.2 ** attempt + random.uniform(0.3, 1.2))
         except Exception as e:
             last_err = e
             await asyncio.sleep(1.2 ** attempt + random.uniform(0.3, 1.2))
@@ -248,36 +290,119 @@ def _user_id_cache_file() -> str:
     return os.path.join(os.path.dirname(__file__), ".cache", "user_ids.json")
 
 
-def load_cached_user_id(username: str) -> Optional[str]:
+def _norm_username(username: str) -> str:
+    return username.strip().lstrip("@").lower()
+
+
+def _user_id_cache_ttl_sec() -> int:
+    return max(3600, int(os.getenv("ADMIN_LAB_USER_ID_CACHE_TTL_SEC") or "2592000"))
+
+
+def _read_user_id_cache_raw() -> Dict[str, Any]:
     path = _user_id_cache_file()
     if not os.path.exists(path):
-        return None
+        return {}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        key = username.strip().lstrip("@").lower()
-        uid = data.get(key) if isinstance(data, dict) else None
-        return str(uid) if uid else None
+            raw = json.load(f)
+        return raw if isinstance(raw, dict) else {}
     except Exception:
+        return {}
+
+
+def _expires_at_from_entry(entry: Dict[str, Any]) -> Optional[float]:
+    exp = entry.get("expires_at")
+    if isinstance(exp, (int, float)):
+        return float(exp)
+    if isinstance(exp, str):
+        try:
+            dt = datetime.datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except Exception:
+            return None
+    return None
+
+
+def load_cached_user_id(username: str) -> Optional[str]:
+    """
+    Return cached numeric user id if present and not past expires_at.
+    Legacy entries (plain string) are treated as valid and rewritten with a fresh TTL on save.
+    """
+    key = _norm_username(username)
+    data = _read_user_id_cache_raw()
+    raw = data.get(key)
+    if raw is None:
         return None
+    now = time.time()
+    if isinstance(raw, str):
+        return str(raw) if raw.strip() else None
+    if isinstance(raw, dict):
+        uid = raw.get("id")
+        if not uid:
+            return None
+        exp_ts = _expires_at_from_entry(raw)
+        if exp_ts is not None and now > exp_ts:
+            return None
+        return str(uid)
+    return None
 
 
 def save_cached_user_id(username: str, uid: str) -> None:
     cache_dir = os.path.join(os.path.dirname(__file__), ".cache")
     os.makedirs(cache_dir, exist_ok=True)
     path = _user_id_cache_file()
-    data: Dict[str, str] = {}
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            if isinstance(raw, dict):
-                data = {str(k): str(v) for k, v in raw.items()}
-        except Exception:
-            data = {}
-    data[username.strip().lstrip("@").lower()] = str(uid)
+    data = _read_user_id_cache_raw()
+    ttl = _user_id_cache_ttl_sec()
+    now = time.time()
+    # Migrate legacy string values to structured entries when we touch the file.
+    for k, v in list(data.items()):
+        if isinstance(v, str) and v.strip():
+            data[k] = {
+                "id": str(v).strip(),
+                "resolved_at": datetime.datetime.utcfromtimestamp(now).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "expires_at": now + ttl,
+            }
+    key = _norm_username(username)
+    data[key] = {
+        "id": str(uid),
+        "resolved_at": datetime.datetime.utcfromtimestamp(now).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": now + ttl,
+    }
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+
+async def run_resolve_only(username: str, proxy: str) -> Dict[str, Any]:
+    """Resolve username -> user id using the same cookie jar as scrape; updates TTL cache."""
+    un = _norm_username(username)
+    cached = load_cached_user_id(un)
+    if cached:
+        raw = _read_user_id_cache_raw().get(un)
+        exp_iso = ""
+        if isinstance(raw, dict):
+            exp_ts = _expires_at_from_entry(raw)
+            if exp_ts is not None:
+                exp_iso = datetime.datetime.utcfromtimestamp(exp_ts).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return {"ok": True, "userId": cached, "cached": True, "expiresAt": exp_iso}
+
+    transport = httpx.AsyncHTTPTransport(retries=1)
+    async with httpx.AsyncClient(
+        proxy=proxy.strip(),
+        transport=transport,
+        follow_redirects=True,
+        timeout=httpx.Timeout(90.0),
+    ) as client:
+        cookie_header = load_cookie_header()
+        uid = await fetch_profile_user_id(
+            client,
+            un,
+            cookie_header if cookie_header else None,
+        )
+        save_cached_user_id(un, uid)
+    ttl = _user_id_cache_ttl_sec()
+    exp = time.time() + ttl
+    exp_iso = datetime.datetime.utcfromtimestamp(exp).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return {"ok": True, "userId": uid, "cached": False, "expiresAt": exp_iso}
 
 
 def load_cookie_header() -> str:
@@ -413,11 +538,21 @@ async def run_scrape(username: str, proxy: str, max_users: int, output: str, use
     ) as client:
         cookie_header = load_cookie_header()
         uid = user_id.strip() if isinstance(user_id, str) and user_id.strip() else None
+        require_cached = (os.getenv("ADMIN_LAB_SCRAPE_REQUIRE_CACHED_USER_ID") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         if not uid:
             uid = load_cached_user_id(username)
             if uid:
                 sys.stderr.write(f"[admin-lab] Using cached user id for @{username} -> {uid}\n")
         if not uid:
+            if require_cached:
+                raise RuntimeError(
+                    "No cached user id (or cache expired). Call POST /api/admin-lab/scrape/resolve first, "
+                    "pass --user_id / targetUserId, or unset ADMIN_LAB_SCRAPE_REQUIRE_CACHED_USER_ID."
+                )
             uid = await fetch_profile_user_id(
                 client,
                 username,
@@ -526,17 +661,41 @@ async def run_scrape(username: str, proxy: str, max_users: int, output: str, use
 def main() -> None:
     p = argparse.ArgumentParser(description="Instagram public followers scrape (login-less, lab)")
     p.add_argument("--username", required=True)
+    p.add_argument(
+        "--resolve_only",
+        action="store_true",
+        help="Only resolve username to numeric user id (TTL cache); prints one JSON object on stdout.",
+    )
     p.add_argument("--user_id", required=False, help="Optional: bypass web_profile_info lookup (use numeric IG user id)")
-    p.add_argument("--proxy", required=True, help="HTTP proxy URL, e.g. http://user:pass@host:port")
+    p.add_argument("--proxy", required=False, help="HTTP proxy URL, e.g. http://user:pass@host:port")
     p.add_argument("--max_users", type=int, default=500)
-    p.add_argument("--output", required=True, help="Output CSV path")
+    p.add_argument("--output", required=False, help="Output CSV path")
     args = p.parse_args()
+
+    if args.resolve_only:
+        if not args.proxy or not str(args.proxy).strip():
+            print(json.dumps({"ok": False, "error": "--proxy is required with --resolve_only"}))
+            sys.exit(1)
+        try:
+            out = asyncio.run(run_resolve_only(args.username.strip().lstrip("@"), str(args.proxy).strip()))
+            print(json.dumps(out))
+            sys.exit(0 if out.get("ok") else 1)
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": str(e)}))
+            sys.exit(1)
+
+    if not args.output:
+        print("--output is required unless --resolve_only", file=sys.stderr)
+        sys.exit(2)
+    if not args.proxy or not str(args.proxy).strip():
+        print("--proxy is required for scrape", file=sys.stderr)
+        sys.exit(2)
 
     t0 = time.time()
     n = asyncio.run(
         run_scrape(
             args.username.strip().lstrip("@"),
-            args.proxy.strip(),
+            str(args.proxy).strip(),
             int(args.max_users),
             args.output,
             args.user_id,

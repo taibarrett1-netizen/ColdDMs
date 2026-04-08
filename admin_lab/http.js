@@ -22,6 +22,32 @@ const labDownloadTokens = new Map(); // token -> { filePath, expiresAt }
 
 let adminLabSenderBusy = false;
 let adminLabScrapeRunning = false;
+let adminLabResolveBusy = false;
+
+/** Max time for username→user_id resolve (spawn); default 20m. */
+const ADMIN_LAB_RESOLVE_SPAWN_MS = Math.min(
+  Math.max(60000, parseInt(process.env.ADMIN_LAB_RESOLVE_HTTP_TIMEOUT_MS || '1200000', 10) || 1200000),
+  3600000,
+);
+
+function parseAdminLabResolveStdout(stdout) {
+  const s = String(stdout || '').trim();
+  if (!s) return null;
+  const lines = s.split(/\r?\n/).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    try {
+      const j = JSON.parse(lines[i]);
+      if (j && typeof j === 'object') return j;
+    } catch (_) {
+      /* continue */
+    }
+  }
+  try {
+    return JSON.parse(s);
+  } catch (_) {
+    return null;
+  }
+}
 
 const adminLabConnectLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -343,6 +369,81 @@ function registerAdminLabRoutes(app) {
     });
 
     res.json({ ok: true, jobId });
+  });
+
+  app.post('/api/admin-lab/scrape/resolve', requireAdminLabSecret, (req, res) => {
+    const { targetUsername, proxyUrl } = req.body || {};
+    const un = typeof targetUsername === 'string' ? targetUsername.trim().replace(/^@/, '') : '';
+    if (!un) {
+      return res.status(400).json({ ok: false, error: 'targetUsername is required' });
+    }
+    const proxy =
+      (typeof proxyUrl === 'string' && proxyUrl.trim()) || (process.env.ADMIN_LAB_DECODO_PROXY_URL || '').trim();
+    if (!proxy) {
+      return res.status(503).json({
+        ok: false,
+        error: 'Set ADMIN_LAB_DECODO_PROXY_URL on the VPS or pass proxyUrl in the request body.',
+      });
+    }
+    if (adminLabResolveBusy) {
+      return res.status(503).json({
+        ok: false,
+        error: 'A resolve operation is already running. Wait or try again.',
+      });
+    }
+
+    const py = process.env.ADMIN_LAB_PYTHON || 'python3';
+    const args = [PYTHON_SCRIPT, '--resolve_only', '--username', un, '--proxy', proxy];
+    adminLabResolveBusy = true;
+    const child = spawn(py, args, {
+      cwd: projectRoot,
+      env: { ...process.env },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdoutBuf = '';
+    let stderrBuf = '';
+    child.stdout.on('data', (d) => {
+      stdoutBuf += d.toString();
+    });
+    child.stderr.on('data', (d) => {
+      stderrBuf += d.toString();
+      if (stderrBuf.length > 12000) stderrBuf = stderrBuf.slice(-8000);
+    });
+
+    const killTimer = setTimeout(() => {
+      try {
+        child.kill('SIGTERM');
+      } catch (_) {
+        /* ignore */
+      }
+    }, ADMIN_LAB_RESOLVE_SPAWN_MS);
+
+    child.on('error', (err) => {
+      clearTimeout(killTimer);
+      adminLabResolveBusy = false;
+      console.error('[admin-lab] resolve spawn error', err);
+      return res.status(500).json({ ok: false, error: err.message || String(err) });
+    });
+
+    child.on('close', (code) => {
+      clearTimeout(killTimer);
+      adminLabResolveBusy = false;
+      const parsed = parseAdminLabResolveStdout(stdoutBuf);
+      if (parsed && parsed.ok && parsed.userId) {
+        return res.json({
+          ok: true,
+          userId: String(parsed.userId),
+          cached: !!parsed.cached,
+          expiresAt: typeof parsed.expiresAt === 'string' ? parsed.expiresAt : undefined,
+        });
+      }
+      const errMsg =
+        (parsed && parsed.error) ||
+        stderrBuf.slice(-1500) ||
+        `Python exited with code ${code}`;
+      return res.status(500).json({ ok: false, error: errMsg });
+    });
   });
 
   app.get('/api/admin-lab/scrape/followers/status', requireAdminLabSecret, (req, res) => {
