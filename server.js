@@ -799,11 +799,17 @@ app.post('/api/control/start', async (req, res) => {
       `pm2 start ${SEND_WORKER_ENTRY} --name ${BOT_PM2_NAME} --no-autorestart`,
       { cwd: projectRoot },
       (err, stdout, stderr) => {
-      const out = (stdout || '') + (stderr || '');
-      const alreadyRunning = /already (running|launched)|online/i.test(out);
-      if (err && !alreadyRunning) console.error('[API] pm2 start failed', err, stderr);
-      else if (!alreadyRunning) console.log('[API] Worker started.');
-    }
+        const out = ((stdout || '') + (stderr || '')).trim();
+        const alreadyRunning = /already (running|launched)|online/i.test(out);
+        if (err && !alreadyRunning) {
+          console.error('[API] pm2 start failed', err, stderr);
+          const detail = (stderr || err.message || 'pm2 error').toString().slice(0, 220);
+          setClientStatusMessage(clientId, `Send worker did not start: ${detail}`).catch(() => {});
+          return;
+        }
+        if (out && !alreadyRunning) console.log('[API] pm2 start output:', out.slice(0, 600));
+        else if (!alreadyRunning) console.log('[API] Worker start command finished.');
+      }
     );
     return;
   }

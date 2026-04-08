@@ -1499,6 +1499,8 @@ async function runBotMultiTenant() {
   let page;
   let currentSessionId = null;
   const campaignRoundRobin = new Map();
+  /** Retries when cold_dm_control has no pause=0 yet (race right after dashboard Start). */
+  let noPauseZeroEmptyRounds = 0;
 
   async function ensurePageSession(pg, session) {
     const cookies = session?.session_data?.cookies;
@@ -1538,6 +1540,20 @@ async function runBotMultiTenant() {
     const next = await sb.getNextPendingWorkAnyClient(SEND_WORKER_ID, SEND_LEASE_SECONDS);
     if (!next) {
       const clientIds = await sb.getClientIdsWithPauseZero();
+      if (clientIds.length === 0) {
+        noPauseZeroEmptyRounds += 1;
+        if (noPauseZeroEmptyRounds <= 24) {
+          logger.warn(
+            `[send-worker] No cold_dm_control rows with pause=0 (attempt ${noPauseZeroEmptyRounds}/24). Retrying in 15s (common right after clicking Start).`
+          );
+          await delay(15000);
+          continue;
+        }
+        logger.error('[send-worker] Giving up: still no pause=0 clients after ~6 min.');
+        await browser.close().catch(() => {});
+        process.exit(0);
+      }
+      noPauseZeroEmptyRounds = 0;
       let earliestResumeAt = null;
       let resumeReason = '';
       const reasonMessageByClient = new Map();
@@ -1584,6 +1600,7 @@ async function runBotMultiTenant() {
       continue;
     }
     const { clientId, work } = next;
+    noPauseZeroEmptyRounds = 0;
     const pause = await sb.getControl(clientId);
     if (pause === '1' || pause === 1) {
       continue;
@@ -1598,7 +1615,13 @@ async function runBotMultiTenant() {
     const sessions = await sb.getSessionsForCampaign(clientId, work.campaignId);
     if (!sessions || sessions.length === 0) {
       logger.warn('No sessions for campaign ' + work.campaignId + ', failing lead.');
-      await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', null, SEND_WORKER_ID).catch(() => {});
+      await sb
+        .setClientStatusMessage(
+          clientId,
+          'No Instagram sender linked to this campaign. Open the campaign → Settings → Instagram accounts, attach an account, then Start again.'
+        )
+        .catch(() => {});
+      await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', 'no_instagram_session', SEND_WORKER_ID).catch(() => {});
       await delay(randomDelay(2000, 5000));
       continue;
     }
