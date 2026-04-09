@@ -837,27 +837,37 @@ async function login(page, credentials) {
         const hiddenByStyle = style && (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0');
         return !node.disabled && rects > 0 && !hiddenByStyle;
       })(),
+      disabled: !!node.disabled,
       name: node.name || '',
       autocomplete: node.autocomplete || '',
       placeholder: node.placeholder || '',
       aria: node.getAttribute('aria-label') || '',
       value: node.value || '',
     }));
+  const isUsableField = (meta) => meta && !meta.disabled;
   const findField = async (chooser) => {
     for (const el of inputs) {
       const meta = await getFieldMeta(el);
-      if (!meta.visible) continue;
+      if (!isUsableField(meta)) continue;
       if (chooser(meta)) return { el, meta };
     }
     return { el: null, meta: null };
   };
+  const pickByIndex = async (idx) => {
+    if (typeof idx !== 'number' || idx < 0 || idx >= inputs.length) return { el: null, meta: null };
+    const el = inputs[idx];
+    const meta = await getFieldMeta(el).catch(() => null);
+    return isUsableField(meta) ? { el, meta } : { el: null, meta: null };
+  };
   const userChoice =
+    (await pickByIndex(loginDiag?.userIndex)) ||
     (await findField((p) => p.name === 'username' || p.autocomplete === 'username')) ||
-    (await findField((p) => p.placeholder.toLowerCase().includes('username') || p.placeholder.toLowerCase().includes('email'))) ||
+    (await findField((p) => p.placeholder.toLowerCase().includes('username') || p.placeholder.toLowerCase().includes('email') || p.aria.toLowerCase().includes('username') || p.aria.toLowerCase().includes('email'))) ||
     (await findField((p) => p.type === 'text' || p.type === 'email' || p.type === ''));
   const passChoice =
+    (await pickByIndex(loginDiag?.passIndex)) ||
     (await findField((p) => p.name === 'password' || p.autocomplete === 'current-password')) ||
-    (await findField((p) => p.placeholder.toLowerCase().includes('password') || p.type === 'password'));
+    (await findField((p) => p.placeholder.toLowerCase().includes('password') || p.aria.toLowerCase().includes('password') || p.type === 'password'));
   const userEl = userChoice.el;
   const passEl = passChoice.el;
   if (!userEl || !passEl) {
@@ -867,6 +877,7 @@ async function login(page, credentials) {
     const bodyText = await page.evaluate(() => document.body ? document.body.innerText.slice(0, 500) : '').catch(() => '');
     logger.error('Login form fields not found after retry');
     logger.log(`Page at failure: URL=${failUrl} title=${failTitle}`);
+    logger.log(`Login field diag reused: ${JSON.stringify(loginDiag || {}, null, 0).slice(0, 2000)}`);
     logger.log(`Page body snippet: ${bodyText.replace(/\n/g, ' ').slice(0, 300)}`);
     throw new Error('Login form fields not found. Instagram may have changed the page.');
   }
