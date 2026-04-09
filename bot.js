@@ -1283,6 +1283,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (t === needle || t === `@${needle}` || containsUsernameToken(t)) return true;
           if (t.length < 2 || t.length > 80) return true;
           if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return true;
+          // Inbox-only relative time token (not a person name).
+          if (/^\d{1,3}\s*[mhdw]$/i.test(t)) return true;
           return false;
         };
         const normalizeCandidateName = (raw) => {
@@ -1301,7 +1303,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           return t;
         };
 
-        /** Open thread column only (anchored from Message composer — not inbox list). */
+        /**
+         * Open conversation column only. [role=main] often wraps inbox + thread (full width);
+         * we climb from the Message composer and keep the topmost ancestor still laid out in the thread column (right side).
+         */
         function threadPaneRoot() {
           const vis = (el) => {
             try {
@@ -1317,17 +1322,21 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             return ph.includes('message') || aria.includes('message');
           });
           if (!compose) return document.body;
-          let main = compose.closest('[role="main"]') || compose.closest('main');
-          if (main) return main;
-          let el = compose;
           const vw = document.documentElement.clientWidth || 1200;
-          for (let depth = 0; depth < 14 && el; depth++) {
+          const minLeft = Math.max(120, vw * 0.2);
+          let best = compose;
+          let el = compose;
+          for (let depth = 0; depth < 28 && el; depth++) {
             el = el.parentElement;
-            if (!el) break;
+            if (!el || el === document.body || el === document.documentElement) break;
             const r = el.getBoundingClientRect();
-            if (r.width >= vw * 0.28 && r.height >= 180) return el;
+            if (r.left >= minLeft) {
+              best = el;
+            } else {
+              break;
+            }
           }
-          return compose.parentElement || document.body;
+          return best;
         }
 
         const pane = threadPaneRoot();
@@ -1394,16 +1403,21 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         return null;
       }, u);
       if (extracted) {
-        const firstWord = extracted.trim().split(/\s+/)[0] || '';
-        const normalizedFirst = normalizeName(firstWord);
-        const blocklist = sendOpts.firstNameBlocklist || new Set();
-        if (!normalizedFirst) {
-          logger.log(`Display name from thread for @${u} not used: first word normalized to empty`);
-        } else if (blocklist.has(normalizedFirst.toLowerCase())) {
-          logger.log(`Display name from thread for @${u} not used: first name "${normalizedFirst}" is blocklisted`);
+        const trimmed = extracted.trim();
+        if (/^\d{1,3}\s*[mhdw]$/i.test(trimmed)) {
+          logger.log(`Display name from thread for @${u} ignored (inbox time token, not a name): "${extracted}"`);
         } else {
-          displayNameForSubst = extracted;
-          logger.log(`Using display name from thread for @${u}: "${extracted}"`);
+          const firstWord = trimmed.split(/\s+/)[0] || '';
+          const normalizedFirst = normalizeName(firstWord);
+          const blocklist = sendOpts.firstNameBlocklist || new Set();
+          if (!normalizedFirst) {
+            logger.log(`Display name from thread for @${u} not used: first word normalized to empty`);
+          } else if (blocklist.has(normalizedFirst.toLowerCase())) {
+            logger.log(`Display name from thread for @${u} not used: first name "${normalizedFirst}" is blocklisted`);
+          } else {
+            displayNameForSubst = extracted;
+            logger.log(`Using display name from thread for @${u}: "${extracted}"`);
+          }
         }
       }
     } catch (e) {
