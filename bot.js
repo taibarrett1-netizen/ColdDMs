@@ -15,7 +15,7 @@ const {
   buildDesktopViewport,
   getDesktopWindowPadding,
 } = require('./utils/mobile-viewport');
-const { substituteVariables, normalizeName } = require('./utils/message-variables');
+const { substituteVariables, normalizeName, normalizeFullDisplayName } = require('./utils/message-variables');
 const { isFfmpegAvailable, convertToChromeFakeMicWav, ensureChromeFakeMicPlaceholder } = require('./utils/voice-note-audio');
 const {
   appendChromeFakeMicArgs,
@@ -1003,6 +1003,56 @@ async function login(page, credentials) {
 
 const MAX_SEND_RETRIES = 3;
 
+async function runComposeDiagnostic(page) {
+  return page.evaluate(() => {
+    const textareas = document.querySelectorAll('textarea');
+    const editables = document.querySelectorAll('div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"]');
+    const roleBoxes = document.querySelectorAll('[role="textbox"]');
+    const visible = (el) => el.offsetParent !== null;
+    const vis = (el) => {
+      try {
+        return el && el.offsetParent !== null;
+      } catch {
+        return false;
+      }
+    };
+    const composers = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"]')).filter(vis);
+    const compose = composers.find((el) => {
+      const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+      const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+      return ph.includes('message') || aria.includes('message');
+    });
+    let paneScopedSnippet = '';
+    if (compose) {
+      const vw = document.documentElement.clientWidth || 1200;
+      const minLeft = Math.max(0, compose.getBoundingClientRect().left - 48);
+      const maxPaneWidth = vw - minLeft + 120;
+      let best = compose;
+      let el = compose;
+      for (let depth = 0; depth < 28 && el; depth++) {
+        el = el.parentElement;
+        if (!el || el === document.body || el === document.documentElement) break;
+        const r = el.getBoundingClientRect();
+        if (r.left < minLeft) break;
+        if (r.width <= maxPaneWidth) best = el;
+        else break;
+      }
+      paneScopedSnippet = (best.innerText || '').slice(0, 400).replace(/\n/g, ' ');
+    }
+    return {
+      url: window.location.href,
+      textarea: textareas.length,
+      textareaVisible: Array.from(textareas).filter(visible).length,
+      contenteditable: editables.length,
+      contenteditableVisible: Array.from(editables).filter(visible).length,
+      roleTextbox: roleBoxes.length,
+      roleTextboxVisible: Array.from(roleBoxes).filter(visible).length,
+      bodySnippet: document.body ? document.body.innerText.slice(0, 400).replace(/\n/g, ' ') : '',
+      paneScopedSnippet,
+    };
+  });
+}
+
 async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts = {}) {
   const voiceCfg = buildVoiceSendConfig(sendOpts);
   if (wantsVoiceNotes(voiceCfg) && !isFfmpegAvailable()) {
@@ -1230,55 +1280,6 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   await dismissInstagramHomeModals(page, logger);
   await delay(600);
 
-  const composeDiagnostic = () =>
-    page.evaluate(() => {
-      const textareas = document.querySelectorAll('textarea');
-      const editables = document.querySelectorAll('div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"]');
-      const roleBoxes = document.querySelectorAll('[role="textbox"]');
-      const visible = (el) => el.offsetParent !== null;
-      const vis = (el) => {
-        try {
-          return el && el.offsetParent !== null;
-        } catch {
-          return false;
-        }
-      };
-      const composers = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"]')).filter(vis);
-      const compose = composers.find((el) => {
-        const ph = (el.getAttribute('placeholder') || '').toLowerCase();
-        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
-        return ph.includes('message') || aria.includes('message');
-      });
-      let paneScopedSnippet = '';
-      if (compose) {
-        const vw = document.documentElement.clientWidth || 1200;
-        const minLeft = Math.max(0, compose.getBoundingClientRect().left - 48);
-        const maxPaneWidth = vw - minLeft + 120;
-        let best = compose;
-        let el = compose;
-        for (let depth = 0; depth < 28 && el; depth++) {
-          el = el.parentElement;
-          if (!el || el === document.body || el === document.documentElement) break;
-          const r = el.getBoundingClientRect();
-          if (r.left < minLeft) break;
-          if (r.width <= maxPaneWidth) best = el;
-          else break;
-        }
-        paneScopedSnippet = (best.innerText || '').slice(0, 400).replace(/\n/g, ' ');
-      }
-      return {
-        url: window.location.href,
-        textarea: textareas.length,
-        textareaVisible: Array.from(textareas).filter(visible).length,
-        contenteditable: editables.length,
-        contenteditableVisible: Array.from(editables).filter(visible).length,
-        roleTextbox: roleBoxes.length,
-        roleTextboxVisible: Array.from(roleBoxes).filter(visible).length,
-        bodySnippet: document.body ? document.body.innerText.slice(0, 400).replace(/\n/g, ' ') : '',
-        paneScopedSnippet,
-      };
-    });
-
   const composeSelector = 'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]';
   logger.log('Waiting for compose area...');
   let composeFound = false;
@@ -1289,7 +1290,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     await dismissInstagramHomeModals(page, logger);
     await delay(500);
   } catch (e) {
-    const diag = await composeDiagnostic().catch(() => ({}));
+    const diag = await runComposeDiagnostic(page).catch(() => ({}));
     const bodySnippet = (diag.bodySnippet || '').toLowerCase();
     if (bodySnippet.includes('this account is private') || bodySnippet.includes('account is private')) noComposeReason = 'account_private';
     else if (bodySnippet.includes("can't message") || bodySnippet.includes("can't send") || bodySnippet.includes('message request') || bodySnippet.includes("don't accept")) noComposeReason = 'messages_restricted';
@@ -1500,12 +1501,43 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     onFirstNameEmpty: (reason) => logger.warn(`First name empty for @${u}: ${reason}`),
     senderName: sendOpts.senderName || '',
   });
+  const threadId = getInstagramThreadIdFromUrl(page.url());
+  if (sendOpts.dryRunNames) {
+    let fullNameOut = '';
+    if (leadFromPage.display_name && String(leadFromPage.display_name).trim()) {
+      fullNameOut = normalizeFullDisplayName(leadFromPage.display_name);
+    }
+    if (!fullNameOut) {
+      fullNameOut = [derivedNames.first_name, derivedNames.last_name].filter(Boolean).join(' ');
+    }
+    const diag = await runComposeDiagnostic(page).catch(() => ({}));
+    logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+    if (diag.paneScopedSnippet) {
+      logger.log(
+        'Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet
+      );
+    }
+    return {
+      ok: composeFound,
+      previewNamesOnly: true,
+      reason: composeFound ? undefined : noComposeReason,
+      username: u,
+      url: page.url(),
+      instagramThreadId: threadId || undefined,
+      display_name: leadFromPage.display_name || null,
+      first_name: derivedNames.first_name || null,
+      last_name: derivedNames.last_name || null,
+      full_name: fullNameOut || null,
+      composeFound,
+      pane_scoped_snippet: diag.paneScopedSnippet || null,
+      body_snippet: diag.bodySnippet || null,
+    };
+  }
   const shouldSendText = voiceCfg.mode !== 'voice_only';
   const shouldSendVoice = wantsVoiceNotes(voiceCfg);
   let textSent = false;
   let voiceSent = false;
   let voiceFailure = null;
-  const threadId = getInstagramThreadIdFromUrl(page.url());
 
   const attemptVoiceSend = async () => {
     if (!shouldSendVoice) return;
@@ -1541,7 +1573,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   };
 
   if (composeFound) {
-    const diag = await composeDiagnostic().catch(() => ({}));
+    const diag = await runComposeDiagnostic(page).catch(() => ({}));
     logger.log('Compose diagnostic: ' + JSON.stringify(diag));
     if (diag.paneScopedSnippet) {
       logger.log('Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet);
@@ -1642,6 +1674,93 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   if (voiceFailure) return { ok: false, reason: voiceFailure };
 
   return { ok: false, reason: noComposeReason || 'no_compose' };
+}
+
+/**
+ * Opens Instagram with a stored sender session, runs the same DM-open + display-name path as a real send,
+ * but does not type or send. For admin "name test" debugging.
+ *
+ * @param {{ clientId: string, instagramSessionId: string, username?: string, targetUsername?: string, first_name?: string, last_name?: string, display_name?: string }} body
+ */
+async function previewDmLeadNamesFromSession(body) {
+  const clientId = (body.clientId || '').trim();
+  const instagramSessionId = (body.instagramSessionId || '').trim();
+  const targetUsername = normalizeUsername(body.username || body.targetUsername || '');
+  if (!clientId || !instagramSessionId || !targetUsername) {
+    return { ok: false, error: 'clientId, instagramSessionId, and username are required' };
+  }
+  if (!sb.isSupabaseConfigured()) {
+    return { ok: false, error: 'Supabase not configured' };
+  }
+  const session = await sb.getInstagramSessionByIdForClient(clientId, instagramSessionId);
+  if (!session) {
+    return { ok: false, error: 'Instagram session not found' };
+  }
+  const cookies = session.session_data?.cookies;
+  if (!cookies?.length) {
+    return { ok: false, error: 'Session has no cookies; reconnect Instagram' };
+  }
+
+  const firstNameBlocklist = new Set();
+  if (sb.getFirstNameBlocklist) {
+    const list = await sb.getFirstNameBlocklist(clientId).catch(() => []);
+    list.forEach((n) => firstNameBlocklist.add(String(n).toLowerCase()));
+  }
+  let senderAccountName = '';
+  if (sb.getUserAccountName) {
+    senderAccountName = (await sb.getUserAccountName(clientId).catch(() => null)) || '';
+  }
+  const nameFallback = {
+    first_name: body.first_name,
+    last_name: body.last_name,
+    display_name: body.display_name,
+  };
+
+  const launchOpts = buildFollowUpLaunchOptions(DEFAULT_CHROME_FAKE_MIC_WAV, session.proxy_url);
+  let browser;
+  try {
+    browser = await puppeteer.launch(launchOpts);
+    const page = await browser.newPage();
+    await authenticatePageForProxy(page, session.proxy_url);
+    await grantMicrophoneForInstagram(page, logger);
+    await applyDesktopEmulation(page);
+    await page.setCookie(...cookies);
+    await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+    await delay(2000);
+    await dismissInstagramHomeModals(page, logger);
+    await delay(500);
+    if (page.url().includes('/accounts/login')) {
+      return { ok: false, error: 'Instagram session expired' };
+    }
+
+    const result = await sendDMOnce(page, targetUsername, '{{first_name}}', nameFallback, {
+      dryRunNames: true,
+      firstNameBlocklist,
+      senderName: senderAccountName,
+    });
+    if (result.previewNamesOnly) {
+      return {
+        ok: result.ok,
+        username: result.username,
+        url: result.url,
+        instagramThreadId: result.instagramThreadId,
+        display_name: result.display_name,
+        first_name: result.first_name,
+        last_name: result.last_name,
+        full_name: result.full_name,
+        composeFound: result.composeFound,
+        reason: result.reason,
+        pane_scoped_snippet: result.pane_scoped_snippet,
+        body_snippet: result.body_snippet,
+      };
+    }
+    return { ok: false, error: 'Unexpected send path (preview only)' };
+  } catch (e) {
+    logger.warn(`[preview-dm-names] ${e && e.message ? e.message : String(e)}`);
+    return { ok: false, error: e.message || 'Preview failed' };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
 }
 
 function buildFollowUpLaunchOptions(fakeMicPath = DEFAULT_CHROME_FAKE_MIC_WAV, proxyUrl = null) {
@@ -2940,4 +3059,5 @@ module.exports = {
   completeInstagram2FA,
   completeInstagramEmailVerification,
   scheduleDebugFollowUpBrowser,
+  previewDmLeadNamesFromSession,
 };

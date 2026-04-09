@@ -44,6 +44,7 @@ const {
   completeInstagramEmailVerification,
   sendFollowUp,
   scheduleDebugFollowUpBrowser,
+  previewDmLeadNamesFromSession,
 } = require('./bot');
 const { connectScraper, runFollowerScrape, runCommentScrape } = require('./scraper');
 const { MESSAGES } = require('./config/messages');
@@ -563,6 +564,44 @@ app.post('/api/follow-up/send', followUpLimiter, async (req, res) => {
  * Body: { clientId, instagramSessionId, recipientUsername? }
  * Server needs HEADLESS_MODE=false and DISPLAY (e.g. :98 with Xvfb). Returns 202 immediately; browser starts in background.
  */
+/**
+ * Admin / debug: same DM navigation + thread display-name extraction as a real send; does not type or send.
+ * Body: { clientId, instagramSessionId, username, first_name?, last_name?, display_name? }
+ */
+app.post('/api/debug/preview-dm-names', async (req, res) => {
+  if (!isSupabaseConfigured()) {
+    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
+  }
+  const body = req.body || {};
+  const cid = (body.clientId || '').trim();
+  if (req.authClientId && cid && cid !== req.authClientId) {
+    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
+  }
+  if (!cid) {
+    return res.status(400).json({ ok: false, error: 'clientId is required' });
+  }
+  if (!tryAcquire('followUp')) {
+    return res.status(429).json({ ok: false, error: 'Too many concurrent browser jobs. Try again shortly.' });
+  }
+  try {
+    const result = await previewDmLeadNamesFromSession(body);
+    let status = 200;
+    if (result.error === 'Instagram session expired') status = 401;
+    else if (
+      typeof result.error === 'string' &&
+      /required|not configured|not found|no cookies/i.test(result.error)
+    ) {
+      status = 400;
+    }
+    return res.status(status).json(result);
+  } catch (e) {
+    logger.error('[API] debug/preview-dm-names exception', e);
+    return res.status(500).json({ ok: false, error: e.message || 'Internal error' });
+  } finally {
+    release('followUp');
+  }
+});
+
 app.post('/api/debug/follow-up/browser', (req, res) => {
   if (!isSupabaseConfigured()) {
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
