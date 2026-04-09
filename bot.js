@@ -970,7 +970,8 @@ async function login(page, credentials) {
   }
 
   const emailCheckpoint = await detectInstagramEmailVerificationState(page);
-  if (emailCheckpoint.required) {
+  const currentLoginUrl = page.url().toLowerCase();
+  if (emailCheckpoint.required || currentLoginUrl.includes('/auth_platform/codeentry')) {
     await saveLoginDebugScreenshot(page, 'email_checkpoint');
     page.off('response', respHandler);
     const err = new Error(
@@ -1010,7 +1011,8 @@ async function login(page, credentials) {
   }
 
   const emailCheckpointAfterRetry = await detectInstagramEmailVerificationState(page);
-  if (emailCheckpointAfterRetry.required) {
+  const retryLoginUrl = page.url().toLowerCase();
+  if (emailCheckpointAfterRetry.required || retryLoginUrl.includes('/auth_platform/codeentry')) {
     await saveLoginDebugScreenshot(page, 'email_checkpoint_after_retry');
     page.off('response', respHandler);
     const err = new Error(
@@ -2838,6 +2840,10 @@ async function runBotMultiTenant() {
   const campaignRoundRobin = new Map();
   /** Retries when cold_dm_control has no pause=0 yet (race right after dashboard Start). */
   let noPauseZeroEmptyRounds = 0;
+  const NO_WORK_LOG_EVERY_ROUNDS = Math.max(
+    4,
+    parseInt(process.env.SEND_WORKER_NO_WORK_LOG_EVERY_ROUNDS || '20', 10) || 20
+  );
 
   function proxyKeyForSession(session) {
     return session && session.proxy_url ? String(session.proxy_url).trim() : '';
@@ -2932,10 +2938,12 @@ async function runBotMultiTenant() {
       const clientIds = await sb.getClientIdsWithPauseZero();
       if (clientIds.length === 0) {
         noPauseZeroEmptyRounds += 1;
-        if (noPauseZeroEmptyRounds <= 24) {
+        if (noPauseZeroEmptyRounds === 1 || noPauseZeroEmptyRounds % NO_WORK_LOG_EVERY_ROUNDS === 0) {
           logger.warn(
-            `[send-worker] No cold_dm_control rows with pause=0 (attempt ${noPauseZeroEmptyRounds}/24). Retrying in 15s (common right after clicking Start).`
+            `[send-worker] No cold_dm_control rows with pause=0 (attempt ${noPauseZeroEmptyRounds}). Retrying in 15s (common right after clicking Start).`
           );
+        }
+        if (noPauseZeroEmptyRounds < 24) {
           await delay(15000);
           continue;
         }
