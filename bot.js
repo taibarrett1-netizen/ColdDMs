@@ -1359,6 +1359,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return true;
           // Inbox-only relative time token (not a person name).
           if (/^\d{1,3}\s*[mhdw]$/i.test(t)) return true;
+          // IG thread chrome (profile link parent is often only this).
+          if (/^view\s*profile$/i.test(t)) return true;
+          if (/^(follow|following|requested|message|share|more|options|report)$/i.test(t)) return true;
+          if (/^conversation information$/i.test(t)) return true;
           return false;
         };
         const tooGenericReason = (s) => {
@@ -1370,6 +1374,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (t.length > 120) return 'too_long';
           if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return 'ui_label';
           if (/^\d{1,3}\s*[mhdw]$/i.test(t)) return 'relative_time_token';
+          if (/^view\s*profile$/i.test(t)) return 'ig_view_profile_chrome';
+          if (/^(follow|following|requested|message|share|more|options|report)$/i.test(t)) return 'ig_action_chrome';
+          if (/^conversation information$/i.test(t)) return 'ig_conversation_info';
           return 'unknown';
         };
 
@@ -1658,7 +1665,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           return { extracted: headerCandidates[0], debug };
         }
 
-        // 3) Visible profile link in pane → nearby text.
+        // 3) Profile link → parent text (often only "View profile"; tooGeneric rejects so we fall through to step 4).
         const profileLink = Array.from(pane.querySelectorAll('a[href*="instagram.com/"], a[href^="/"]')).find((a) => {
           const href = (a.getAttribute('href') || '').toLowerCase();
           return href.includes(`/${needle}`) || href === `/${needle}/` || href === `/${needle}`;
@@ -1681,19 +1688,30 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           debug.step3Profile = { found: false };
         }
 
-        // 4) Fallback: text in pane only.
+        // 4) Fallback: substring of pane before first username token (handles single-line IG headers).
         const body = pane.innerText || '';
         const idx = body.toLowerCase().indexOf(needle);
         if (idx > 0) {
-          const before = body.slice(0, idx).trim();
+          let before = body.slice(0, idx).trim();
+          before = before.replace(/\s*·\s*Instagram\s*$/i, '').trim();
           const lines = before.split(/\n/);
           const lastPart = (lines[lines.length - 1] || '').trim();
-          const candidate = lastPart.length > 0 && lastPart.length <= 80 && !/^https?:\/\//i.test(lastPart) ? lastPart : (before.length > 0 && before.length <= 80 ? before : null);
+          const maxSeg = 200;
+          const candidate =
+            lastPart.length > 0 && lastPart.length <= maxSeg && !/^https?:\/\//i.test(lastPart)
+              ? lastPart
+              : before.length > 0 && before.length <= maxSeg
+                ? before
+                : lastPart.length > 0 && !/^https?:\/\//i.test(lastPart)
+                  ? lastPart.slice(0, maxSeg)
+                  : before.length > 0
+                    ? before.slice(0, maxSeg)
+                    : null;
           const normalized = normalizeCandidateName(candidate || '', 'step4:pane_before_username');
           debug.step4Fallback = {
             needleIndex: idx,
-            beforePreview: before.slice(-200),
-            lastLineBeforeNeedle: lastPart.slice(0, 120),
+            beforePreview: before.slice(-240),
+            lastLineBeforeNeedle: lastPart.slice(0, 160),
             chosenCandidate: candidate,
             normalized: normalized || null,
           };
