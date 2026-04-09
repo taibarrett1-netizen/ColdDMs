@@ -1722,6 +1722,95 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         } else {
           debug.step4Fallback = { needleIndex: idx, note: idx <= 0 ? 'username_not_found_in_pane_text' : null };
         }
+
+        // 5) Empty / sparse thread: display name is often in the column *above* the compose-scoped pane
+        // (pane.innerText is only "username username · Instagram View profile"; heading row is a sibling branch).
+        let wideRoot = pane;
+        for (let d = 0; d < 12 && wideRoot && wideRoot.parentElement; d++) {
+          const p = wideRoot.parentElement;
+          if (!p || p === document.body || p === document.documentElement) break;
+          wideRoot = p;
+        }
+        if (!wideRoot || wideRoot === document.documentElement) wideRoot = pane;
+
+        const vwStep5 = document.documentElement.clientWidth || 1200;
+        let paneLeftStep5 = 0;
+        try {
+          paneLeftStep5 = pane.getBoundingClientRect().left;
+        } catch {
+          paneLeftStep5 = 0;
+        }
+        const colLeftStep5 = Math.max(0, paneLeftStep5 - 80);
+        const inThreadColumn = (el) => {
+          try {
+            const r = el.getBoundingClientRect();
+            if (r.width < 6 || r.height < 6) return false;
+            const cx = r.left + r.width / 2;
+            return cx >= colLeftStep5 && r.left < vwStep5 - 4;
+          } catch {
+            return false;
+          }
+        };
+
+        const step5Candidates = [];
+        const step5Log = {
+          wideRootTag: wideRoot.tagName,
+          wideRootClass: (wideRoot.className && String(wideRoot.className).slice(0, 120)) || '',
+          colLeftStep5,
+          fromAria: [],
+          fromHeadings: [],
+        };
+
+        const profileAnchorsWide = Array.from(wideRoot.querySelectorAll('a[href*="instagram.com/"], a[href^="/"]')).filter(
+          (a) => {
+            const href = (a.getAttribute('href') || '').toLowerCase();
+            return href.includes(`/${needle}`) || href === `/${needle}/` || href === `/${needle}`;
+          }
+        );
+        for (const a of profileAnchorsWide) {
+          if (!inThreadColumn(a)) continue;
+          const al = (a.getAttribute('aria-label') || '').trim();
+          if (!al || /^view\s*profile$/i.test(al)) continue;
+          const cleanedAria = al.replace(/\s*,?\s*verified\s*$/i, '').trim();
+          const t = normalizeCandidateName(cleanedAria, 'step5:profile_aria_label');
+          if (t) {
+            step5Candidates.push(t);
+            step5Log.fromAria.push(t);
+          }
+        }
+
+        const headingNodes = wideRoot.querySelectorAll('[role="heading"], h1, h2, h3');
+        headingNodes.forEach((el) => {
+          try {
+            if (!el.offsetParent) return;
+          } catch {
+            return;
+          }
+          if (!inThreadColumn(el)) return;
+          const raw = (el.textContent || '').replace(/\s+/g, ' ').trim();
+          if (!raw || clean(raw).toLowerCase() === needle) return;
+          const t = normalizeCandidateName(raw, 'step5:column_heading');
+          if (t) {
+            step5Candidates.push(t);
+            step5Log.fromHeadings.push(t);
+          }
+        });
+
+        debug.step5WideColumn = {
+          ...step5Log,
+          candidateCount: step5Candidates.length,
+          chosen: null,
+        };
+
+        if (step5Candidates.length) {
+          const uniq = [...new Set(step5Candidates)];
+          uniq.sort((a, b) => b.length - a.length);
+          const chosen = uniq[0];
+          debug.step5WideColumn.chosen = chosen;
+          debug.winningPath = 'step5_wide_column_heading_or_aria';
+          return { extracted: chosen, debug };
+        }
+
         debug.winningPath = null;
         return { extracted: null, debug };
       }, u);
