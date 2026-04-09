@@ -106,6 +106,9 @@ const BROWSER_PROFILE_DIR = path.join(process.cwd(), '.browser-profile');
 const VOICE_NOTE_FILE = (process.env.VOICE_NOTE_FILE || '').trim();
 const VOICE_NOTE_MODE = (process.env.VOICE_NOTE_MODE || 'after_text').trim().toLowerCase();
 const LOGIN_DEBUG_SCREENSHOT_DIR = path.join(process.cwd(), 'logs', 'login-debug');
+const GLOBAL_SEND_GAP_MS = Math.max(0, parseInt(process.env.SEND_WORKER_GLOBAL_GAP_MS || '90000', 10) || 90000);
+const GLOBAL_SEND_GATE_FILE = path.join(os.tmpdir(), 'cold_dm_global_send_gate.json');
+const GLOBAL_SEND_GATE_LOCK_FILE = `${GLOBAL_SEND_GATE_FILE}.lock`;
 
 function wantsVoiceNotes(sendOpts = {}) {
   return !!((sendOpts.voiceNotePath || '').trim());
@@ -647,6 +650,88 @@ function randomDelay(minMs, maxMs) {
 
 async function humanDelay() {
   await delay(500 + Math.floor(Math.random() * 1500));
+}
+
+async function tinyHumanMouseMove(page) {
+  if (!page || !page.mouse || typeof page.viewport !== 'function') return;
+  const vp = page.viewport() || {};
+  const width = Math.max(800, vp.width || 1200);
+  const height = Math.max(600, vp.height || 900);
+  const start = {
+    x: Math.max(20, Math.min(width - 20, Math.round(width * (0.18 + Math.random() * 0.18)))),
+    y: Math.max(20, Math.min(height - 20, Math.round(height * (0.22 + Math.random() * 0.16)))),
+  };
+  const end = {
+    x: Math.max(20, Math.min(width - 20, Math.round(width * (0.42 + Math.random() * 0.2)))),
+    y: Math.max(20, Math.min(height - 20, Math.round(height * (0.34 + Math.random() * 0.18)))),
+  };
+  try {
+    await page.mouse.move(start.x, start.y, { steps: 5 });
+    await delay(60 + Math.floor(Math.random() * 100));
+    await page.mouse.move(end.x, end.y, { steps: 7 });
+    await delay(80 + Math.floor(Math.random() * 140));
+  } catch {
+    // best-effort only
+  }
+}
+
+async function withExclusiveFileLock(lockFile, fn) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    try {
+      const handle = await fs.promises.open(lockFile, 'wx');
+      try {
+        return await fn();
+      } finally {
+        await handle.close().catch(() => {});
+        await fs.promises.unlink(lockFile).catch(() => {});
+      }
+    } catch (e) {
+      if (!e || e.code !== 'EEXIST') throw e;
+      await delay(40 + Math.floor(Math.random() * 80));
+    }
+  }
+  throw new Error('global_send_lock_timeout');
+}
+
+async function respectGlobalSendGap(minGapMs = GLOBAL_SEND_GAP_MS) {
+  const gapMs = Math.max(0, Number(minGapMs) || 0);
+  if (gapMs <= 0) return 0;
+  const now = Date.now();
+  return withExclusiveFileLock(GLOBAL_SEND_GATE_LOCK_FILE, async () => {
+    let lastSentAt = 0;
+    try {
+      const raw = await fs.promises.readFile(GLOBAL_SEND_GATE_FILE, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.lastSentAt === 'number') lastSentAt = parsed.lastSentAt;
+    } catch {}
+    const elapsed = now - lastSentAt;
+    if (elapsed < gapMs) {
+      return gapMs - elapsed;
+    }
+    await fs.promises.writeFile(
+      GLOBAL_SEND_GATE_FILE,
+      JSON.stringify({ lastSentAt: now, updatedAt: new Date().toISOString(), pid: process.pid }, null, 0),
+      'utf8'
+    );
+    return 0;
+  });
+}
+
+async function updateGlobalSendGateAfterSuccess() {
+  if (GLOBAL_SEND_GAP_MS <= 0) return;
+  const now = Date.now();
+  try {
+    await withExclusiveFileLock(GLOBAL_SEND_GATE_LOCK_FILE, async () => {
+      await fs.promises.writeFile(
+        GLOBAL_SEND_GATE_FILE,
+        JSON.stringify({ lastSentAt: now, updatedAt: new Date().toISOString(), pid: process.pid }, null, 0),
+        'utf8'
+      );
+    });
+  } catch {
+    // best-effort only
+  }
 }
 
 /** Extract Instagram thread id from direct URL (e.g. /direct/t/17843804841623833/). */
@@ -1385,6 +1470,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   }
 
   const searchMeta = await page.evaluate((el) => ({ tag: el.tagName, type: el.type || '', isCE: !!el.isContentEditable }), searchEl).catch(() => ({}));
+  await tinyHumanMouseMove(page);
   await searchEl.click({ delay: 50 }).catch(() => {});
 
   if (searchMeta.tag === 'INPUT' || searchMeta.tag === 'TEXTAREA') {
@@ -2157,19 +2243,21 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       return null;
     });
     const compose = composeEl.asElement();
-    if (compose && shouldSendText) {
-      await delay(500);
-      await compose.click();
-      await saveComposeTypingDebugScreenshot(page, u);
-      await typeInstagramDmPlainTextInComposer(page, compose, msg, {
-        delay: 60 + Math.floor(Math.random() * 40),
-      });
-      await compose.dispose();
-      await composeEl.dispose();
-      await humanDelay();
-      await page.keyboard.press('Enter');
-      await delay(1500);
-      textSent = true;
+  if (compose && shouldSendText) {
+    await delay(500);
+    await tinyHumanMouseMove(page);
+    await compose.click();
+    await saveComposeTypingDebugScreenshot(page, u);
+    await typeInstagramDmPlainTextInComposer(page, compose, msg, {
+      delay: 60 + Math.floor(Math.random() * 40),
+    });
+    await compose.dispose();
+    await composeEl.dispose();
+    await humanDelay();
+    await tinyHumanMouseMove(page);
+    await page.keyboard.press('Enter');
+    await delay(1500);
+    textSent = true;
     } else if (compose) {
       await compose.dispose();
       await composeEl.dispose();
@@ -2205,6 +2293,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     await saveComposeTypingDebugScreenshot(page, u);
     await typeInstagramDmPlainTextWithKeyboard(page, msg, { delay: 60 + Math.floor(Math.random() * 40) });
     await humanDelay();
+    await tinyHumanMouseMove(page);
     await page.keyboard.press('Enter');
     await delay(1500);
     textSent = true;
@@ -2401,6 +2490,7 @@ async function debugOpenFollowUpBrowserForManualTest(body) {
 
     if (recipientUsername) {
       const u = normalizeUsername(recipientUsername);
+      await tinyHumanMouseMove(page);
       const nav = await navigateToDmThread(page, u);
       if (!nav.ok) {
         logger.warn(
@@ -2619,7 +2709,15 @@ async function sendFollowUp(body) {
       return fail('Instagram session expired', 401);
     }
 
+    const gapMs = await respectGlobalSendGap().catch(() => 0);
+    if (gapMs > 0) {
+      const gapMin = Math.max(1, Math.round(gapMs / 60000));
+      logger.log(`[follow-up] global send cooldown active. Waiting ${gapMin} min before sending @${recipientUsername}.`);
+      await delay(gapMs);
+    }
+
     const u = normalizeUsername(recipientUsername);
+    await tinyHumanMouseMove(page);
     const nav = await navigateToDmThread(page, u);
     if (!nav.ok) {
       const errMsg = followUpReasonToError(nav.reason, nav.pageSnippet);
@@ -2628,6 +2726,7 @@ async function sendFollowUp(body) {
     if (hasAudio) await grantMicrophoneForInstagram(page, logger);
 
     if (textSingle) {
+      await tinyHumanMouseMove(page);
       const sent = await sendPlainTextInThread(page, String(body.text).trim(), { idCapture });
       if (!sent.ok) {
         return fail(followUpReasonToError(sent.reason), 400);
@@ -2636,6 +2735,7 @@ async function sendFollowUp(body) {
       if (sent.instagramMessageId) {
         logger.log(`[follow-up] instagram_message_id=${sent.instagramMessageId}${cLog}`);
       }
+      await updateGlobalSendGateAfterSuccess().catch(() => {});
       return followUpOkWithInstagramIds({
         instagram_message_id: sent.instagramMessageId || undefined,
       });
@@ -2644,6 +2744,7 @@ async function sendFollowUp(body) {
     if (hasMessages) {
       const collectedIds = [];
       for (const line of messageLines) {
+        await tinyHumanMouseMove(page);
         const sent = await sendPlainTextInThread(page, line, { idCapture });
         if (!sent.ok) {
           return fail(followUpReasonToError(sent.reason), 400);
@@ -2656,12 +2757,14 @@ async function sendFollowUp(body) {
       if (instagram_message_ids) {
         logger.log(`[follow-up] instagram_message_ids=${JSON.stringify(instagram_message_ids)}${cLog}`);
       }
+      await updateGlobalSendGateAfterSuccess().catch(() => {});
       return followUpOkWithInstagramIds({ instagram_message_ids });
     }
 
     if (hasAudio) {
       const captionIds = [];
       if (hasCaption) {
+        await tinyHumanMouseMove(page);
         const cap = await sendPlainTextInThread(page, captionRaw, { idCapture });
         if (!cap.ok) {
           return fail(followUpReasonToError(cap.reason), 400);
@@ -2669,6 +2772,7 @@ async function sendFollowUp(body) {
         captionIds.push(cap.instagramMessageId || null);
         await delay(1200);
       }
+      await tinyHumanMouseMove(page);
       const prep = await prepareVoiceNoteUi(page, { logger });
       if (!prep.ok) {
         return fail(followUpReasonToError(prep.reason || 'voice_mic_not_found'), 400);
@@ -2700,6 +2804,7 @@ async function sendFollowUp(body) {
       if (voiceResult.instagramMessageId) {
         logger.log(`[follow-up] instagram_message_id=${voiceResult.instagramMessageId}${cLog}`);
       }
+      await updateGlobalSendGateAfterSuccess().catch(() => {});
       return followUpOkWithInstagramIds({
         instagram_message_id: voiceResult.instagramMessageId || undefined,
       });
@@ -2775,18 +2880,27 @@ async function sendDM(page, username, adapter, options = {}) {
   if (options.clientId && sb.getUserAccountName) {
     senderAccountName = (await sb.getUserAccountName(options.clientId).catch(() => null)) || '';
   }
+  const preferThreadName = options.preferThreadName !== false;
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
+      const gapMs = await respectGlobalSendGap(options.globalSendGapMs || GLOBAL_SEND_GAP_MS).catch(() => 0);
+      if (gapMs > 0) {
+        const gapMin = Math.max(1, Math.round(gapMs / 60000));
+        logger.log(`Global send cooldown active. Waiting ${gapMin} min before sending @${u}.`);
+        await delay(gapMs);
+      }
       const result = await sendDMOnce(page, u, messageTemplate, nameFallback, {
         firstNameBlocklist,
         senderName: senderAccountName,
         voiceNotePath: resolvedVoicePath,
         voiceNoteMode: resolvedVoiceMode,
         voiceDurationSec: options.voiceDurationSec,
+        preferThreadName,
       });
       if (result.ok) {
         const finalMessage = result.finalMessage != null ? result.finalMessage : (resolvedVoiceMode === 'voice_only' ? '' : messageTemplate);
         await Promise.resolve(logSent('success', finalMessage));
+        await updateGlobalSendGateAfterSuccess().catch(() => {});
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent', null, sendWorkerId).catch(() => {});
         if (options.clientId && (result.display_name || result.first_name || result.last_name) && typeof sb.upsertLeadIdentity === 'function') {
           sb.upsertLeadIdentity(options.clientId, u, {
