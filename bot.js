@@ -1191,29 +1191,62 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   await page
     .waitForFunction(
       () => {
-        const els = document.querySelectorAll('input, textarea, [contenteditable="true"]');
-        return Array.from(els).some((el) => {
+        const selectors = [
+          'input',
+          'textarea',
+          '[contenteditable="true"]',
+          '[role="combobox"]',
+          '[role="textbox"]',
+        ];
+        const els = Array.from(document.querySelectorAll(selectors.join(',')));
+        return els.some((el) => {
           try {
             if (!el || el.disabled) return false;
-            return (el.getClientRects && el.getClientRects().length > 0) || el.offsetParent !== null;
+            const t = ((el.getAttribute && el.getAttribute('type')) || '').toLowerCase();
+            if (t === 'hidden') return false;
+            const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+            const aria = ((el.getAttribute && el.getAttribute('aria-label')) || '').toLowerCase();
+            const ph = ((el.getAttribute && el.getAttribute('placeholder')) || '').toLowerCase();
+            const role = ((el.getAttribute && el.getAttribute('role')) || '').toLowerCase();
+            const looksLikeSearch =
+              ph.includes('search') ||
+              ph.includes('to:') ||
+              aria.includes('search') ||
+              aria.includes('to:') ||
+              role === 'combobox' ||
+              role === 'textbox';
+            return looksLikeSearch || (style && style.display !== 'none');
           } catch {
             return false;
           }
         });
       },
-      { timeout: 8000 }
+      { timeout: 12000 }
     )
     .catch(() => {});
 
   const searchHandle = await page.evaluateHandle(() => {
     const normalize = (s) => (s || '').toString().toLowerCase();
-    const candidates = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]')).filter((el) => {
+    const candidates = Array.from(
+      document.querySelectorAll('input, textarea, [contenteditable="true"], [role="combobox"], [role="textbox"]')
+    ).filter((el) => {
       try {
         if (!el || el.disabled) return false;
         if (el.type === 'hidden') return false;
+        const ph = normalize(el.getAttribute && el.getAttribute('placeholder'));
+        const aria = normalize(el.getAttribute && el.getAttribute('aria-label'));
+        const role = normalize(el.getAttribute && el.getAttribute('role'));
+        const looksLikeSearch =
+          ph.includes('search') ||
+          ph.includes('to:') ||
+          aria.includes('search') ||
+          aria.includes('to:') ||
+          role === 'combobox' ||
+          role === 'textbox';
+        if (looksLikeSearch) return true;
         if (el.getClientRects && el.getClientRects().length > 0) return true;
         if (el.offsetParent !== null) return true;
-        return false;
+        return true;
       } catch {
         return false;
       }
@@ -1298,7 +1331,57 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         pageSnippet: `Instagram redirected to security/unblock page before DM search (url=${diag?.url || 'unknown'}). Open this account in a normal browser and complete the unblock/checkpoint, then retry.`,
       };
     }
-    throw new Error(`Search input not found on direct/new page (url=${diag?.url || 'unknown'} visible=${diag?.visibleCount ?? 'n/a'})`);
+    await delay(1200);
+    const retryHandle = await page.evaluateHandle(() => {
+      const selectors = [
+        'input[placeholder*="search" i]',
+        'input[aria-label*="search" i]',
+        'input[placeholder*="to:" i]',
+        'input[aria-label*="to:" i]',
+        'input',
+        'textarea',
+        '[contenteditable="true"]',
+        '[role="combobox"]',
+        '[role="textbox"]',
+      ];
+      const els = Array.from(document.querySelectorAll(selectors.join(',')));
+      const norm = (s) => (s || '').toString().toLowerCase();
+      const visible = (el) => {
+        try {
+          if (!el || el.disabled) return false;
+          if (el.type === 'hidden') return false;
+          const r = el.getClientRects && el.getClientRects();
+          if (r && r.length) return true;
+          const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+          return !!style && style.display !== 'none' && style.visibility !== 'hidden';
+        } catch {
+          return false;
+        }
+      };
+      const preferred = els.find((el) => {
+        const ph = norm(el.getAttribute && el.getAttribute('placeholder'));
+        const aria = norm(el.getAttribute && el.getAttribute('aria-label'));
+        const role = norm(el.getAttribute && el.getAttribute('role'));
+        return ph.includes('search') || ph.includes('to:') || aria.includes('search') || aria.includes('to:') || role === 'combobox' || role === 'textbox';
+      });
+      return preferred || els.find(visible) || els[0] || null;
+    });
+    const retrySearchEl = retryHandle.asElement();
+    if (retrySearchEl) {
+      const retryMeta = await page.evaluate((el) => ({ tag: el.tagName, type: el.type || '', isCE: !!el.isContentEditable }), retrySearchEl).catch(() => ({}));
+      await retrySearchEl.click({ delay: 50 }).catch(() => {});
+      if (retryMeta.tag === 'INPUT' || retryMeta.tag === 'TEXTAREA') {
+        await retrySearchEl.type(u, { delay: 90 });
+      } else {
+        await delay(100);
+        await page.keyboard.type(u, { delay: 90 });
+      }
+      await retrySearchEl.dispose().catch(() => {});
+      await retryHandle.dispose().catch(() => {});
+    } else {
+      await retryHandle.dispose().catch(() => {});
+      throw new Error(`Search input not found on direct/new page (url=${diag?.url || 'unknown'} visible=${diag?.visibleCount ?? 'n/a'})`);
+    }
   }
 
   const searchMeta = await page.evaluate((el) => ({ tag: el.tagName, type: el.type || '', isCE: !!el.isContentEditable }), searchEl).catch(() => ({}));
