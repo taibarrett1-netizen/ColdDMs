@@ -105,9 +105,33 @@ const VOICE_NOTE_SOURCE_NAME = (process.env.VOICE_NOTE_SOURCE_NAME || 'ColdDMsVo
 const BROWSER_PROFILE_DIR = path.join(process.cwd(), '.browser-profile');
 const VOICE_NOTE_FILE = (process.env.VOICE_NOTE_FILE || '').trim();
 const VOICE_NOTE_MODE = (process.env.VOICE_NOTE_MODE || 'after_text').trim().toLowerCase();
+const LOGIN_DEBUG_SCREENSHOT_DIR = path.join(process.cwd(), 'logs', 'login-debug');
 
 function wantsVoiceNotes(sendOpts = {}) {
   return !!((sendOpts.voiceNotePath || '').trim());
+}
+
+async function saveLoginDebugScreenshot(page, label) {
+  const enabled =
+    process.env.LOGIN_DEBUG_SCREENSHOTS === '1' ||
+    process.env.LOGIN_DEBUG_SCREENSHOTS === 'true' ||
+    process.env.LOGIN_DEBUG === '1' ||
+    process.env.LOGIN_DEBUG === 'true';
+  if (!enabled || !page) return null;
+  try {
+    fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+    const safe = String(label || 'step')
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '_')
+      .slice(0, 40);
+    const out = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_${safe}.png`);
+    await page.screenshot({ path: out, fullPage: true });
+    logger.log(`[LOGIN_DEBUG] screenshot=${out}`);
+    return out;
+  } catch (e) {
+    logger.warn('[LOGIN_DEBUG] screenshot failed: ' + (e.message || e));
+    return null;
+  }
 }
 
 /** Non-login Instagram URLs that mean we do not have a usable session (challenge, checkpoint, etc.). */
@@ -427,6 +451,7 @@ async function login(page, credentials) {
   }
 
   if (LOGIN_DEBUG) logger.log('[LOGIN_DEBUG] submitMethod=' + submitMethod);
+  await saveLoginDebugScreenshot(page, 'before_submit');
 
   logger.log('Submitted login form, waiting for redirect...');
   await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(() => {});
@@ -505,6 +530,7 @@ async function login(page, credentials) {
 
   const emailCheckpoint = await detectInstagramEmailVerificationState(page);
   if (emailCheckpoint.required) {
+    await saveLoginDebugScreenshot(page, 'email_checkpoint');
     page.off('response', respHandler);
     const err = new Error(
       `Email verification required.${emailCheckpoint.maskedEmail ? ` Enter the code sent to ${emailCheckpoint.maskedEmail}.` : ''}`
@@ -544,6 +570,7 @@ async function login(page, credentials) {
 
   const emailCheckpointAfterRetry = await detectInstagramEmailVerificationState(page);
   if (emailCheckpointAfterRetry.required) {
+    await saveLoginDebugScreenshot(page, 'email_checkpoint_after_retry');
     page.off('response', respHandler);
     const err = new Error(
       `Email verification required.${emailCheckpointAfterRetry.maskedEmail ? ` Enter the code sent to ${emailCheckpointAfterRetry.maskedEmail}.` : ''}`
@@ -583,6 +610,7 @@ async function login(page, credentials) {
   page.off('response', respHandler);
   const urlAfterLogin = page.url();
   if (urlAfterLogin.includes('/accounts/login')) {
+    await saveLoginDebugScreenshot(page, 'still_on_login_failure');
     const bodySnippet = await page.evaluate(() => (document.body && document.body.innerText ? document.body.innerText : '').slice(0, 600)).catch(() => '');
     let hint = '';
     const lower = bodySnippet.toLowerCase();
