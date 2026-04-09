@@ -923,15 +923,59 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   if (templateUsesName && !displayNameForSubst && (!nameFallback.display_name || !nameFallback.first_name)) {
     try {
       const extracted = await page.evaluate((username) => {
-        const body = document.body ? document.body.innerText : '';
         const needle = username.replace(/^@/, '').toLowerCase();
+        const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+        const tooGeneric = (s) => {
+          const t = clean(s).toLowerCase();
+          if (!t) return true;
+          if (t === needle || t === `@${needle}`) return true;
+          if (t.length < 2 || t.length > 80) return true;
+          if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return true;
+          return false;
+        };
+
+        // 1) Prefer thread header title/name when available.
+        const headerCandidates = [];
+        const selectors = [
+          'header h1',
+          'header h2',
+          'header [role="heading"]',
+          '[role="banner"] h1',
+          '[role="banner"] h2',
+          '[role="banner"] [role="heading"]',
+        ];
+        for (const sel of selectors) {
+          document.querySelectorAll(sel).forEach((el) => {
+            const txt = clean(el.textContent || '');
+            if (!tooGeneric(txt)) headerCandidates.push(txt);
+          });
+        }
+        if (headerCandidates.length) {
+          // Pick the longest non-generic heading, usually the full profile name.
+          headerCandidates.sort((a, b) => b.length - a.length);
+          return headerCandidates[0];
+        }
+
+        // 2) Try visible links that point to this profile and use nearby text.
+        const profileLink = Array.from(document.querySelectorAll('a[href*="instagram.com/"], a[href^="/"]')).find((a) => {
+          const href = (a.getAttribute('href') || '').toLowerCase();
+          return href.includes(`/${needle}`) || href === `/${needle}/` || href === `/${needle}`;
+        });
+        if (profileLink) {
+          const parent = profileLink.closest('header') || profileLink.parentElement || profileLink;
+          const txt = clean(parent.textContent || '');
+          if (!tooGeneric(txt)) return txt;
+        }
+
+        // 3) Legacy fallback: infer from body text around username.
+        const body = document.body ? document.body.innerText : '';
         const idx = body.toLowerCase().indexOf(needle);
         if (idx > 0) {
           const before = body.slice(0, idx).trim();
           const lines = before.split(/\n/);
           const lastPart = (lines[lines.length - 1] || '').trim();
           const candidate = lastPart.length > 0 && lastPart.length <= 80 && !/^https?:\/\//i.test(lastPart) ? lastPart : (before.length > 0 && before.length <= 80 ? before : null);
-          if (candidate && !/^\d+$/.test(candidate)) return candidate;
+          if (candidate && !/^\d+$/.test(candidate) && !tooGeneric(candidate)) return candidate;
         }
         return null;
       }, u);
