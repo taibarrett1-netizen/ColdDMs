@@ -1302,9 +1302,16 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   // When lead has no display_name/first_name in DB but template uses {{first_name}}/{{full_name}}, get name from thread page (e.g. "AI Setter Test 8 aisettertest8")
   const templateUsesName = /\{\{\s*(first_name|full_name)\s*\}\}/i.test(messageTemplate);
   let displayNameForSubst = nameFallback.display_name ?? nameFallback.first_name ?? null;
+  let nameExtractionDebugSnapshot = null;
+  const nameExtractionDebugLog =
+    !!sendOpts.dryRunNames ||
+    sendOpts.nameExtractionDebug === true ||
+    process.env.NAME_EXTRACTION_DEBUG === '1' ||
+    process.env.NAME_EXTRACTION_DEBUG === 'true';
+
   if (templateUsesName && !displayNameForSubst && (!nameFallback.display_name || !nameFallback.first_name)) {
     try {
-      const extracted = await page.evaluate((username) => {
+      const extractionResult = await page.evaluate((username) => {
         const needle = username.replace(/^@/, '').toLowerCase();
         const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
         const tokenRegex = new RegExp(`(^|[^a-z0-9._])@?${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9._]|$)`, 'i');
@@ -1319,19 +1326,63 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (/^\d{1,3}\s*[mhdw]$/i.test(t)) return true;
           return false;
         };
-        const normalizeCandidateName = (raw) => {
+        const tooGenericReason = (s) => {
+          const t = clean(s).toLowerCase();
+          if (!t) return 'empty';
+          if (t === needle || t === `@${needle}`) return 'equals_username';
+          if (containsUsernameToken(t)) return 'contains_username_token';
+          if (t.length < 2) return 'too_short';
+          if (t.length > 80) return 'too_long';
+          if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return 'ui_label';
+          if (/^\d{1,3}\s*[mhdw]$/i.test(t)) return 'relative_time_token';
+          return 'unknown';
+        };
+
+        /** @type {{ ctx: string, rawPreview: string, splitPieces: string[], nonUserPieces: string[], usedFirstNonUserPiece: boolean, afterSplit: string, afterStripUsername: string, rejected?: string, out: string }[]} */
+        const normalizationTraces = [];
+
+        const normalizeCandidateName = (raw, ctx) => {
+          const trace = {
+            ctx: ctx || 'unnamed',
+            rawPreview: String(raw || '').slice(0, 320),
+            splitPieces: /** @type {string[]} */ ([]),
+            nonUserPieces: /** @type {string[]} */ ([]),
+            usedFirstNonUserPiece: false,
+            afterSplit: '',
+            afterStripUsername: '',
+            rejected: /** @type {string|undefined} */ (undefined),
+            out: '',
+          };
           let t = clean(raw);
-          if (!t) return '';
+          if (!t) {
+            trace.rejected = 'empty_raw';
+            normalizationTraces.push(trace);
+            return '';
+          }
           const splitPieces = t
             .split(/[|·•]/g)
             .map((x) => clean(x))
             .filter(Boolean);
+          trace.splitPieces = splitPieces.slice(0, 12);
           if (splitPieces.length > 1) {
             const nonUserPieces = splitPieces.filter((p) => !containsUsernameToken(p) && !/^instagram$/i.test(p));
-            if (nonUserPieces.length) t = nonUserPieces[0];
+            trace.nonUserPieces = nonUserPieces.slice(0, 12);
+            if (nonUserPieces.length) {
+              trace.usedFirstNonUserPiece = true;
+              t = nonUserPieces[0];
+            }
           }
+          trace.afterSplit = t.slice(0, 200);
           t = clean(t.replace(/\binstagram\b/gi, '').replace(new RegExp(`@?${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'gi'), ''));
-          if (tooGeneric(t)) return '';
+          trace.afterStripUsername = t.slice(0, 200);
+          if (tooGeneric(t)) {
+            trace.rejected = tooGenericReason(t);
+            trace.out = '';
+            normalizationTraces.push(trace);
+            return '';
+          }
+          trace.out = t;
+          normalizationTraces.push(trace);
           return t;
         };
 
@@ -1353,12 +1404,13 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             const aria = (el.getAttribute('aria-label') || '').toLowerCase();
             return ph.includes('message') || aria.includes('message');
           });
-          if (!compose) return document.body;
+          if (!compose) return { el: document.body, composeFound: false };
           const vw = document.documentElement.clientWidth || 1200;
           const minLeft = Math.max(0, compose.getBoundingClientRect().left - 48);
           const maxPaneWidth = vw - minLeft + 120;
           let best = compose;
           let el = compose;
+          let depthUsed = 0;
           for (let depth = 0; depth < 28 && el; depth++) {
             el = el.parentElement;
             if (!el || el === document.body || el === document.documentElement) break;
@@ -1366,27 +1418,77 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             if (r.left < minLeft) break;
             if (r.width <= maxPaneWidth) {
               best = el;
+              depthUsed = depth + 1;
             } else {
               break;
             }
           }
-          return best;
+          return {
+            el: best,
+            composeFound: true,
+            composeRect: compose.getBoundingClientRect(),
+            paneRect: best.getBoundingClientRect(),
+            climbDepth: depthUsed,
+            minLeft,
+            maxPaneWidth,
+          };
         }
 
-        const pane = threadPaneRoot();
+        const paneInfo = threadPaneRoot();
+        const pane = paneInfo.el;
+        const debug = {
+          needle,
+          threadPane: {
+            composeFound: paneInfo.composeFound,
+            climbDepth: paneInfo.climbDepth ?? 0,
+            minLeft: paneInfo.minLeft,
+            maxPaneWidth: paneInfo.maxPaneWidth,
+            paneTag: pane.tagName,
+            paneRole: pane.getAttribute && pane.getAttribute('role'),
+            paneClass: (pane.className && String(pane.className).slice(0, 160)) || '',
+            paneInnerTextLen: (pane.innerText || '').length,
+            paneInnerTextPreview: (pane.innerText || '').slice(0, 700).replace(/\s+/g, ' '),
+            fallbackToBody: !paneInfo.composeFound,
+          },
+          headersTried: /** @type {object[]} */ ([]),
+          step2HeadingHits: /** @type {object[]} */ ([]),
+          step3Profile: null,
+          step4Fallback: null,
+          winningPath: /** @type {string|null} */ (null),
+          normalizationTraces,
+        };
 
-        const extractNameFromHeaderRoot = (root) => {
-          const lines = (root.innerText || '')
-            .split(/\n/)
-            .map((x) => clean(x))
-            .filter(Boolean);
+        const extractNameFromHeaderRoot = (root, headerDebug) => {
+          const rawLines = (root.innerText || '').split(/\n/);
+          const lines = rawLines.map((x) => clean(x)).filter(Boolean);
+          headerDebug.linesLabeled = lines.slice(0, 20).map((line, idx) => ({
+            lineIndex: idx,
+            text: line.slice(0, 200),
+            containsUsernameToken: containsUsernameToken(line),
+          }));
           for (let i = 0; i < lines.length; i++) {
             if (!containsUsernameToken(lines[i])) continue;
-            const prev = i > 0 ? normalizeCandidateName(lines[i - 1]) : '';
-            if (prev) return prev;
-            const next = i + 1 < lines.length ? normalizeCandidateName(lines[i + 1]) : '';
-            if (next) return next;
+            const lineDebug = {
+              handleLineIndex: i,
+              lineAbove: i > 0 ? lines[i - 1].slice(0, 200) : null,
+              lineWithHandle: lines[i].slice(0, 200),
+              lineBelow: i + 1 < lines.length ? lines[i + 1].slice(0, 200) : null,
+            };
+            headerDebug.handleLineDetail = lineDebug;
+            const prev = i > 0 ? normalizeCandidateName(lines[i - 1], `header[${headerDebug.headerIndex}]:lineAboveHandle`) : '';
+            const next = i + 1 < lines.length ? normalizeCandidateName(lines[i + 1], `header[${headerDebug.headerIndex}]:lineBelowHandle`) : '';
+            lineDebug.normalizedAbove = prev || null;
+            lineDebug.normalizedBelow = next || null;
+            if (prev) {
+              headerDebug.pickedFrom = 'line_above_handle';
+              return prev;
+            }
+            if (next) {
+              headerDebug.pickedFrom = 'line_below_handle';
+              return next;
+            }
           }
+          headerDebug.pickedFrom = null;
           return null;
         };
 
@@ -1402,9 +1504,26 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           return ra.top - rb.top;
         });
         const otherHeaders = allHeaderRoots.filter((h) => !headerMatchesNeedle(h));
+        let hi = 0;
         for (const root of [...matchingHeaders, ...otherHeaders]) {
-          const got = extractNameFromHeaderRoot(root);
-          if (got) return got;
+          const ra = root.getBoundingClientRect();
+          const headerDebug = {
+            headerIndex: hi,
+            group: matchingHeaders.includes(root) ? 'matching_handle' : 'other',
+            tag: root.tagName,
+            role: root.getAttribute && root.getAttribute('role'),
+            area: Math.round(ra.width * ra.height),
+            innerTextPreview: (root.innerText || '').slice(0, 500).replace(/\s+/g, ' '),
+            matchesHandle: headerMatchesNeedle(root),
+          };
+          const got = extractNameFromHeaderRoot(root, headerDebug);
+          headerDebug.extractNameFromHeaderRoot = got;
+          debug.headersTried.push(headerDebug);
+          hi += 1;
+          if (got) {
+            debug.winningPath = 'step1_header_banner_line_adjacent_to_handle';
+            return { extracted: got, debug };
+          }
         }
 
         // 2) Prefer thread header title/name when available (pane only).
@@ -1419,13 +1538,21 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         ];
         for (const sel of selectors) {
           pane.querySelectorAll(sel).forEach((el) => {
-            const txt = normalizeCandidateName(el.textContent || '');
+            const raw = el.textContent || '';
+            const txt = normalizeCandidateName(raw, `step2:${sel}`);
+            debug.step2HeadingHits.push({
+              selector: sel,
+              rawPreview: raw.slice(0, 240),
+              normalized: txt || null,
+            });
             if (txt) headerCandidates.push(txt);
           });
         }
         if (headerCandidates.length) {
           headerCandidates.sort((a, b) => b.length - a.length);
-          return headerCandidates[0];
+          debug.winningPath = 'step2_heading_longest_after_normalize';
+          debug.step2Chosen = headerCandidates[0];
+          return { extracted: headerCandidates[0], debug };
         }
 
         // 3) Visible profile link in pane → nearby text.
@@ -1435,8 +1562,20 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         });
         if (profileLink) {
           const parent = profileLink.closest('header') || profileLink.parentElement || profileLink;
-          const txt = normalizeCandidateName(parent.textContent || '');
-          if (txt) return txt;
+          const rawParent = parent.textContent || '';
+          const txt = normalizeCandidateName(rawParent, 'step3:profile_parent');
+          debug.step3Profile = {
+            href: (profileLink.getAttribute('href') || '').slice(0, 200),
+            parentTag: parent.tagName,
+            rawPreview: rawParent.slice(0, 400),
+            normalized: txt || null,
+          };
+          if (txt) {
+            debug.winningPath = 'step3_profile_link_parent';
+            return { extracted: txt, debug };
+          }
+        } else {
+          debug.step3Profile = { found: false };
         }
 
         // 4) Fallback: text in pane only.
@@ -1447,11 +1586,41 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           const lines = before.split(/\n/);
           const lastPart = (lines[lines.length - 1] || '').trim();
           const candidate = lastPart.length > 0 && lastPart.length <= 80 && !/^https?:\/\//i.test(lastPart) ? lastPart : (before.length > 0 && before.length <= 80 ? before : null);
-          const normalized = normalizeCandidateName(candidate || '');
-          if (candidate && !/^\d+$/.test(candidate) && normalized) return normalized;
+          const normalized = normalizeCandidateName(candidate || '', 'step4:pane_before_username');
+          debug.step4Fallback = {
+            needleIndex: idx,
+            beforePreview: before.slice(-200),
+            lastLineBeforeNeedle: lastPart.slice(0, 120),
+            chosenCandidate: candidate,
+            normalized: normalized || null,
+          };
+          if (candidate && !/^\d+$/.test(candidate) && normalized) {
+            debug.winningPath = 'step4_pane_text_before_username_token';
+            return { extracted: normalized, debug };
+          }
+        } else {
+          debug.step4Fallback = { needleIndex: idx, note: idx <= 0 ? 'username_not_found_in_pane_text' : null };
         }
-        return null;
+        debug.winningPath = null;
+        return { extracted: null, debug };
       }, u);
+
+      const extracted = extractionResult && extractionResult.extracted;
+      const nameDebug = extractionResult && extractionResult.debug;
+      if (nameDebug) nameExtractionDebugSnapshot = nameDebug;
+
+      if (nameExtractionDebugLog && nameDebug) {
+        try {
+          const payload = JSON.stringify({ username: u, ...nameDebug }, null, 0);
+          const max = 24000;
+          logger.log(
+            `[name-extraction-debug] @${u} ${payload.length > max ? payload.slice(0, max) + '…[truncated]' : payload}`
+          );
+        } catch (e) {
+          logger.warn(`[name-extraction-debug] could not serialize debug for @${u}: ${e.message || e}`);
+        }
+      }
+
       if (extracted) {
         const trimmed = extracted.trim();
         if (/^\d{1,3}\s*[mhdw]$/i.test(trimmed)) {
@@ -1471,7 +1640,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         }
       }
     } catch (e) {
-      // ignore
+      if (nameExtractionDebugLog) {
+        logger.warn(`[name-extraction-debug] page.evaluate failed @${u}: ${e && e.message ? e.message : String(e)}`);
+      }
     }
   }
 
@@ -1531,6 +1702,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       composeFound,
       pane_scoped_snippet: diag.paneScopedSnippet || null,
       body_snippet: diag.bodySnippet || null,
+      name_extraction_debug: nameExtractionDebugSnapshot,
     };
   }
   const shouldSendText = voiceCfg.mode !== 'voice_only';
@@ -1752,6 +1924,7 @@ async function previewDmLeadNamesFromSession(body) {
         reason: result.reason,
         pane_scoped_snippet: result.pane_scoped_snippet,
         body_snippet: result.body_snippet,
+        name_extraction_debug: result.name_extraction_debug,
       };
     }
     return { ok: false, error: 'Unexpected send path (preview only)' };
