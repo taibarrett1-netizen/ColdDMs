@@ -762,7 +762,11 @@ async function login(page, credentials) {
     return page.evaluate(() => {
       const visible = (el) => {
         try {
-          return !!el && el.offsetParent !== null && (el.getClientRects?.().length || 0) > 0 && !el.disabled;
+          if (!el || el.disabled) return false;
+          const rects = el.getClientRects?.().length || 0;
+          const style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+          const hiddenByStyle = style && (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0');
+          return rects > 0 && !hiddenByStyle;
         } catch {
           return false;
         }
@@ -829,7 +833,12 @@ async function login(page, credentials) {
   const getFieldMeta = async (el) =>
     el.evaluate((node) => ({
       type: node.type,
-      visible: node.offsetParent !== null,
+      visible: (() => {
+        const rects = node.getClientRects?.().length || 0;
+        const style = window.getComputedStyle ? window.getComputedStyle(node) : null;
+        const hiddenByStyle = style && (style.visibility === 'hidden' || style.display === 'none' || style.opacity === '0');
+        return !node.disabled && rects > 0 && !hiddenByStyle;
+      })(),
       name: node.name || '',
       autocomplete: node.autocomplete || '',
       placeholder: node.placeholder || '',
