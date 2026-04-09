@@ -3264,18 +3264,23 @@ async function runBotMultiTenant() {
             logger.log('No work: ' + existingReasonMessage);
             await sb.setClientStatusMessage(cid, existingReasonMessage).catch(() => {});
           } else {
-          const hint = await sb.getNoWorkHint(cid).catch(() => '');
-          if (hint) {
-            logger.log('No work: ' + hint);
-            await sb.setClientStatusMessage(cid, hint).catch(() => {});
-          } else {
-            await sb.setClientStatusMessage(cid, 'No work. Start again from the dashboard when you have a campaign to run.').catch(() => {});
-          }
+            const hint = await sb.getNoWorkHint(cid).catch(() => '');
+            if (hint) {
+              logger.log('No work: ' + hint);
+              await sb.setClientStatusMessage(cid, hint).catch(() => {});
+            } else {
+              await sb
+                .setClientStatusMessage(
+                  cid,
+                  'No sendable campaign found. Check campaign status, lead groups, message template/group, schedule, and delay settings.'
+                )
+                .catch(() => {});
+            }
           }
           // Keep control flag aligned with worker state so dashboards don't show "running" after an auto-exit.
           await sb.setControl(cid, 1).catch(() => {});
         }
-        logger.log('No work. Exiting. Start again from the dashboard when you have a campaign to run.');
+        logger.log('No work. Exiting after surfacing the specific blocker for each client.');
         await browser?.close().catch(() => {});
         process.exit(0);
       }

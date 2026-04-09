@@ -932,6 +932,7 @@ async function getClientNoWorkResumeAt(clientId) {
     return {
       message:
         `You have ${totalPendingAllCampaigns} pending lead(s), but none on an active campaign. ` +
+        `Active campaigns: ${allCampaigns.map((c) => `${c.name || c.id}:${c.status || 'unknown'}`).join(', ')}. ` +
         'Open the campaign and set status to active (or press Start in the dashboard) so the bot can send.',
       reason: 'no_sendable_work',
       resumeAt: null,
@@ -1016,7 +1017,7 @@ async function getClientNoWorkResumeAt(clientId) {
       resumeAt: getNextHourStartInTimezone(clientTz),
     };
   }
-  const unsendableHint = await getNoWorkHint(clientId).catch(() => '');
+  const unsendableHint = await getMostSpecificNoWorkHint(clientId).catch(() => '');
   if (unsendableHint) {
     return { message: unsendableHint, reason: 'no_sendable_work', resumeAt: null };
   }
@@ -2396,31 +2397,61 @@ async function getCampaignsMissingSendDelays(clientId, campaignId = null) {
  * Returns a short hint for why there is no sendable work for this client.
  */
 async function getNoWorkHint(clientId) {
+  return getMostSpecificNoWorkHint(clientId);
+}
+
+async function getMostSpecificNoWorkHint(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return '';
-  const { data: campaigns } = await sb
-    .from('cold_dm_campaigns')
-    .select('id, name, status')
-    .eq('client_id', clientId);
-  if (!campaigns?.length) return 'No campaigns.';
-  const delayProblems = await getCampaignsMissingSendDelays(clientId).catch(() => []);
-  if (delayProblems.length > 0) {
-    const first = delayProblems[0];
-    const extra = delayProblems.length > 1 ? ` (+${delayProblems.length - 1} more)` : '';
-    return `Campaign "${first.name || first.id}" is missing send delay settings (${first.reason}). Set min/max delay in campaign settings before starting${extra}.`;
+
+  const campaigns = await getActiveCampaigns(clientId);
+  if (!campaigns?.length) return '';
+
+  for (const camp of campaigns) {
+    const { count: campPending } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', camp.id)
+      .eq('status', 'pending');
+    if ((campPending ?? 0) === 0) continue;
+
+    if (!hasValidCampaignSendDelayConfig(camp)) {
+      return `Campaign "${camp.name || camp.id}" is missing send delay settings (${describeCampaignSendDelayConfigProblem(camp)}). Set min/max delay in campaign settings before starting.`;
+    }
+
+    let messageText = null;
+    if (camp.message_group_id) {
+      const groupMsg = await getRandomMessageFromGroup(camp.message_group_id).catch(() => null);
+      if (groupMsg?.message_text) messageText = groupMsg.message_text;
+    }
+    if (!messageText && camp.message_template_id) {
+      messageText = await getMessageTemplateById(camp.message_template_id).catch(() => null);
+    }
+    if (!messageText) {
+      return `Campaign "${camp.name || camp.id}" has no usable message text. Add a message template or messages to the selected message group before starting.`;
+    }
+
+    const { data: leadGroupRows, error: leadGroupErr } = await sb
+      .from('cold_dm_campaign_lead_groups')
+      .select('lead_group_id')
+      .eq('campaign_id', camp.id);
+    if (leadGroupErr) throw leadGroupErr;
+    const leadGroupIds = (leadGroupRows || []).map((r) => r.lead_group_id).filter(Boolean);
+    if (leadGroupIds.length === 0) {
+      return `Campaign "${camp.name || camp.id}" has no lead groups assigned. Select at least one lead group before starting.`;
+    }
+
+    const { data: leadRows, error: leadErr } = await sb
+      .from('cold_dm_leads')
+      .select('id')
+      .eq('client_id', clientId)
+      .in('lead_group_id', leadGroupIds);
+    if (leadErr) throw leadErr;
+    if (!leadRows || leadRows.length === 0) {
+      return `Campaign "${camp.name || camp.id}" has no leads in the selected lead groups. Add leads to those groups before starting.`;
+    }
   }
-  const withPending = await Promise.all(
-    campaigns.map(async (c) => {
-      const { count } = await sb
-        .from('cold_dm_campaign_leads')
-        .select('*', { count: 'exact', head: true })
-        .eq('campaign_id', c.id)
-        .eq('status', 'pending');
-      return { name: c.name, status: c.status, pending: count ?? 0 };
-    })
-  );
-  const campaignsWithPending = withPending.filter((c) => c.pending > 0);
-  if (campaignsWithPending.length > 0) return '';
+
   return 'No campaigns with pending leads.';
 }
 
