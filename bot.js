@@ -2819,19 +2819,38 @@ async function runBotMultiTenant() {
     const pg = page;
     if (!pg) return false;
     if (currentSessionId === session.id) return true;
+    const sessionLabel = session.instagram_username || session.id;
     try {
       const existing = await pg.cookies();
       if (existing.length) await pg.deleteCookie(...existing);
       await pg.setCookie(...cookies);
-      await pg.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
-      await delay(2000);
+      let gotoTimedOut = false;
+      try {
+        await pg.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+      } catch (e) {
+        gotoTimedOut = e && e.name === 'TimeoutError';
+        logger.warn(
+          `Session switch navigation ${gotoTimedOut ? 'timed out' : 'failed'} for ${sessionLabel}: ${e.message}. Verifying current page before failing.`
+        );
+      }
+      await delay(3000);
       if (pg.url().includes('/accounts/login')) {
-        logger.error('Instagram session expired for account ' + (session.instagram_username || session.id));
+        logger.error('Instagram session expired for account ' + sessionLabel);
         return false;
       }
       currentSessionId = session.id;
       return true;
     } catch (e) {
+      if (e && e.name === 'TimeoutError') {
+        try {
+          await delay(2000);
+          if (!pg.url().includes('/accounts/login')) {
+            logger.warn(`Session switch timeout for ${sessionLabel} but page is not login; continuing.`);
+            currentSessionId = session.id;
+            return true;
+          }
+        } catch {}
+      }
       logger.error('Failed to switch session: ' + e.message);
       return false;
     }
@@ -3096,19 +3115,38 @@ async function runBot() {
     const cookies = session?.session_data?.cookies;
     if (!cookies?.length) return false;
     if (currentSessionId === session.id) return true;
+    const sessionLabel = session.instagram_username || session.id;
     try {
       const existing = await page.cookies();
       if (existing.length) await page.deleteCookie(...existing);
       await page.setCookie(...cookies);
-      await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
-      await delay(2000);
+      let gotoTimedOut = false;
+      try {
+        await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 45000 });
+      } catch (e) {
+        gotoTimedOut = e && e.name === 'TimeoutError';
+        logger.warn(
+          `Session switch navigation ${gotoTimedOut ? 'timed out' : 'failed'} for ${sessionLabel}: ${e.message}. Verifying current page before failing.`
+        );
+      }
+      await delay(3000);
       if (page.url().includes('/accounts/login')) {
-        logger.error('Instagram session expired for account ' + (session.instagram_username || session.id));
+        logger.error('Instagram session expired for account ' + sessionLabel);
         return false;
       }
       currentSessionId = session.id;
       return true;
     } catch (e) {
+      if (e && e.name === 'TimeoutError') {
+        try {
+          await delay(2000);
+          if (!page.url().includes('/accounts/login')) {
+            logger.warn(`Session switch timeout for ${sessionLabel} but page is not login; continuing.`);
+            currentSessionId = session.id;
+            return true;
+          }
+        } catch {}
+      }
       logger.error('Failed to switch session: ' + e.message);
       return false;
     }
