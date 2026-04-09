@@ -16,6 +16,8 @@ module.exports = {
     {
       name: 'ig-dm-send',
       script: 'workers/send-worker.js',
+      instances: Math.max(1, parseInt(process.env.SEND_WORKER_INSTANCES || '4', 10) || 4),
+      exec_mode: 'cluster',
       autorestart: false,
       max_restarts: 20,
       min_uptime: 5000,

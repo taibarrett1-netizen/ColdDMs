@@ -749,8 +749,9 @@ function cleanupExpiredScraper2FA() {
 // --- API: Instagram connect (one-time; password never stored) ---
 // If account has 2FA, returns { ok: false, code: 'two_factor_required', pending2FAId }. Submit code to POST /api/instagram/connect/2fa with same clientId.
 app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
-  const { username, password, clientId, platformScraperPool } = req.body || {};
+  const { username, password, clientId, platformScraperPool, platformScraperBackup } = req.body || {};
   const isPlatformPool = platformScraperPool === true || platformScraperPool === 'true' || platformScraperPool === 1;
+  const isPlatformBackup = platformScraperBackup === true || platformScraperBackup === 'true' || platformScraperBackup === 1;
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
@@ -786,6 +787,8 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
         createdAt: Date.now(),
         proxyUrl: proxyMeta.proxyUrl,
         proxyAssignmentId: proxyMeta.proxyAssignmentId,
+        platformScraperPool: isPlatformPool,
+        platformScraperBackup: isPlatformBackup,
       });
       return res.status(200).json({
         ok: false,
@@ -806,6 +809,7 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
         proxyUrl: proxyMeta.proxyUrl,
         proxyAssignmentId: proxyMeta.proxyAssignmentId,
         platformScraperPool: isPlatformPool,
+        platformScraperBackup: isPlatformBackup,
       });
       return res.status(200).json({
         ok: false,
@@ -822,7 +826,12 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
       proxyAssignmentId: proxyMeta.proxyAssignmentId,
     });
     if (isPlatformPool) {
-      await savePlatformScraperSession({ cookies: result.cookies }, result.username, req.body?.daily_actions_limit || 500).catch(() => {});
+      await savePlatformScraperSession(
+        { cookies: result.cookies },
+        result.username,
+        req.body?.daily_actions_limit || 500,
+        { forceInsert: isPlatformBackup }
+      ).catch(() => {});
     }
     await updateSettingsInstagramUsername(clientId, result.username);
     res.json({ ok: true });
@@ -844,7 +853,9 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
 });
 
 app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
-  const { pending2FAId, twoFactorCode, clientId } = req.body || {};
+  const { pending2FAId, twoFactorCode, clientId, platformScraperPool, platformScraperBackup, daily_actions_limit } = req.body || {};
+  const isPlatformPool = platformScraperPool === true || platformScraperPool === 'true' || platformScraperPool === 1;
+  const isPlatformBackup = platformScraperBackup === true || platformScraperBackup === 'true' || platformScraperBackup === 1;
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
@@ -870,6 +881,16 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
       proxyUrl: pending.proxyUrl,
       proxyAssignmentId: pending.proxyAssignmentId,
     });
+    if (isPlatformPool || pending.platformScraperPool) {
+      await savePlatformScraperSession(
+        { cookies: result.cookies },
+        result.username,
+        daily_actions_limit != null ? daily_actions_limit : 500,
+        { forceInsert: isPlatformBackup || pending.platformScraperBackup === true }
+      ).catch(() => {});
+      res.json({ ok: true, cookies: result.cookies, username: result.username, instagram_username: result.username });
+      return;
+    }
     await updateSettingsInstagramUsername(clientId, result.username);
     res.json({ ok: true });
   } catch (e) {
@@ -880,8 +901,9 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
 });
 
 app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) => {
-  const { pendingEmailId, emailCode, clientId, platformScraperPool, daily_actions_limit } = req.body || {};
+  const { pendingEmailId, emailCode, clientId, platformScraperPool, platformScraperBackup, daily_actions_limit } = req.body || {};
   const isPlatformPool = platformScraperPool === true || platformScraperPool === 'true' || platformScraperPool === 1;
+  const isPlatformBackup = platformScraperBackup === true || platformScraperBackup === 'true' || platformScraperBackup === 1;
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
@@ -911,7 +933,12 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
       proxyAssignmentId: pending.proxyAssignmentId,
     });
     if (isPlatformPool) {
-      await savePlatformScraperSession({ cookies: result.cookies }, result.username, daily_actions_limit || 500).catch(() => {});
+      await savePlatformScraperSession(
+        { cookies: result.cookies },
+        result.username,
+        daily_actions_limit || 500,
+        { forceInsert: isPlatformBackup || pending.platformScraperBackup === true }
+      ).catch(() => {});
       return res.json({ ok: true, cookies: result.cookies, username: result.username, instagram_username: result.username });
     }
     await updateSettingsInstagramUsername(clientId, result.username);
@@ -1280,7 +1307,8 @@ app.post('/api/scraper/stop', async (req, res) => {
 });
 
 app.post('/api/scraper/connect-platform', connectLimiter, async (req, res) => {
-  const { username, password, daily_actions_limit } = req.body || {};
+  const { username, password, daily_actions_limit, platformScraperBackup } = req.body || {};
+  const isPlatformBackup = platformScraperBackup === true || platformScraperBackup === 'true' || platformScraperBackup === 1;
   if (!username || !password) {
     return res.status(400).json({ ok: false, error: 'username and password are required' });
   }
@@ -1293,7 +1321,8 @@ app.post('/api/scraper/connect-platform', connectLimiter, async (req, res) => {
     await savePlatformScraperSession(
       { cookies },
       instagramUsername,
-      daily_actions_limit != null ? daily_actions_limit : 500
+      daily_actions_limit != null ? daily_actions_limit : 500,
+      { forceInsert: isPlatformBackup }
     );
     res.json({ ok: true });
   } catch (e) {

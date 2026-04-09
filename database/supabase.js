@@ -333,40 +333,71 @@ async function getLeadsTotalAndRemaining(clientId) {
 async function getSession(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return null;
-  const { data, error } = await sb
-    .from('cold_dm_instagram_sessions')
-    .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id')
-    .eq('client_id', clientId)
-    .maybeSingle();
-  if (error) throw error;
-  return data;
+  try {
+    const { data, error } = await sb
+      .from('cold_dm_instagram_sessions')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at')
+      .eq('client_id', clientId)
+      .maybeSingle();
+    if (error) throw error;
+    return data;
+  } catch (e) {
+    const { data, error } = await sb
+      .from('cold_dm_instagram_sessions')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id')
+      .eq('client_id', clientId)
+      .maybeSingle();
+    if (error) throw error;
+    return data;
+  }
 }
 
 /** Instagram session row for a specific id; must belong to clientId (follow-up send). */
 async function getInstagramSessionByIdForClient(clientId, sessionId) {
   const sb = getSupabase();
   if (!sb || !clientId || !sessionId) return null;
-  const { data, error } = await sb
-    .from('cold_dm_instagram_sessions')
-    .select('id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id')
-    .eq('id', sessionId)
-    .eq('client_id', clientId)
-    .maybeSingle();
-  if (error) throw error;
-  return data;
+  try {
+    const { data, error } = await sb
+      .from('cold_dm_instagram_sessions')
+      .select('id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at')
+      .eq('id', sessionId)
+      .eq('client_id', clientId)
+      .maybeSingle();
+    if (error) throw error;
+    return data;
+  } catch (e) {
+    const { data, error } = await sb
+      .from('cold_dm_instagram_sessions')
+      .select('id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id')
+      .eq('id', sessionId)
+      .eq('client_id', clientId)
+      .maybeSingle();
+    if (error) throw error;
+    return data;
+  }
 }
 
 /** All sessions for a client. Used when campaign has no assigned sessions. */
 async function getSessions(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return [];
-  const { data, error } = await sb
-    .from('cold_dm_instagram_sessions')
-    .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id')
-    .eq('client_id', clientId)
-    .order('id', { ascending: true });
-  if (error) throw error;
-  return data || [];
+  try {
+    const { data, error } = await sb
+      .from('cold_dm_instagram_sessions')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at')
+      .eq('client_id', clientId)
+      .order('id', { ascending: true });
+    if (error) throw error;
+    return data || [];
+  } catch (e) {
+    const { data, error } = await sb
+      .from('cold_dm_instagram_sessions')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id')
+      .eq('client_id', clientId)
+      .order('id', { ascending: true });
+    if (error) throw error;
+    return data || [];
+  }
 }
 
 /**
@@ -386,17 +417,97 @@ async function getSessionsForCampaign(clientId, campaignId) {
     }
     const ids = assigned.map((r) => r.instagram_session_id).filter(Boolean);
     if (ids.length === 0) return getSessions(clientId);
-    const { data: sessions, error: sessErr } = await sb
-      .from('cold_dm_instagram_sessions')
-      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id')
-      .eq('client_id', clientId)
-      .in('id', ids)
-      .order('id', { ascending: true });
-    if (sessErr || !sessions?.length) return getSessions(clientId);
-    return sessions;
+    try {
+      const { data: sessions, error: sessErr } = await sb
+        .from('cold_dm_instagram_sessions')
+        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at')
+        .eq('client_id', clientId)
+        .in('id', ids)
+        .order('id', { ascending: true });
+      if (sessErr || !sessions?.length) return getSessions(clientId);
+      return sessions;
+    } catch (e) {
+      const { data: sessions, error: sessErr } = await sb
+        .from('cold_dm_instagram_sessions')
+        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id')
+        .eq('client_id', clientId)
+        .in('id', ids)
+        .order('id', { ascending: true });
+      if (sessErr || !sessions?.length) return getSessions(clientId);
+      return sessions;
+    }
   } catch (e) {
     return getSessions(clientId);
   }
+}
+
+function computeSendSessionLeaseUntil(leaseSec = 600) {
+  const sec = Math.max(60, parseInt(leaseSec, 10) || 600);
+  return new Date(Date.now() + sec * 1000).toISOString();
+}
+
+async function claimInstagramSessionLease(sessionId, workerId, leaseSeconds = 600) {
+  const sb = getSupabase();
+  if (!sb || !sessionId || !workerId) return false;
+  const nowIso = new Date().toISOString();
+  const leaseUntil = computeSendSessionLeaseUntil(leaseSeconds);
+  const updatePayload = {
+    leased_by_worker: workerId,
+    leased_until: leaseUntil,
+    lease_heartbeat_at: nowIso,
+  };
+  const attempts = [
+    (q) => q.is('leased_until', null),
+    (q) => q.lte('leased_until', nowIso),
+  ];
+  for (const build of attempts) {
+    let query = sb.from('cold_dm_instagram_sessions').update(updatePayload).eq('id', sessionId);
+    query = build(query);
+    const { data, error } = await query.select('id').limit(1);
+    if (!error && data && data.length > 0) return true;
+  }
+  return false;
+}
+
+async function claimInstagramSessionForCampaign(clientId, campaignId, workerId, leaseSeconds = 600) {
+  const sessions = await getSessionsForCampaign(clientId, campaignId);
+  if (!sessions?.length) return null;
+  const now = Date.now();
+  const eligible = sessions.filter((s) => !s.leased_until || new Date(s.leased_until).getTime() <= now);
+  for (const candidate of eligible) {
+    const ok = await claimInstagramSessionLease(candidate.id, workerId, leaseSeconds);
+    if (ok) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function heartbeatInstagramSessionLease(sessionId, workerId, leaseSeconds = 600) {
+  const sb = getSupabase();
+  if (!sb || !sessionId || !workerId) return false;
+  const nowIso = new Date().toISOString();
+  const leaseUntil = computeSendSessionLeaseUntil(leaseSeconds);
+  const { data, error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .update({ leased_until: leaseUntil, lease_heartbeat_at: nowIso, updated_at: nowIso })
+    .eq('id', sessionId)
+    .eq('leased_by_worker', workerId)
+    .select('id')
+    .limit(1);
+  return !error && !!(data && data.length > 0);
+}
+
+async function releaseInstagramSessionLease(sessionId, workerId) {
+  const sb = getSupabase();
+  if (!sb || !sessionId) return;
+  const nowIso = new Date().toISOString();
+  let q = sb
+    .from('cold_dm_instagram_sessions')
+    .update({ leased_until: null, leased_by_worker: null, lease_heartbeat_at: nowIso, updated_at: nowIso })
+    .eq('id', sessionId);
+  if (workerId) q = q.eq('leased_by_worker', workerId);
+  await q;
 }
 
 function normalizeInstagramKey(instagramUsername) {
@@ -1005,7 +1116,7 @@ async function getPlatformScraperSessions() {
   const { data, error } = await sb
     .from('cold_dm_platform_scraper_sessions')
     .select(
-      'id, session_data, instagram_username, daily_actions_limit, account_state, cooldown_until, leased_until, leased_by_worker, risk_score'
+      'id, session_data, instagram_username, daily_actions_limit, account_state, cooldown_until, leased_until, leased_by_worker, risk_score, created_at, updated_at'
     )
     .order('id', { ascending: true });
   if (error) {
@@ -1021,6 +1132,8 @@ async function getPlatformScraperSessions() {
       leased_until: null,
       leased_by_worker: null,
       risk_score: 0,
+      created_at: row.created_at || null,
+      updated_at: row.updated_at || null,
     }));
   }
   return data || [];
@@ -1032,7 +1145,7 @@ async function getPlatformScraperSessionById(id) {
   if (!sb) return null;
   const { data, error } = await sb
     .from('cold_dm_platform_scraper_sessions')
-    .select('id, session_data, instagram_username')
+    .select('id, session_data, instagram_username, created_at, updated_at')
     .eq('id', id)
     .maybeSingle();
   if (error) return null;
@@ -1097,9 +1210,14 @@ async function describePlatformScraperPoolForLogs() {
   }
   const usage = await getPlatformScraperUsageToday(sessions.map((s) => s.id));
   const now = Date.now();
+  const groups = new Map();
   let withCookies = 0;
   let eligible = 0;
   for (const s of sessions) {
+    const key = normalizeInstagramKey(s.instagram_username) || String(s.id);
+    const list = groups.get(key) || [];
+    list.push(s);
+    groups.set(key, list);
     if (platformSessionHasPuppeteerCookies(s)) withCookies += 1;
     const state = (s.account_state || 'active').toLowerCase();
     const okState = state === 'active';
@@ -1108,9 +1226,12 @@ async function describePlatformScraperPoolForLogs() {
     const okUsage = (usage[s.id] || 0) < (s.daily_actions_limit || 500);
     if (okState && platformSessionHasPuppeteerCookies(s) && okCd && okLease && okUsage) eligible += 1;
   }
+  const uniqueAccounts = groups.size;
+  const overflowRows = Math.max(0, sessions.length - uniqueAccounts);
   return (
-    `pool: ${sessions.length} row(s), ${withCookies} with session_data.cookies (Puppeteer login), ` +
-      `${eligible} eligible for scrape (active + cookies + not leased + under daily limit). ` +
+    `pool: ${sessions.length} row(s) across ${uniqueAccounts} account key(s), ${overflowRows} overflow row(s), ` +
+      `${withCookies} with session_data.cookies (Puppeteer login), ${eligible} eligible for scrape ` +
+      `(active + cookies + not leased + under daily limit). ` +
       (withCookies === 0
         ? 'Reconnect Instagram in admin Platform scrapers so Puppeteer saves cookies.'
         : eligible === 0
@@ -1131,23 +1252,6 @@ async function reservePlatformScraperSessionForWorker(workerId, leaseSec = 180) 
   const sessions = await getPlatformScraperSessions();
   if (!sessions.length) return null;
   const usage = await getPlatformScraperUsageToday(sessions.map((s) => s.id));
-
-  const eligible = sessions
-    .filter((s) => {
-      const state = (s.account_state || 'active').toLowerCase();
-      if (state !== 'active') return false;
-      if (!platformSessionHasPuppeteerCookies(s)) return false;
-      if (s.cooldown_until && new Date(s.cooldown_until).getTime() > Date.now()) return false;
-      if (s.leased_until && new Date(s.leased_until).getTime() > Date.now()) return false;
-      return (usage[s.id] || 0) < (s.daily_actions_limit || 500);
-    })
-    .sort((a, b) => {
-      const aRisk = a.risk_score || 0;
-      const bRisk = b.risk_score || 0;
-      if (aRisk !== bRisk) return aRisk - bRisk;
-      return (usage[a.id] || 0) - (usage[b.id] || 0);
-    });
-
   const updatePayload = {
     leased_until: leaseUntil,
     leased_by_worker: workerId,
@@ -1155,62 +1259,115 @@ async function reservePlatformScraperSessionForWorker(workerId, leaseSec = 180) 
     updated_at: nowIso,
   };
 
-  for (const candidate of eligible) {
-    // Do not use a single .or(`leased_until.is.null,leased_until.lte.${nowIso}`): raw ISO in the filter
-    // breaks PostgREST parsing (colons/dots), so the UPDATE matches 0 rows while JS still shows "eligible".
-    const attempts = [
-      { name: 'leased_until_is_null', build: (q) => q.is('leased_until', null) },
-      { name: 'leased_until_lte_now', build: (q) => q.lte('leased_until', nowIso) },
-    ];
+  function sessionSortKey(s) {
+    const createdAt = s.created_at ? new Date(s.created_at).getTime() : 0;
+    return [createdAt, String(s.id || '')];
+  }
 
-    for (const attempt of attempts) {
-      let query = sb
-        .from('cold_dm_platform_scraper_sessions')
-        .update(updatePayload)
-        .eq('id', candidate.id);
-      query = attempt.build(query);
-      const { data, error } = await query.select('id, session_data, instagram_username').limit(1);
+  const groups = new Map();
+  for (const s of sessions) {
+    const key = normalizeInstagramKey(s.instagram_username) || String(s.id);
+    const list = groups.get(key) || [];
+    list.push(s);
+    groups.set(key, list);
+  }
 
-      if (error) {
-        logPlatformScraperReserve('update failed', {
+  const sortRows = (rows) =>
+    [...rows].sort((a, b) => {
+      const aRisk = a.risk_score || 0;
+      const bRisk = b.risk_score || 0;
+      if (aRisk !== bRisk) return aRisk - bRisk;
+      const aUsage = usage[a.id] || 0;
+      const bUsage = usage[b.id] || 0;
+      if (aUsage !== bUsage) return aUsage - bUsage;
+      const [aCreated, aId] = sessionSortKey(a);
+      const [bCreated, bId] = sessionSortKey(b);
+      if (aCreated !== bCreated) return aCreated - bCreated;
+      return String(aId).localeCompare(String(bId));
+    });
+
+  const eligibleRows = (rows) =>
+    sortRows(
+      rows.filter((s) => {
+        const state = (s.account_state || 'active').toLowerCase();
+        if (state !== 'active') return false;
+        if (!platformSessionHasPuppeteerCookies(s)) return false;
+        if (s.cooldown_until && new Date(s.cooldown_until).getTime() > Date.now()) return false;
+        if (s.leased_until && new Date(s.leased_until).getTime() > Date.now()) return false;
+        return (usage[s.id] || 0) < (s.daily_actions_limit || 500);
+      })
+    );
+
+  const primaries = [];
+  const overflow = [];
+  for (const rows of groups.values()) {
+    const sorted = sortRows(rows);
+    if (sorted.length > 0) primaries.push(sorted[0]);
+    if (sorted.length > 1) overflow.push(...sorted.slice(1));
+  }
+
+  const stageCandidates = [eligibleRows(primaries), eligibleRows(overflow)];
+
+  for (const [stageIndex, stage] of stageCandidates.entries()) {
+    for (const candidate of stage) {
+      // Do not use a single .or(`leased_until.is.null,leased_until.lte.${nowIso}`): raw ISO in the filter
+      // breaks PostgREST parsing (colons/dots), so the UPDATE matches 0 rows while JS still shows "eligible".
+      const attempts = [
+        { name: 'leased_until_is_null', build: (q) => q.is('leased_until', null) },
+        { name: 'leased_until_lte_now', build: (q) => q.lte('leased_until', nowIso) },
+      ];
+
+      for (const attempt of attempts) {
+        let query = sb
+          .from('cold_dm_platform_scraper_sessions')
+          .update(updatePayload)
+          .eq('id', candidate.id);
+        query = attempt.build(query);
+        const { data, error } = await query.select('id, session_data, instagram_username, created_at').limit(1);
+
+        if (error) {
+          logPlatformScraperReserve('update failed', {
+            workerId,
+            candidateId: candidate.id,
+            attempt: attempt.name,
+            message: error.message,
+            code: error.code,
+            details: error.details,
+            hint: error.hint,
+          }, { always: true });
+          continue;
+        }
+
+        const rowCount = data?.length ?? 0;
+        if (rowCount > 0) {
+          logPlatformScraperReserve('reserved session', {
+            workerId,
+            candidateId: candidate.id,
+            attempt: attempt.name,
+            stage: stageIndex === 0 ? 'primary' : 'overflow',
+          });
+          return {
+            id: data[0].id,
+            session_data: data[0].session_data,
+            instagram_username: data[0].instagram_username,
+          };
+        }
+
+        logPlatformScraperReserve('update matched 0 rows (lost race or stale eligible list)', {
           workerId,
           candidateId: candidate.id,
           attempt: attempt.name,
-          message: error.message,
-          code: error.code,
-          details: error.details,
-          hint: error.hint,
+          nowIso,
         }, { always: true });
-        continue;
       }
-
-      const rowCount = data?.length ?? 0;
-      if (rowCount > 0) {
-        logPlatformScraperReserve('reserved session', {
-          workerId,
-          candidateId: candidate.id,
-          attempt: attempt.name,
-        });
-        return {
-          id: data[0].id,
-          session_data: data[0].session_data,
-          instagram_username: data[0].instagram_username,
-        };
-      }
-
-      logPlatformScraperReserve('update matched 0 rows (lost race or stale eligible list)', {
-        workerId,
-        candidateId: candidate.id,
-        attempt: attempt.name,
-        nowIso,
-      }, { always: true });
     }
   }
 
   logPlatformScraperReserve('no session reserved after trying all eligible candidates', {
     workerId,
-    eligibleCount: eligible.length,
-    candidateIds: eligible.map((c) => c.id),
+    primaryCount: stageCandidates[0].length,
+    overflowCount: stageCandidates[1].length,
+    candidateIds: [...stageCandidates[0], ...stageCandidates[1]].map((c) => c.id),
   }, { always: true });
   return null;
 }
@@ -1321,33 +1478,58 @@ async function recordScraperActions(platformSessionId, count) {
   throw new Error('Failed to atomically update scraper daily usage after retries');
 }
 
-async function savePlatformScraperSession(sessionData, instagramUsername, dailyActionsLimit = 500) {
+async function savePlatformScraperSession(sessionData, instagramUsername, dailyActionsLimit = 500, opts = {}) {
   const sb = getSupabase();
   if (!sb) throw new Error('Supabase not configured');
   const username = (instagramUsername || '').trim().replace(/^@/, '');
   if (!username) throw new Error('Instagram username required');
-  const { data, error } = await sb
-    .from('cold_dm_platform_scraper_sessions')
-    .upsert(
-      {
+  const limit = Math.max(1, parseInt(dailyActionsLimit, 10) || 500);
+  const forceInsert = opts && (opts.forceInsert === true || opts.allowDuplicateUsername === true);
+  if (forceInsert) {
+    const { data, error } = await sb
+      .from('cold_dm_platform_scraper_sessions')
+      .insert({
         session_data: sessionData,
         instagram_username: username,
-        daily_actions_limit: Math.max(1, parseInt(dailyActionsLimit, 10) || 500),
-        updated_at: new Date().toISOString(),
-      },
-      { onConflict: 'instagram_username' }
-    )
+        daily_actions_limit: limit,
+      })
+      .select('id')
+      .single();
+    if (error) throw error;
+    return data?.id;
+  }
+  const { data: existing, error: selErr } = await sb
+    .from('cold_dm_platform_scraper_sessions')
     .select('id')
-    .single();
-  if (error) {
-    const { error: insertErr } = await sb.from('cold_dm_platform_scraper_sessions').insert({
+    .eq('instagram_username', username)
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (selErr) throw selErr;
+  if (existing?.id) {
+    const { data, error } = await sb
+      .from('cold_dm_platform_scraper_sessions')
+      .update({
+        session_data: sessionData,
+        daily_actions_limit: limit,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', existing.id)
+      .select('id')
+      .single();
+    if (error) throw error;
+    return data?.id;
+  }
+  const { data, error } = await sb
+    .from('cold_dm_platform_scraper_sessions')
+    .insert({
       session_data: sessionData,
       instagram_username: username,
-      daily_actions_limit: Math.max(1, parseInt(dailyActionsLimit, 10) || 500),
-    });
-    if (insertErr) throw insertErr;
-    return;
-  }
+      daily_actions_limit: limit,
+    })
+    .select('id')
+    .single();
+  if (error) throw error;
   return data?.id;
 }
 
@@ -2330,6 +2512,10 @@ module.exports = {
   getInstagramSessionByIdForClient,
   getSessions,
   getSessionsForCampaign,
+  claimInstagramSessionLease,
+  claimInstagramSessionForCampaign,
+  heartbeatInstagramSessionLease,
+  releaseInstagramSessionLease,
   saveSession,
   alreadySent,
   logSentMessage,

@@ -106,9 +106,6 @@ const BROWSER_PROFILE_DIR = path.join(process.cwd(), '.browser-profile');
 const VOICE_NOTE_FILE = (process.env.VOICE_NOTE_FILE || '').trim();
 const VOICE_NOTE_MODE = (process.env.VOICE_NOTE_MODE || 'after_text').trim().toLowerCase();
 const LOGIN_DEBUG_SCREENSHOT_DIR = path.join(process.cwd(), 'logs', 'login-debug');
-const GLOBAL_SEND_GAP_MS = Math.max(0, parseInt(process.env.SEND_WORKER_GLOBAL_GAP_MS || '240000', 10) || 240000);
-const GLOBAL_SEND_GATE_FILE = path.join(os.tmpdir(), 'cold_dm_global_send_gate.json');
-const GLOBAL_SEND_GATE_LOCK_FILE = `${GLOBAL_SEND_GATE_FILE}.lock`;
 
 function wantsVoiceNotes(sendOpts = {}) {
   return !!((sendOpts.voiceNotePath || '').trim());
@@ -670,78 +667,6 @@ async function tinyHumanMouseMove(page) {
     await delay(60 + Math.floor(Math.random() * 100));
     await page.mouse.move(end.x, end.y, { steps: 7 });
     await delay(80 + Math.floor(Math.random() * 140));
-  } catch {
-    // best-effort only
-  }
-}
-
-async function withExclusiveFileLock(lockFile, fn) {
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    try {
-      const handle = await fs.promises.open(lockFile, 'wx');
-      try {
-        return await fn();
-      } finally {
-        await handle.close().catch(() => {});
-        await fs.promises.unlink(lockFile).catch(() => {});
-      }
-    } catch (e) {
-      if (!e || e.code !== 'EEXIST') throw e;
-      await delay(40 + Math.floor(Math.random() * 80));
-    }
-  }
-  throw new Error('global_send_lock_timeout');
-}
-
-async function respectGlobalSendGap(minGapMs = GLOBAL_SEND_GAP_MS) {
-  const gapMs = Math.max(0, Number(minGapMs) || 0);
-  if (gapMs <= 0) return 0;
-  const now = Date.now();
-  return withExclusiveFileLock(GLOBAL_SEND_GATE_LOCK_FILE, async () => {
-    let resumeAt = 0;
-    try {
-      const raw = await fs.promises.readFile(GLOBAL_SEND_GATE_FILE, 'utf8');
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.resumeAt === 'number') resumeAt = parsed.resumeAt;
-      else if (parsed && typeof parsed.lastSentAt === 'number') {
-        const storedGap = typeof parsed.cooldownMs === 'number' ? parsed.cooldownMs : gapMs;
-        resumeAt = parsed.lastSentAt + Math.max(0, storedGap);
-      }
-    } catch {}
-    if (resumeAt > now) {
-      return resumeAt - now;
-    }
-    await fs.promises.writeFile(
-      GLOBAL_SEND_GATE_FILE,
-      JSON.stringify({ resumeAt: now, cooldownMs: 0, updatedAt: new Date().toISOString(), pid: process.pid }, null, 0),
-      'utf8'
-    );
-    return 0;
-  });
-}
-
-async function updateGlobalSendGateAfterSuccess(minGapMs = GLOBAL_SEND_GAP_MS) {
-  const gapMs = Math.max(0, Number(minGapMs) || 0);
-  if (gapMs <= 0) return;
-  const now = Date.now();
-  try {
-    await withExclusiveFileLock(GLOBAL_SEND_GATE_LOCK_FILE, async () => {
-      await fs.promises.writeFile(
-        GLOBAL_SEND_GATE_FILE,
-        JSON.stringify(
-          {
-            resumeAt: now + gapMs,
-            cooldownMs: gapMs,
-            updatedAt: new Date().toISOString(),
-            pid: process.pid,
-          },
-          null,
-          0
-        ),
-        'utf8'
-      );
-    });
   } catch {
     // best-effort only
   }
@@ -2722,13 +2647,6 @@ async function sendFollowUp(body) {
       return fail('Instagram session expired', 401);
     }
 
-    const gapMs = await respectGlobalSendGap().catch(() => 0);
-    if (gapMs > 0) {
-      const gapMin = Math.max(1, Math.round(gapMs / 60000));
-      logger.log(`[follow-up] global send cooldown active. Waiting ${gapMin} min before sending @${recipientUsername}.`);
-      await delay(gapMs);
-    }
-
     const u = normalizeUsername(recipientUsername);
     await tinyHumanMouseMove(page);
     const nav = await navigateToDmThread(page, u);
@@ -2748,7 +2666,6 @@ async function sendFollowUp(body) {
       if (sent.instagramMessageId) {
         logger.log(`[follow-up] instagram_message_id=${sent.instagramMessageId}${cLog}`);
       }
-      await updateGlobalSendGateAfterSuccess().catch(() => {});
       return followUpOkWithInstagramIds({
         instagram_message_id: sent.instagramMessageId || undefined,
       });
@@ -2770,7 +2687,6 @@ async function sendFollowUp(body) {
       if (instagram_message_ids) {
         logger.log(`[follow-up] instagram_message_ids=${JSON.stringify(instagram_message_ids)}${cLog}`);
       }
-      await updateGlobalSendGateAfterSuccess().catch(() => {});
       return followUpOkWithInstagramIds({ instagram_message_ids });
     }
 
@@ -2817,7 +2733,6 @@ async function sendFollowUp(body) {
       if (voiceResult.instagramMessageId) {
         logger.log(`[follow-up] instagram_message_id=${voiceResult.instagramMessageId}${cLog}`);
       }
-      await updateGlobalSendGateAfterSuccess().catch(() => {});
       return followUpOkWithInstagramIds({
         instagram_message_id: voiceResult.instagramMessageId || undefined,
       });
@@ -2910,12 +2825,6 @@ async function sendDM(page, username, adapter, options = {}) {
   );
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
-      const gapMs = await respectGlobalSendGap(options.globalSendGapMs || GLOBAL_SEND_GAP_MS).catch(() => 0);
-      if (gapMs > 0) {
-        const gapSec = Math.max(1, Math.ceil(gapMs / 1000));
-        logger.log(`Shared cooldown active. Waiting ${gapSec} sec before sending @${u}.`);
-        await delay(gapMs);
-      }
       const result = await sendDMOnce(page, u, messageTemplate, nameFallback, {
         firstNameBlocklist,
         senderName: senderAccountName,
@@ -2927,7 +2836,6 @@ async function sendDM(page, username, adapter, options = {}) {
       if (result.ok) {
         const finalMessage = result.finalMessage != null ? result.finalMessage : (resolvedVoiceMode === 'voice_only' ? '' : messageTemplate);
         await Promise.resolve(logSent('success', finalMessage));
-        await updateGlobalSendGateAfterSuccess(sendCooldownMs).catch(() => {});
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent', null, sendWorkerId).catch(() => {});
         if (options.clientId && (result.display_name || result.first_name || result.last_name) && typeof sb.upsertLeadIdentity === 'function') {
           sb.upsertLeadIdentity(options.clientId, u, {
@@ -3061,7 +2969,6 @@ async function runBotMultiTenant() {
   /** @type {string|null|undefined} undefined = never launched; '' = no proxy */
   let currentProxyKey = undefined;
   let currentSessionId = null;
-  const campaignRoundRobin = new Map();
   /** Retries when cold_dm_control has no pause=0 yet (race right after dashboard Start). */
   let noPauseZeroEmptyRounds = 0;
   const NO_WORK_LOG_EVERY_ROUNDS = Math.max(
@@ -3234,106 +3141,117 @@ async function runBotMultiTenant() {
     }
     const { adapter, minDelayMs, maxDelayMs } = built;
 
-    const sessions = await sb.getSessionsForCampaign(clientId, work.campaignId);
-    if (!sessions || sessions.length === 0) {
-      logger.warn('No sessions for campaign ' + work.campaignId + ', failing lead.');
-      await sb
-        .setClientStatusMessage(
-          clientId,
-          'No Instagram sender linked to this campaign. Open the campaign → Settings → Instagram accounts, attach an account, then Start again.'
-        )
-        .catch(() => {});
-      await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', 'no_instagram_session', SEND_WORKER_ID).catch(() => {});
-      await delay(randomDelay(2000, 5000));
+    const session = await sb.claimInstagramSessionForCampaign(clientId, work.campaignId, SEND_WORKER_ID, SEND_LEASE_SECONDS);
+    if (!session) {
+      logger.warn(`No Instagram session available for campaign ${work.campaignId}, waiting.`);
+      await sb.setClientStatusMessage(clientId, 'Waiting for an available Instagram session…').catch(() => {});
+      await delay(randomDelay(5000, 15000));
       continue;
     }
-    let state = campaignRoundRobin.get(work.campaignId);
-    if (!state) {
-      state = { lastIndex: -1 };
-      campaignRoundRobin.set(work.campaignId, state);
-    }
-    state.lastIndex = (state.lastIndex + 1) % sessions.length;
-    const session = sessions[state.lastIndex];
-    const ok = await ensurePageSession(session);
-    if (!ok) {
-      logger.warn('Could not load session for campaign, failing lead.');
+    const leaseHeartbeatMs = Math.max(30000, Math.min(60000, Math.floor((SEND_LEASE_SECONDS * 1000) / 2)));
+    let leaseHeartbeatTimer = null;
+    const startLeaseHeartbeat = () => {
+      if (leaseHeartbeatTimer) return;
+      leaseHeartbeatTimer = setInterval(() => {
+        sb.heartbeatInstagramSessionLease(session.id, SEND_WORKER_ID, SEND_LEASE_SECONDS).catch(() => {});
+      }, leaseHeartbeatMs);
+      if (typeof leaseHeartbeatTimer.unref === 'function') leaseHeartbeatTimer.unref();
+    };
+    const stopLeaseHeartbeat = () => {
+      if (leaseHeartbeatTimer) clearInterval(leaseHeartbeatTimer);
+      leaseHeartbeatTimer = null;
+    };
+
+    try {
+      startLeaseHeartbeat();
+      const ok = await ensurePageSession(session);
+      if (!ok) {
+        logger.warn('Could not load session for campaign, failing lead.');
+        await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', null, SEND_WORKER_ID).catch(() => {});
+        await delay(randomDelay(2000, 5000));
+        continue;
+      }
+
+      const options = {
+        clientId,
+        sendWorkerId: SEND_WORKER_ID,
+        messageOverride: work.messageText,
+        campaignId: work.campaignId,
+        campaignLeadId: work.campaignLeadId,
+        messageGroupId: work.messageGroupId,
+        messageGroupMessageId: work.messageGroupMessageId,
+        dailySendLimit: work.dailySendLimit,
+        hourlySendLimit: work.hourlySendLimit,
+        minDelaySec: work.minDelaySec,
+        maxDelaySec: work.maxDelaySec,
+        first_name: work.first_name,
+        last_name: work.last_name,
+        display_name: work.display_name,
+        voice_note_path: work.voiceNotePath || VOICE_NOTE_FILE || null,
+        voice_note_mode: work.voiceNoteMode || VOICE_NOTE_MODE || 'after_text',
+      };
+      sb.setClientStatusMessage(clientId, 'Sending…').catch(() => {});
+
+      // NEW: For voice notes, close browser, convert audio, relaunch so Chrome loads the new file.
+      const needsVoice = (options.voice_note_path || '').trim() !== '';
+      if (needsVoice && browser) {
+        let resolved = null;
+        try {
+          resolved = await resolveVoiceNotePath(options.voice_note_path);
+          if (resolved.localPath) {
+            const conv = convertToChromeFakeMicWav(resolved.localPath, logger);
+            options.voiceDurationSec = conv.durationSec;
+            await browser.close().catch(() => {});
+            browser = null;
+            page = null;
+            currentSessionId = null;
+            const okVoice = await ensurePageSession(session);
+            if (!okVoice) {
+              logger.warn('Could not restore session after voice browser restart.');
+            }
+          }
+        } catch (e) {
+          logger.warn('Voice browser restart failed: ' + (e.message || e));
+        } finally {
+          if (resolved) await resolved.cleanup().catch(() => {});
+        }
+      }
+
+      const sendResult = await sendDM(page, work.username, adapter, options);
+
+      let delayMs;
+      if (!sendResult.ok && sendResult.reason === 'hourly_limit') {
+        delayMs = randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
+        const msg = sendResult.statusMessage || 'hourly limit reached';
+        logger.log(`${msg}. Sleeping ${Math.round(delayMs / 60000)} minutes until window resets.`);
+        sb.setClientStatusMessage(clientId, `${msg}. Next send in ~60 min.`).catch(() => {});
+      } else if (!sendResult.ok && sendResult.reason === 'daily_limit') {
+        delayMs = randomDelay(5 * 60 * 1000, 10 * 60 * 1000);
+        const msg = sendResult.statusMessage || 'daily limit reached';
+        logger.log(`${msg}. Rechecking in ${Math.round(delayMs / 60000)} minutes.`);
+        sb.setClientStatusMessage(clientId, msg).catch(() => {});
+      } else if (!sendResult.ok && sendResult.reason === 'missing_delay_config') {
+        delayMs = 10 * 60 * 1000;
+        const msg = sendResult.statusMessage || 'campaign missing delay settings';
+        logger.warn(msg);
+        sb.setClientStatusMessage(clientId, msg).catch(() => {});
+      } else {
+        delayMs = sendResult.cooldownMs != null ? sendResult.cooldownMs : randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000);
+        const delaySec = Math.max(1, Math.ceil(delayMs / 1000));
+        const minSec = Math.max(0, Number(work.minDelaySec) || 0);
+        const maxSec = Math.max(0, Number(work.maxDelaySec) || 0);
+        logger.log(`Campaign cooldown from settings ${minSec}-${maxSec}s. Next send in ${delaySec} sec.`);
+        sb.setClientStatusMessage(clientId, `Waiting. Campaign cooldown ${delaySec} sec (settings ${minSec}-${maxSec}s).`).catch(() => {});
+      }
+      await delay(delayMs);
+    } catch (e) {
+      logger.error(`Unexpected send loop error for client ${clientId} campaign ${work.campaignId}: ${e.message}`, e);
       await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', null, SEND_WORKER_ID).catch(() => {});
       await delay(randomDelay(2000, 5000));
-      continue;
+    } finally {
+      stopLeaseHeartbeat();
+      await sb.releaseInstagramSessionLease(session.id, SEND_WORKER_ID).catch(() => {});
     }
-
-    const options = {
-      clientId,
-      sendWorkerId: SEND_WORKER_ID,
-      messageOverride: work.messageText,
-      campaignId: work.campaignId,
-      campaignLeadId: work.campaignLeadId,
-      messageGroupId: work.messageGroupId,
-      messageGroupMessageId: work.messageGroupMessageId,
-      dailySendLimit: work.dailySendLimit,
-      hourlySendLimit: work.hourlySendLimit,
-      minDelaySec: work.minDelaySec,
-      maxDelaySec: work.maxDelaySec,
-      first_name: work.first_name,
-      last_name: work.last_name,
-      display_name: work.display_name,
-      voice_note_path: work.voiceNotePath || VOICE_NOTE_FILE || null,
-      voice_note_mode: work.voiceNoteMode || VOICE_NOTE_MODE || 'after_text',
-    };
-    sb.setClientStatusMessage(clientId, 'Sending…').catch(() => {});
-
-    // NEW: For voice notes, close browser, convert audio, relaunch so Chrome loads the new file.
-    const needsVoice = (options.voice_note_path || '').trim() !== '';
-    if (needsVoice && browser) {
-      let resolved = null;
-      try {
-        resolved = await resolveVoiceNotePath(options.voice_note_path);
-        if (resolved.localPath) {
-          const conv = convertToChromeFakeMicWav(resolved.localPath, logger);
-          options.voiceDurationSec = conv.durationSec;
-          await browser.close().catch(() => {});
-          browser = null;
-          page = null;
-          currentSessionId = null;
-          const okVoice = await ensurePageSession(session);
-          if (!okVoice) {
-            logger.warn('Could not restore session after voice browser restart.');
-          }
-        }
-      } catch (e) {
-        logger.warn('Voice browser restart failed: ' + (e.message || e));
-      } finally {
-        if (resolved) await resolved.cleanup().catch(() => {});
-      }
-    }
-
-    const sendResult = await sendDM(page, work.username, adapter, options);
-
-    let delayMs;
-    if (!sendResult.ok && sendResult.reason === 'hourly_limit') {
-      delayMs = randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
-      const msg = sendResult.statusMessage || 'hourly limit reached';
-      logger.log(`${msg}. Sleeping ${Math.round(delayMs / 60000)} minutes until window resets.`);
-      sb.setClientStatusMessage(clientId, `${msg}. Next send in ~60 min.`).catch(() => {});
-    } else if (!sendResult.ok && sendResult.reason === 'daily_limit') {
-      delayMs = randomDelay(5 * 60 * 1000, 10 * 60 * 1000);
-      const msg = sendResult.statusMessage || 'daily limit reached';
-      logger.log(`${msg}. Rechecking in ${Math.round(delayMs / 60000)} minutes.`);
-      sb.setClientStatusMessage(clientId, msg).catch(() => {});
-    } else if (!sendResult.ok && sendResult.reason === 'missing_delay_config') {
-      delayMs = 10 * 60 * 1000;
-      const msg = sendResult.statusMessage || 'campaign missing delay settings';
-      logger.warn(msg);
-      sb.setClientStatusMessage(clientId, msg).catch(() => {});
-    } else {
-      delayMs = sendResult.cooldownMs != null ? sendResult.cooldownMs : randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000);
-      const delaySec = Math.max(1, Math.ceil(delayMs / 1000));
-      const minSec = Math.max(0, Number(work.minDelaySec) || 0);
-      const maxSec = Math.max(0, Number(work.maxDelaySec) || 0);
-      logger.log(`Campaign cooldown from settings ${minSec}-${maxSec}s. Next send in ${delaySec} sec.`);
-      sb.setClientStatusMessage(clientId, `Waiting. Campaign cooldown ${delaySec} sec (settings ${minSec}-${maxSec}s).`).catch(() => {});
-    }
-    await delay(delayMs);
   }
 }
 
