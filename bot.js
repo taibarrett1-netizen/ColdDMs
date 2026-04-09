@@ -192,6 +192,87 @@ async function logTermsUnblockVisibleButtons(page) {
   }
 }
 
+function wantsDmSearchDebugScreenshot() {
+  return (
+    process.env.DM_SEARCH_DEBUG_SCREENSHOTS === '1' ||
+    process.env.DM_SEARCH_DEBUG_SCREENSHOTS === 'true' ||
+    process.env.LOGIN_DEBUG_SCREENSHOTS === '1' ||
+    process.env.LOGIN_DEBUG_SCREENSHOTS === 'true' ||
+    process.env.LOGIN_DEBUG === '1' ||
+    process.env.LOGIN_DEBUG === 'true'
+  );
+}
+
+/** Full-page PNG when DM /direct/new search result click fails (same folder as login-debug). */
+async function saveDmSearchDebugScreenshot(page, label) {
+  if (!wantsDmSearchDebugScreenshot() || !page) return null;
+  try {
+    fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+    const safe = String(label || 'dm_search')
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]+/g, '_')
+      .slice(0, 48);
+    const out = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_${safe}.png`);
+    await page.screenshot({ path: out, fullPage: true });
+    logger.log(`[dm-search] debug screenshot=${out}`);
+    return out;
+  } catch (e) {
+    logger.warn('[dm-search] debug screenshot failed: ' + (e.message || e));
+    return null;
+  }
+}
+
+/**
+ * Always logs URL + page text snippet + light DOM counts when picking a search result fails.
+ * PNG only if DM_SEARCH_DEBUG_SCREENSHOTS or LOGIN_DEBUG* is set.
+ */
+async function logDmSearchFailureDiagnostics(page, username, searchPick) {
+  const u = String(username || '').trim().replace(/^@/, '');
+  let url = '';
+  let meta = {};
+  let snippet = '';
+  try {
+    url = page.url();
+    const data = await page.evaluate(() => {
+      const vis = (el) => {
+        try {
+          if (!el || el.disabled) return false;
+          if (el.type === 'hidden') return false;
+          return (el.getClientRects && el.getClientRects().length > 0) || el.offsetParent !== null;
+        } catch {
+          return false;
+        }
+      };
+      const body = (document.body && document.body.innerText ? document.body.innerText : '').replace(/\s+/g, ' ').trim();
+      return {
+        path: location.pathname,
+        title: (document.title || '').slice(0, 200),
+        listboxCount: document.querySelectorAll('[role="listbox"]').length,
+        dialogCount: document.querySelectorAll('[role="dialog"], [role="alertdialog"]').length,
+        visibleInputs: Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]')).filter(vis).length,
+        bodyLen: body.length,
+        bodySnippet: body.slice(0, 1200),
+      };
+    });
+    meta = {
+      path: data.path,
+      title: data.title,
+      listboxCount: data.listboxCount,
+      dialogCount: data.dialogCount,
+      visibleInputs: data.visibleInputs,
+      bodyLen: data.bodyLen,
+    };
+    snippet = data.bodySnippet;
+  } catch (e) {
+    snippet = '(read failed: ' + (e.message || e) + ')';
+  }
+  const pickLine = searchPick && searchPick.logLine ? searchPick.logLine : JSON.stringify(searchPick || {});
+  logger.warn(`[dm-search] failed @${u} pick={${pickLine}}`);
+  logger.warn(`[dm-search] url=${url} meta=${JSON.stringify(meta)}`);
+  logger.warn(`[dm-search] snippet=${snippet}`);
+  await saveDmSearchDebugScreenshot(page, `dm_search_fail_${u.replace(/[^a-z0-9_-]/gi, '_').slice(0, 40)}`);
+}
+
 /** Non-login Instagram URLs that mean we do not have a usable session (challenge, checkpoint, etc.). */
 function instagramAuthUrlFailureReason(url) {
   try {
@@ -1088,6 +1169,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     logLine: `evaluate_threw: ${e && e.message ? e.message : String(e)}`,
   }));
   if (!searchPick.ok) {
+    await logDmSearchFailureDiagnostics(page, u, searchPick).catch(() => {});
     return {
       ok: false,
       reason: searchPick.reason || 'search_result_select_failed',
