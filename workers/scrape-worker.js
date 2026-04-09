@@ -10,7 +10,7 @@ const logger = require('../utils/logger');
 const sb = require('../database/supabase');
 const { runFollowerScrape, runCommentScrape } = require('../scraper');
 
-const SCRAPER_POLL_MS = Math.max(2000, parseInt(process.env.SCRAPER_WORKER_POLL_MS || '5000', 10) || 5000);
+const SCRAPER_POLL_MS = Math.max(1000, parseInt(process.env.SCRAPER_WORKER_POLL_MS || '2000', 10) || 2000);
 const LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 
 function delay(ms) {
@@ -37,10 +37,12 @@ async function processOneJob(workerId, job) {
         );
       } else {
         const hint = await sb.describePlatformScraperPoolForLogs().catch(() => '');
-        logger.error(
+        const message =
           `[scrape-worker] could not reserve a platform scraper for job ${job.id} (need Puppeteer cookies on pool rows). ${hint} ` +
-            `Check PM2 stderr for [platform-scraper-reserve] (set PLATFORM_SCRAPER_RESERVE_DEBUG=1 for per-attempt success logs).`
-        );
+          `Check PM2 stderr for [platform-scraper-reserve] (set PLATFORM_SCRAPER_RESERVE_DEBUG=1 for per-attempt success logs).`;
+        logger.error(message);
+        await sb.retryScrapeJob(job.id, 'waiting_for_platform_scraper_session', 60, workerId).catch(() => {});
+        return;
       }
     }
 

@@ -18,6 +18,7 @@ const {
   saveScraperSession,
   createScrapeJob,
   updateScrapeJob,
+  retryScrapeJob,
   getScrapeJob,
   upsertLeadsBatch,
   getConversationParticipantUsernames,
@@ -161,10 +162,16 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           `job.platform_scraper_session_id=${job?.platform_scraper_session_id ?? 'null'} ` +
           `session_row=${session ? 'yes' : 'no'} cookie_count=${n}. ${poolHint}`
       );
-      await failScrapeJob(
+      await retryScrapeJob(
         jobId,
-        'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.'
-      );
+        'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.',
+        60
+      ).catch(async () => {
+        await failScrapeJob(
+          jobId,
+          'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.'
+        );
+      });
       return;
     }
 
@@ -1077,10 +1084,16 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           `job.platform_scraper_session_id=${job?.platform_scraper_session_id ?? 'null'} ` +
           `session_row=${session ? 'yes' : 'no'} cookie_count=${n}. ${poolHint}`
       );
-      await failScrapeJob(
+      await retryScrapeJob(
         jobId,
-        'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.'
-      );
+        'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.',
+        60
+      ).catch(async () => {
+        await failScrapeJob(
+          jobId,
+          'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.'
+        );
+      });
       return;
     }
 

@@ -3063,9 +3063,16 @@ async function runBotMultiTenant() {
   }
 
   for (;;) {
-    // Fresh DB read every iteration (no cache). After PM2 restart, first run sees current cold_dm_control, cold_dm_campaigns.status, and cold_dm_campaign_leads.
-    const next = await sb.getNextPendingWorkAnyClient(SEND_WORKER_ID, SEND_LEASE_SECONDS);
-    if (!next) {
+    await sb.workerHeartbeat(SEND_WORKER_ID, 'send', { pid: process.pid }).catch(() => {});
+    let claimedJob = await sb.claimColdDmSendJob(SEND_WORKER_ID, SEND_LEASE_SECONDS);
+    if (!claimedJob) {
+      const clientIds = await sb.getClientIdsWithPauseZero();
+      for (const cid of clientIds) {
+        await sb.syncSendJobsForClient(cid).catch(() => 0);
+      }
+      claimedJob = await sb.claimColdDmSendJob(SEND_WORKER_ID, SEND_LEASE_SECONDS);
+    }
+    if (!claimedJob) {
       const clientIds = await sb.getClientIdsWithPauseZero();
       if (clientIds.length === 0) {
         noPauseZeroEmptyRounds += 1;
@@ -3128,15 +3135,69 @@ async function runBotMultiTenant() {
       await delay(chunkMs);
       continue;
     }
-    const { clientId, work } = next;
+
+    const resolved = await sb.buildSendWorkFromJob(claimedJob.id).catch(() => null);
+    if (!resolved) {
+      await sb.updateSendJob(claimedJob.id, { status: 'failed', last_error_class: 'job_resolution_failed', last_error_message: 'Could not resolve send job payload.' }, SEND_WORKER_ID).catch(() => {});
+      await delay(randomDelay(1000, 3000));
+      continue;
+    }
+    if (resolved.disposition === 'cancelled') {
+      await sb.updateSendJob(claimedJob.id, {
+        status: 'cancelled',
+        last_error_class: resolved.reason || 'cancelled',
+        last_error_message: resolved.reason || 'cancelled',
+      }, SEND_WORKER_ID).catch(() => {});
+      await delay(randomDelay(500, 1500));
+      continue;
+    }
+    if (resolved.disposition === 'retry') {
+      await sb.updateSendJob(claimedJob.id, {
+        status: 'retry',
+        available_at: resolved.availableAt || new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+        last_error_class: resolved.reason || 'retry',
+        last_error_message: resolved.reason || 'retry',
+      }, SEND_WORKER_ID).catch(() => {});
+      await delay(randomDelay(500, 1500));
+      continue;
+    }
+    if (resolved.disposition === 'failed') {
+      if (resolved.work?.campaignLeadId) {
+        await sb.updateCampaignLeadStatus(resolved.work.campaignLeadId, 'failed', resolved.reason || null, SEND_WORKER_ID).catch(() => {});
+      } else if (resolved.job?.campaign_lead_id) {
+        await sb.updateCampaignLeadStatus(resolved.job.campaign_lead_id, 'failed', resolved.reason || null, SEND_WORKER_ID).catch(() => {});
+      }
+      await sb.updateSendJob(claimedJob.id, {
+        status: 'failed',
+        last_error_class: resolved.reason || 'failed',
+        last_error_message: resolved.reason || 'failed',
+      }, SEND_WORKER_ID).catch(() => {});
+      await delay(randomDelay(500, 1500));
+      continue;
+    }
+
+    const work = resolved.work;
+    const clientId = work.clientId;
     noPauseZeroEmptyRounds = 0;
     const pause = await sb.getControl(clientId);
     if (pause === '1' || pause === 1) {
+      await sb.updateSendJob(claimedJob.id, {
+        status: 'retry',
+        available_at: new Date(Date.now() + 30 * 1000).toISOString(),
+        last_error_class: 'client_paused',
+        last_error_message: 'client_paused',
+      }, SEND_WORKER_ID).catch(() => {});
       continue;
     }
     const built = await buildAdapterForClient(clientId);
     if (!built) {
       logger.warn('No adapter for client ' + clientId + ', skipping.');
+      await sb.updateSendJob(claimedJob.id, {
+        status: 'retry',
+        available_at: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+        last_error_class: 'missing_adapter',
+        last_error_message: 'missing_adapter',
+      }, SEND_WORKER_ID).catch(() => {});
       continue;
     }
     const { adapter, minDelayMs, maxDelayMs } = built;
@@ -3145,11 +3206,18 @@ async function runBotMultiTenant() {
     if (!session) {
       logger.warn(`No Instagram session available for campaign ${work.campaignId}, waiting.`);
       await sb.setClientStatusMessage(clientId, 'Waiting for an available Instagram session…').catch(() => {});
+      await sb.updateSendJob(claimedJob.id, {
+        status: 'retry',
+        available_at: new Date(Date.now() + randomDelay(15, 45) * 1000).toISOString(),
+        last_error_class: 'waiting_for_session',
+        last_error_message: 'waiting_for_session',
+      }, SEND_WORKER_ID).catch(() => {});
       await delay(randomDelay(5000, 15000));
       continue;
     }
     const leaseHeartbeatMs = Math.max(30000, Math.min(60000, Math.floor((SEND_LEASE_SECONDS * 1000) / 2)));
     let leaseHeartbeatTimer = null;
+    let sendJobHeartbeatTimer = null;
     const startLeaseHeartbeat = () => {
       if (leaseHeartbeatTimer) return;
       leaseHeartbeatTimer = setInterval(() => {
@@ -3157,17 +3225,34 @@ async function runBotMultiTenant() {
       }, leaseHeartbeatMs);
       if (typeof leaseHeartbeatTimer.unref === 'function') leaseHeartbeatTimer.unref();
     };
+    const startSendJobHeartbeat = () => {
+      if (sendJobHeartbeatTimer) return;
+      sendJobHeartbeatTimer = setInterval(() => {
+        sb.heartbeatSendJobLease(claimedJob.id, SEND_WORKER_ID, SEND_LEASE_SECONDS).catch(() => {});
+      }, leaseHeartbeatMs);
+      if (typeof sendJobHeartbeatTimer.unref === 'function') sendJobHeartbeatTimer.unref();
+    };
     const stopLeaseHeartbeat = () => {
       if (leaseHeartbeatTimer) clearInterval(leaseHeartbeatTimer);
       leaseHeartbeatTimer = null;
     };
+    const stopSendJobHeartbeat = () => {
+      if (sendJobHeartbeatTimer) clearInterval(sendJobHeartbeatTimer);
+      sendJobHeartbeatTimer = null;
+    };
 
     try {
       startLeaseHeartbeat();
+      startSendJobHeartbeat();
       const ok = await ensurePageSession(session);
       if (!ok) {
         logger.warn('Could not load session for campaign, failing lead.');
         await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', null, SEND_WORKER_ID).catch(() => {});
+        await sb.updateSendJob(claimedJob.id, {
+          status: 'failed',
+          last_error_class: 'session_load_failed',
+          last_error_message: 'session_load_failed',
+        }, SEND_WORKER_ID).catch(() => {});
         await delay(randomDelay(2000, 5000));
         continue;
       }
@@ -3220,21 +3305,41 @@ async function runBotMultiTenant() {
       const sendResult = await sendDM(page, work.username, adapter, options);
 
       let delayMs;
+      let sendJobStatus = 'completed';
+      let sendJobUpdates = {};
       if (!sendResult.ok && sendResult.reason === 'hourly_limit') {
         delayMs = randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
         const msg = sendResult.statusMessage || 'hourly limit reached';
         logger.log(`${msg}. Sleeping ${Math.round(delayMs / 60000)} minutes until window resets.`);
         sb.setClientStatusMessage(clientId, `${msg}. Next send in ~60 min.`).catch(() => {});
+        sendJobStatus = 'retry';
+        sendJobUpdates = {
+          available_at: new Date(Date.now() + delayMs).toISOString(),
+          last_error_class: 'hourly_limit',
+          last_error_message: msg,
+        };
       } else if (!sendResult.ok && sendResult.reason === 'daily_limit') {
         delayMs = randomDelay(5 * 60 * 1000, 10 * 60 * 1000);
         const msg = sendResult.statusMessage || 'daily limit reached';
         logger.log(`${msg}. Rechecking in ${Math.round(delayMs / 60000)} minutes.`);
         sb.setClientStatusMessage(clientId, msg).catch(() => {});
+        sendJobStatus = 'retry';
+        sendJobUpdates = {
+          available_at: new Date(Date.now() + delayMs).toISOString(),
+          last_error_class: 'daily_limit',
+          last_error_message: msg,
+        };
       } else if (!sendResult.ok && sendResult.reason === 'missing_delay_config') {
         delayMs = 10 * 60 * 1000;
         const msg = sendResult.statusMessage || 'campaign missing delay settings';
         logger.warn(msg);
         sb.setClientStatusMessage(clientId, msg).catch(() => {});
+        sendJobStatus = 'retry';
+        sendJobUpdates = {
+          available_at: new Date(Date.now() + delayMs).toISOString(),
+          last_error_class: 'missing_delay_config',
+          last_error_message: msg,
+        };
       } else {
         delayMs = sendResult.cooldownMs != null ? sendResult.cooldownMs : randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000);
         const delaySec = Math.max(1, Math.ceil(delayMs / 1000));
@@ -3242,14 +3347,28 @@ async function runBotMultiTenant() {
         const maxSec = Math.max(0, Number(work.maxDelaySec) || 0);
         logger.log(`Campaign cooldown from settings ${minSec}-${maxSec}s. Next send in ${delaySec} sec.`);
         sb.setClientStatusMessage(clientId, `Waiting. Campaign cooldown ${delaySec} sec (settings ${minSec}-${maxSec}s).`).catch(() => {});
+        if (!sendResult.ok) {
+          sendJobStatus = 'failed';
+          sendJobUpdates = {
+            last_error_class: sendResult.reason || 'send_failed',
+            last_error_message: sendResult.reason || 'send_failed',
+          };
+        }
       }
+      await sb.updateSendJob(claimedJob.id, { status: sendJobStatus, ...sendJobUpdates }, SEND_WORKER_ID).catch(() => {});
       await delay(delayMs);
     } catch (e) {
       logger.error(`Unexpected send loop error for client ${clientId} campaign ${work.campaignId}: ${e.message}`, e);
       await sb.updateCampaignLeadStatus(work.campaignLeadId, 'failed', null, SEND_WORKER_ID).catch(() => {});
+      await sb.updateSendJob(claimedJob.id, {
+        status: 'failed',
+        last_error_class: 'worker_exception',
+        last_error_message: e.message || 'worker_exception',
+      }, SEND_WORKER_ID).catch(() => {});
       await delay(randomDelay(2000, 5000));
     } finally {
       stopLeaseHeartbeat();
+      stopSendJobHeartbeat();
       await sb.releaseInstagramSessionLease(session.id, SEND_WORKER_ID).catch(() => {});
     }
   }

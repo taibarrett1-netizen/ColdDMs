@@ -16,7 +16,7 @@ module.exports = {
     {
       name: 'ig-dm-send',
       script: 'workers/send-worker.js',
-      instances: Math.max(1, parseInt(process.env.SEND_WORKER_INSTANCES || '4', 10) || 4),
+      instances: Math.max(1, parseInt(process.env.SEND_WORKER_INSTANCES || '8', 10) || 8),
       exec_mode: 'cluster',
       autorestart: false,
       max_restarts: 20,
@@ -25,6 +25,8 @@ module.exports = {
     {
       name: 'ig-dm-scrape',
       script: 'workers/scrape-worker.js',
+      instances: Math.max(1, parseInt(process.env.SCRAPE_WORKER_INSTANCES || '4', 10) || 4),
+      exec_mode: 'fork',
       autorestart: true,
       max_memory_restart: '1G',
       // Set in env or .env — do not commit secrets

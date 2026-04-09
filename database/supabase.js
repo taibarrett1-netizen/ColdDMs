@@ -446,6 +446,11 @@ function computeSendSessionLeaseUntil(leaseSec = 600) {
   return new Date(Date.now() + sec * 1000).toISOString();
 }
 
+function computeAvailableAtIso(delaySeconds = 0) {
+  const sec = Math.max(0, parseInt(delaySeconds, 10) || 0);
+  return new Date(Date.now() + sec * 1000).toISOString();
+}
+
 async function claimInstagramSessionLease(sessionId, workerId, leaseSeconds = 600) {
   const sb = getSupabase();
   if (!sb || !sessionId || !workerId) return false;
@@ -1581,6 +1586,13 @@ async function updateScrapeJob(jobId, updates) {
     payload.finished_at = new Date().toISOString();
     payload.leased_until = null;
     payload.leased_by_worker = null;
+    payload.available_at = payload.available_at || new Date().toISOString();
+  }
+  if (payload.status === 'retry' || payload.status === 'pending') {
+    payload.leased_until = null;
+    payload.leased_by_worker = null;
+    payload.finished_at = null;
+    payload.available_at = payload.available_at || new Date().toISOString();
   }
   const { error } = await sb.from('cold_dm_scrape_jobs').update(payload).eq('id', jobId);
   if (error) throw error;
@@ -1660,6 +1672,24 @@ async function claimColdDmScrapeJob(workerId, leaseSeconds = 240) {
     return null;
   }
   return claimColdDmScrapeJobFallback(workerId, leaseSeconds);
+}
+
+async function retryScrapeJob(jobId, errorMessage = null, delaySeconds = 60, workerId = null) {
+  const sb = getSupabase();
+  if (!sb || !jobId) throw new Error('Supabase or jobId missing');
+  const payload = {
+    status: 'retry',
+    error_message: errorMessage || 'retry_scheduled',
+    available_at: computeAvailableAtIso(delaySeconds),
+    leased_until: null,
+    leased_by_worker: null,
+    lease_heartbeat_at: new Date().toISOString(),
+    finished_at: null,
+  };
+  let q = sb.from('cold_dm_scrape_jobs').update(payload).eq('id', jobId);
+  if (workerId) q = q.eq('leased_by_worker', workerId);
+  const { error } = await q;
+  if (error) throw error;
 }
 
 /** Best-effort claim when RPC is missing or races (no SKIP LOCKED). */
@@ -1757,6 +1787,367 @@ async function workerHeartbeat(workerId, workerType, meta = {}) {
   } catch (e) {
     /* table may not exist until migration */
   }
+}
+
+async function createSendJob({
+  clientId,
+  campaignId,
+  campaignLeadId,
+  instagramSessionId = null,
+  username,
+  payload = {},
+  priority = 100,
+  availableAt = null,
+  idempotencyKey = null,
+}) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !campaignLeadId || !username) throw new Error('Missing createSendJob params');
+  const row = {
+    client_id: clientId,
+    campaign_id: campaignId || null,
+    campaign_lead_id: campaignLeadId,
+    instagram_session_id: instagramSessionId,
+    username: normalizeUsername(username),
+    payload: payload || {},
+    priority: Number.isFinite(Number(priority)) ? Number(priority) : 100,
+    available_at: availableAt || new Date().toISOString(),
+    idempotency_key: idempotencyKey || `campaign-lead:${campaignLeadId}`,
+    status: 'pending',
+  };
+  const { data, error } = await sb
+    .from('cold_dm_send_jobs')
+    .upsert(row, {
+      onConflict: 'client_id,idempotency_key',
+      ignoreDuplicates: true,
+    })
+    .select('id')
+    .limit(1);
+  if (error) throw error;
+  return Array.isArray(data) && data[0]?.id ? data[0].id : null;
+}
+
+async function updateSendJob(jobId, updates, workerId = null) {
+  const sb = getSupabase();
+  if (!sb || !jobId) throw new Error('Supabase or jobId missing');
+  const payload = { ...updates, updated_at: new Date().toISOString() };
+  if (payload.status === 'completed' || payload.status === 'failed' || payload.status === 'cancelled') {
+    payload.finished_at = new Date().toISOString();
+    payload.leased_until = null;
+    payload.leased_by_worker = null;
+  }
+  if (payload.status === 'retry' || payload.status === 'pending') {
+    payload.finished_at = null;
+    payload.leased_until = null;
+    payload.leased_by_worker = null;
+    payload.available_at = payload.available_at || new Date().toISOString();
+  }
+  let q = sb.from('cold_dm_send_jobs').update(payload).eq('id', jobId);
+  if (workerId) q = q.eq('leased_by_worker', workerId);
+  const { error } = await q;
+  if (error) throw error;
+}
+
+async function getSendJob(jobId) {
+  const sb = getSupabase();
+  if (!sb || !jobId) return null;
+  const { data, error } = await sb.from('cold_dm_send_jobs').select('*').eq('id', jobId).maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function claimColdDmSendJob(workerId, leaseSeconds = 240) {
+  const sb = getSupabase();
+  if (!sb || !workerId) return null;
+  const { data, error } = await sb.rpc('claim_cold_dm_send_job', {
+    p_worker_id: workerId,
+    p_lease_seconds: leaseSeconds,
+  });
+  if (!error) {
+    const rows = Array.isArray(data) ? data : data != null ? [data] : [];
+    if (rows.length > 0) return rows[0];
+    return null;
+  }
+  return claimColdDmSendJobFallback(workerId, leaseSeconds);
+}
+
+async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240) {
+  const sb = getSupabase();
+  if (!sb || !workerId) return null;
+  const nowIso = new Date().toISOString();
+  const { data: pending } = await sb
+    .from('cold_dm_send_jobs')
+    .select('id, attempt_count')
+    .in('status', ['pending', 'retry'])
+    .lte('available_at', nowIso)
+    .order('available_at', { ascending: true })
+    .order('priority', { ascending: true })
+    .order('created_at', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (!pending?.id) return null;
+  const leaseUntil = new Date(Date.now() + Math.max(30, leaseSeconds) * 1000).toISOString();
+  const nextAttempt = (pending.attempt_count || 0) + 1;
+  const { data: updated, error } = await sb
+    .from('cold_dm_send_jobs')
+    .update({
+      status: 'running',
+      leased_by_worker: workerId,
+      leased_until: leaseUntil,
+      lease_heartbeat_at: nowIso,
+      attempt_count: nextAttempt,
+      updated_at: nowIso,
+    })
+    .eq('id', pending.id)
+    .in('status', ['pending', 'retry'])
+    .select('*')
+    .maybeSingle();
+  if (error || !updated) return null;
+  return updated;
+}
+
+async function heartbeatSendJobLease(jobId, workerId, leaseSeconds = 240) {
+  const sb = getSupabase();
+  if (!sb || !jobId || !workerId) return false;
+  const { data, error } = await sb.rpc('heartbeat_cold_dm_send_job', {
+    p_job_id: jobId,
+    p_worker_id: workerId,
+    p_lease_seconds: leaseSeconds,
+  });
+  if (!error && data === true) return true;
+  if (!error && data === false) return false;
+  const leaseUntil = new Date(Date.now() + Math.max(30, leaseSeconds) * 1000).toISOString();
+  const { data: rows, error: uerr } = await sb
+    .from('cold_dm_send_jobs')
+    .update({ leased_until: leaseUntil, lease_heartbeat_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+    .eq('id', jobId)
+    .eq('leased_by_worker', workerId)
+    .eq('status', 'running')
+    .select('id');
+  return !uerr && rows && rows.length > 0;
+}
+
+async function syncSendJobsForCampaign(clientId, campaignId) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !campaignId) return 0;
+  await addCampaignLeadsFromGroups(clientId, campaignId).catch(() => 0);
+  const { data: campaign } = await sb
+    .from('cold_dm_campaigns')
+    .select('id, status')
+    .eq('client_id', clientId)
+    .eq('id', campaignId)
+    .maybeSingle();
+  if (!campaign || campaign.status !== 'active') return 0;
+
+  const { data: leadRows, error: leadErr } = await sb
+    .from('cold_dm_campaign_leads')
+    .select('id, lead_id, status')
+    .eq('campaign_id', campaignId)
+    .eq('status', 'pending');
+  if (leadErr) throw leadErr;
+  if (!leadRows?.length) return 0;
+
+  const leadIds = leadRows.map((r) => r.lead_id).filter(Boolean);
+  if (leadIds.length === 0) return 0;
+  const { data: leads, error: leadsErr } = await sb
+    .from('cold_dm_leads')
+    .select('id, username')
+    .eq('client_id', clientId)
+    .in('id', leadIds);
+  if (leadsErr) throw leadsErr;
+  const usernameByLeadId = new Map((leads || []).map((r) => [r.id, r.username]));
+
+  const { data: existingJobs, error: existingErr } = await sb
+    .from('cold_dm_send_jobs')
+    .select('campaign_lead_id')
+    .eq('client_id', clientId)
+    .eq('campaign_id', campaignId)
+    .in('status', ['pending', 'running', 'retry']);
+  if (existingErr) throw existingErr;
+  const existingLeadIds = new Set((existingJobs || []).map((r) => r.campaign_lead_id).filter(Boolean));
+
+  const rows = [];
+  for (const row of leadRows) {
+    if (!row?.id || existingLeadIds.has(row.id)) continue;
+    const username = usernameByLeadId.get(row.lead_id);
+    if (!username) continue;
+    rows.push({
+      client_id: clientId,
+      campaign_id: campaignId,
+      campaign_lead_id: row.id,
+      username: normalizeUsername(username),
+      payload: {},
+      status: 'pending',
+      priority: 100,
+      available_at: new Date().toISOString(),
+      idempotency_key: `campaign-lead:${row.id}`,
+    });
+  }
+  if (rows.length === 0) return 0;
+  const { error } = await sb.from('cold_dm_send_jobs').upsert(rows, {
+    onConflict: 'client_id,idempotency_key',
+    ignoreDuplicates: true,
+  });
+  if (error) throw error;
+  return rows.length;
+}
+
+async function syncSendJobsForClient(clientId, campaignId = null) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return 0;
+  if (campaignId) return syncSendJobsForCampaign(clientId, campaignId);
+  const campaigns = await getActiveCampaigns(clientId);
+  let total = 0;
+  for (const campaign of campaigns) {
+    total += await syncSendJobsForCampaign(clientId, campaign.id).catch(() => 0);
+  }
+  return total;
+}
+
+async function buildSendWorkFromJob(jobId) {
+  const sb = getSupabase();
+  if (!sb || !jobId) return null;
+  const job = await getSendJob(jobId);
+  if (!job || !job.client_id || !job.campaign_id || !job.campaign_lead_id) return null;
+  const { data: campaign } = await sb
+    .from('cold_dm_campaigns')
+    .select(
+      'id, client_id, name, status, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec, send_voice_note, voice_note_storage_path, voice_note_mode'
+    )
+    .eq('id', job.campaign_id)
+    .eq('client_id', job.client_id)
+    .maybeSingle();
+  if (!campaign || campaign.status !== 'active') {
+    return { job, disposition: 'cancelled', reason: 'campaign_inactive' };
+  }
+  const { data: leadLink } = await sb
+    .from('cold_dm_campaign_leads')
+    .select('id, lead_id, status')
+    .eq('id', job.campaign_lead_id)
+    .maybeSingle();
+  if (!leadLink || leadLink.status !== 'pending') {
+    return { job, disposition: 'cancelled', reason: 'campaign_lead_not_pending' };
+  }
+  const { data: lead } = await sb
+    .from('cold_dm_leads')
+    .select('id, username, first_name, last_name, display_name')
+    .eq('id', leadLink.lead_id)
+    .eq('client_id', job.client_id)
+    .maybeSingle();
+  if (!lead?.username) {
+    return { job, disposition: 'failed', reason: 'missing_lead_row' };
+  }
+
+  let messageText = null;
+  let messageGroupMessageId = null;
+  let voiceNotePath = null;
+  let voiceNoteMode = campaign.voice_note_mode || 'after_text';
+  if (campaign.message_group_id) {
+    const groupMsg = await getRandomMessageFromGroup(campaign.message_group_id);
+    if (groupMsg) {
+      messageText = groupMsg.message_text;
+      messageGroupMessageId = groupMsg.id;
+      if (groupMsg.send_voice_note && groupMsg.voice_note_storage_path) {
+        voiceNotePath = groupMsg.voice_note_storage_path;
+      }
+    }
+  }
+  if (!messageText && campaign.message_template_id) {
+    messageText = await getMessageTemplateById(campaign.message_template_id);
+  }
+  if (!voiceNotePath && campaign.send_voice_note && campaign.voice_note_storage_path) {
+    voiceNotePath = campaign.voice_note_storage_path;
+  }
+  if (!messageText) {
+    return { job, disposition: 'failed', reason: 'no_message_text' };
+  }
+  if (!hasValidCampaignSendDelayConfig(campaign)) {
+    return { job, disposition: 'retry', reason: 'missing_delay_config', availableAt: computeAvailableAtIso(10 * 60) };
+  }
+  if (!isWithinSchedule(campaign.schedule_start_time, campaign.schedule_end_time, campaign.timezone ?? null)) {
+    const nextStart = getNextScheduleStartInTimezone(campaign.schedule_start_time, campaign.timezone ?? null);
+    return {
+      job,
+      disposition: 'retry',
+      reason: 'outside_schedule',
+      availableAt: nextStart ? nextStart.toISOString() : computeAvailableAtIso(15 * 60),
+    };
+  }
+  const scrapeBlocklistSet = await getScrapeBlocklistUsernames(job.client_id);
+  const unameNorm = normalizeUsername(lead.username).toLowerCase();
+  if (scrapeBlocklistSet.has(unameNorm)) {
+    return { job, disposition: 'failed', reason: 'blocklist', lead, campaign, messageText, messageGroupMessageId, voiceNotePath, voiceNoteMode };
+  }
+  return {
+    job,
+    disposition: 'ready',
+    work: {
+      clientId: job.client_id,
+      campaignLeadId: job.campaign_lead_id,
+      campaignId: job.campaign_id,
+      leadId: leadLink.lead_id,
+      username: normalizeUsername(lead.username),
+      first_name: lead.first_name ?? null,
+      last_name: lead.last_name ?? null,
+      display_name: lead.display_name ?? null,
+      messageText,
+      messageGroupId: campaign.message_group_id || null,
+      messageGroupMessageId: messageGroupMessageId || null,
+      dailySendLimit: campaign.daily_send_limit,
+      hourlySendLimit: campaign.hourly_send_limit,
+      minDelaySec: campaign.min_delay_sec,
+      maxDelaySec: campaign.max_delay_sec,
+      voiceNotePath,
+      voiceNoteMode,
+    },
+  };
+}
+
+async function getColdDmQueueHealthSnapshot() {
+  const sb = getSupabase();
+  if (!sb) return null;
+  const nowIso = new Date().toISOString();
+  const [sendRes, scrapeRes, followUpRes, workerRes] = await Promise.all([
+    sb.from('cold_dm_send_jobs').select('status, available_at, created_at'),
+    sb.from('cold_dm_scrape_jobs').select('status, available_at, started_at'),
+    sb.from('cold_dm_follow_up_queue').select('status, scheduled_for, created_at'),
+    sb.from('cold_dm_worker_heartbeats').select('worker_id, worker_type, last_seen_at'),
+  ]);
+
+  const sendRows = sendRes.data || [];
+  const scrapeRows = scrapeRes.data || [];
+  const followUpRows = followUpRes.data || [];
+  const workerRows = workerRes.data || [];
+
+  const pendingSend = sendRows.filter((r) => ['pending', 'retry', 'running'].includes(r.status)).length;
+  const pendingScrape = scrapeRows.filter((r) => ['pending', 'retry', 'running'].includes(r.status)).length;
+  const pendingFollowUps = followUpRows.filter((r) => ['pending', 'processing'].includes(r.status)).length;
+  const oldestSend = sendRows
+    .filter((r) => ['pending', 'retry'].includes(r.status))
+    .map((r) => r.available_at || r.created_at)
+    .filter(Boolean)
+    .sort()[0] || null;
+  const oldestScrape = scrapeRows
+    .filter((r) => ['pending', 'retry'].includes(r.status))
+    .map((r) => r.available_at || r.started_at)
+    .filter(Boolean)
+    .sort()[0] || null;
+  const oldestFollowUp = followUpRows
+    .filter((r) => r.status === 'pending')
+    .map((r) => r.scheduled_for || r.created_at)
+    .filter(Boolean)
+    .sort()[0] || null;
+  const activeWorkers = workerRows.filter((r) => r.last_seen_at && r.last_seen_at >= new Date(Date.now() - 2 * 60 * 1000).toISOString());
+  return {
+    now: nowIso,
+    send_jobs: { pending: pendingSend, oldest_available_at: oldestSend },
+    scrape_jobs: { pending: pendingScrape, oldest_available_at: oldestScrape },
+    follow_up_queue: { pending: pendingFollowUps, oldest_scheduled_for: oldestFollowUp },
+    workers: {
+      send: activeWorkers.filter((r) => r.worker_type === 'send').length,
+      scrape: activeWorkers.filter((r) => r.worker_type === 'scrape').length,
+      scheduler: activeWorkers.filter((r) => r.worker_type === 'scheduler').length,
+    },
+  };
 }
 
 /** Returns Set of normalised usernames in cold_dm_scrape_blocklist (do not scrape as leads or cold-DM). */
@@ -2548,11 +2939,17 @@ module.exports = {
   getSentUsernames,
   createScrapeJob,
   updateScrapeJob,
+  retryScrapeJob,
   getScrapeJob,
   getLatestScrapeJob,
   cancelScrapeJob,
   claimColdDmScrapeJob,
   heartbeatScrapeJobLease,
+  createSendJob,
+  updateSendJob,
+  getSendJob,
+  claimColdDmSendJob,
+  heartbeatSendJobLease,
   workerHeartbeat,
   tryVpsIdempotencyOnce,
   upsertLead,
@@ -2574,4 +2971,8 @@ module.exports = {
   getUserAccountName,
   addCampaignLeadsFromGroups,
   reactivateCampaignsWithPendingLeads,
+  syncSendJobsForCampaign,
+  syncSendJobsForClient,
+  buildSendWorkFromJob,
+  getColdDmQueueHealthSnapshot,
 };

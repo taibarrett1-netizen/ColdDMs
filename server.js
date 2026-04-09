@@ -26,12 +26,10 @@ const {
   saveScraperSession,
   getLatestScrapeJob,
   createScrapeJob,
-  updateScrapeJob,
   cancelScrapeJob,
-  reservePlatformScraperSessionForWorker,
-  releasePlatformScraperSessionLease,
   savePlatformScraperSession,
   addCampaignLeadsFromGroups,
+  syncSendJobsForClient,
   getNoWorkHint,
   getCampaignsMissingSendDelays,
   reactivateCampaignsWithPendingLeads,
@@ -47,7 +45,7 @@ const {
   scheduleDebugFollowUpBrowser,
   previewDmLeadNamesFromSession,
 } = require('./bot');
-const { connectScraper, runFollowerScrape, runCommentScrape } = require('./scraper');
+const { connectScraper } = require('./scraper');
 const { MESSAGES } = require('./config/messages');
 const logger = require('./utils/logger');
 
@@ -188,32 +186,7 @@ const BOT_PM2_NAME = 'ig-dm-bot';
 const SEND_WORKER_ENTRY = process.env.SEND_WORKER_ENTRY || 'workers/send-worker.js';
 /** After the worker exits (--no-autorestart), PM2 keeps a stopped app with this name. `pm2 start script --name` then fails as duplicate; `pm2 restart name` starts the stopped process. Fallback creates the app if missing. */
 const PM2_ENSURE_SEND_WORKER_CMD = `pm2 restart ${BOT_PM2_NAME} || pm2 start ${SEND_WORKER_ENTRY} --name ${BOT_PM2_NAME} --no-autorestart`;
-const MAX_CONCURRENT_FOLLOW_UPS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_FOLLOW_UPS || '3', 10) || 3);
-const MAX_CONCURRENT_SCRAPERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_SCRAPERS || '2', 10) || 2);
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
-const SCRAPE_DEFER_TO_WORKER =
-  process.env.SCRAPE_DEFER_TO_WORKER === '1' || process.env.SCRAPE_DEFER_TO_WORKER === 'true';
-let activeFollowUpRequests = 0;
-let activeScraperJobs = 0;
-
-function tryAcquire(kind) {
-  if (kind === 'followUp') {
-    if (activeFollowUpRequests >= MAX_CONCURRENT_FOLLOW_UPS) return false;
-    activeFollowUpRequests += 1;
-    return true;
-  }
-  if (kind === 'scraper') {
-    if (activeScraperJobs >= MAX_CONCURRENT_SCRAPERS) return false;
-    activeScraperJobs += 1;
-    return true;
-  }
-  return false;
-}
-
-function release(kind) {
-  if (kind === 'followUp' && activeFollowUpRequests > 0) activeFollowUpRequests -= 1;
-  if (kind === 'scraper' && activeScraperJobs > 0) activeScraperJobs -= 1;
-}
 
 function getBotProcessRunning(cb) {
   exec('pm2 jlist', { maxBuffer: 1024 * 1024 }, (err, stdout) => {
@@ -509,9 +482,6 @@ app.post('/api/follow-up/send', followUpLimiter, async (req, res) => {
       logger.warn('[API] follow-up/send idempotency error (continuing)', e.message || e);
     }
   }
-  if (!tryAcquire('followUp')) {
-    return res.status(429).json({ ok: false, error: 'Too many concurrent follow-up sends. Try again shortly.' });
-  }
   const sid = (body.instagramSessionId || '').trim();
   const recip = (body.recipientUsername || '').trim().replace(/^@/, '');
   let mode = 'unknown';
@@ -555,8 +525,6 @@ app.post('/api/follow-up/send', followUpLimiter, async (req, res) => {
   } catch (e) {
     logger.error('[API] follow-up/send exception', e);
     return res.status(500).json({ ok: false, error: e.message || 'Internal error' });
-  } finally {
-    release('followUp');
   }
 });
 
@@ -581,9 +549,6 @@ app.post('/api/debug/preview-dm-names', async (req, res) => {
   if (!cid) {
     return res.status(400).json({ ok: false, error: 'clientId is required' });
   }
-  if (!tryAcquire('followUp')) {
-    return res.status(429).json({ ok: false, error: 'Too many concurrent browser jobs. Try again shortly.' });
-  }
   try {
     const result = await previewDmLeadNamesFromSession(body);
     let status = 200;
@@ -598,8 +563,6 @@ app.post('/api/debug/preview-dm-names', async (req, res) => {
   } catch (e) {
     logger.error('[API] debug/preview-dm-names exception', e);
     return res.status(500).json({ ok: false, error: e.message || 'Internal error' });
-  } finally {
-    release('followUp');
   }
 });
 
@@ -990,6 +953,9 @@ app.post('/api/control/start', async (req, res) => {
       console.error('[API] reactivateCampaignsWithPendingLeads', e);
     }
     await setControlSupabase(clientId, 0).catch((e) => console.error('[API] setControlSupabase', e));
+    await syncSendJobsForClient(clientId, campaignId || null).catch((e) => {
+      console.error('[API] syncSendJobsForClient', e);
+    });
     console.log('[API] Start (pause=0) for clientId=', clientId);
     res.json({ ok: true, processRunning: true });
     exec(
@@ -1052,7 +1018,8 @@ app.post('/api/campaigns/add-leads-from-groups', async (req, res) => {
   }
   try {
     const added = await addCampaignLeadsFromGroups(clientId, campaignId);
-    return res.json({ ok: true, added });
+    const queued = await syncSendJobsForClient(clientId, campaignId).catch(() => 0);
+    return res.json({ ok: true, added, queued_send_jobs: queued });
   } catch (e) {
     console.error('[API] add-leads-from-groups', e);
     return res.status(500).json({ ok: false, error: e.message });
@@ -1152,8 +1119,6 @@ app.post('/api/scraper/start', async (req, res) => {
     .toLowerCase();
   const scrapeType =
     rawType === 'comments' ? 'comments' : rawType === 'following' ? 'following' : 'followers';
-  let workerId = null;
-  let reservedPlatformSession = null;
 
   if (!clientId) {
     return res.status(400).json({ ok: false, error: 'clientId is required' });
@@ -1172,115 +1137,29 @@ app.post('/api/scraper/start', async (req, res) => {
     }
   }
 
-  if (SCRAPE_DEFER_TO_WORKER) {
-    try {
-      const targetForJob =
-        scrapeType === 'comments' ? '_comment_scrape' : target_username.trim().replace(/^@/, '');
-      const requestedMaxLeads = max_leads != null && max_leads > 0 ? max_leads : null;
-      const effectiveMaxLeads = requestedMaxLeads != null && requestedMaxLeads > 0 ? requestedMaxLeads : null;
-      const jobId = await createScrapeJob(
-        clientId,
-        targetForJob,
-        lead_group_id || null,
-        scrapeType,
-        scrapeType === 'comments' ? post_urls : null,
-        null,
-        effectiveMaxLeads != null && effectiveMaxLeads > 0 ? effectiveMaxLeads : null,
-        'instagrapi'
-      );
-      return res.json({
-        ok: true,
-        jobId,
-        mode: 'queued',
-        deferred: true,
-        hint: 'SCRAPE_DEFER_TO_WORKER: run PM2 process ig-dm-scrape (workers/scrape-worker.js) to execute jobs.',
-      });
-    } catch (e) {
-      console.error('[API] Scraper enqueue error', e);
-      return res.status(500).json({ ok: false, error: e.message });
-    }
-  }
-
   try {
-    if (!tryAcquire('scraper')) {
-      return res.status(429).json({ ok: false, error: 'Too many concurrent scraper jobs. Try again shortly.' });
-    }
-    workerId = `api-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    reservedPlatformSession = await reservePlatformScraperSessionForWorker(workerId, SCRAPER_SESSION_LEASE_SEC).catch(
-      () => null
-    );
     const targetForJob =
       scrapeType === 'comments' ? '_comment_scrape' : target_username.trim().replace(/^@/, '');
-
     const requestedMaxLeads = max_leads != null && max_leads > 0 ? max_leads : null;
     const effectiveMaxLeads = requestedMaxLeads != null && requestedMaxLeads > 0 ? requestedMaxLeads : null;
-
     const jobId = await createScrapeJob(
       clientId,
       targetForJob,
       lead_group_id || null,
       scrapeType,
       scrapeType === 'comments' ? post_urls : null,
-      reservedPlatformSession?.id || null,
+      null,
       effectiveMaxLeads != null && effectiveMaxLeads > 0 ? effectiveMaxLeads : null,
-      'instagrapi' // legacy value; worker is not used when Puppeteer path is active
+      'instagrapi'
     );
-    await updateScrapeJob(jobId, {
-      status: 'running',
-      leased_by_worker: workerId,
-      leased_until: new Date(Date.now() + SCRAPER_SESSION_LEASE_SEC * 1000).toISOString(),
-      lease_heartbeat_at: new Date().toISOString(),
-      attempt_count: 1,
-    }).catch(() => {});
-
-    // Kick off legacy Puppeteer scraper in the background (do not await).
-    const scrapeLeaseOpts = {
-      jobId,
-      workerId,
-      leaseSec: SCRAPER_SESSION_LEASE_SEC,
-      platformSessionId: reservedPlatformSession?.id || null,
-    };
-
-    if (scrapeType === 'followers' || scrapeType === 'following') {
-      runFollowerScrape(String(clientId), String(jobId), targetForJob, {
-        maxLeads: effectiveMaxLeads,
-        leadGroupId: lead_group_id || null,
-        leaseOptions: scrapeLeaseOpts,
-        listKind: scrapeType === 'following' ? 'following' : 'followers',
-      }).catch((err) => {
-        console.error('[API] runFollowerScrape error', err);
-      }).finally(async () => {
-        release('scraper');
-        if (reservedPlatformSession?.id) {
-          await releasePlatformScraperSessionLease(reservedPlatformSession.id, workerId).catch(() => {});
-        }
-      });
-    } else {
-      runCommentScrape(String(clientId), String(jobId), post_urls || [], {
-        maxLeads: effectiveMaxLeads,
-        leadGroupId: lead_group_id || null,
-        leaseOptions: scrapeLeaseOpts,
-      }).catch((err) => {
-        console.error('[API] runCommentScrape error', err);
-      }).finally(async () => {
-        release('scraper');
-        if (reservedPlatformSession?.id) {
-          await releasePlatformScraperSessionLease(reservedPlatformSession.id, workerId).catch(() => {});
-        }
-      });
-    }
-
     res.json({
       ok: true,
       jobId,
-      mode: 'puppeteer_legacy',
-      platformScraperSessionId: reservedPlatformSession?.id || null,
+      mode: 'queued',
+      deferred: true,
+      hint: 'Run PM2 process ig-dm-scrape (workers/scrape-worker.js) to drain scrape jobs.',
     });
   } catch (e) {
-    release('scraper');
-    if (reservedPlatformSession?.id) {
-      await releasePlatformScraperSessionLease(reservedPlatformSession.id, workerId).catch(() => {});
-    }
     console.error('[API] Scraper start error', e);
     res.status(500).json({ ok: false, error: e.message });
   }
