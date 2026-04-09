@@ -1016,12 +1016,28 @@ async function runComposeDiagnostic(page) {
         return false;
       }
     };
-    const composers = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"]')).filter(vis);
-    const compose = composers.find((el) => {
+    const composers = Array.from(
+      document.querySelectorAll(
+        'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]'
+      )
+    ).filter(vis);
+    let compose = composers.find((el) => {
       const ph = (el.getAttribute('placeholder') || '').toLowerCase();
       const aria = (el.getAttribute('aria-label') || '').toLowerCase();
       return ph.includes('message') || aria.includes('message');
     });
+    if (!compose && composers.length) {
+      const vwGuess = document.documentElement.clientWidth || 1200;
+      compose =
+        [...composers].reverse().find((el) => {
+          try {
+            const r = el.getBoundingClientRect();
+            return r.width > 48 && r.height > 16 && r.left > vwGuess * 0.3;
+          } catch {
+            return false;
+          }
+        }) || null;
+    }
     let paneScopedSnippet = '';
     if (compose) {
       const vw = document.documentElement.clientWidth || 1200;
@@ -1320,7 +1336,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           const t = clean(s).toLowerCase();
           if (!t) return true;
           if (t === needle || t === `@${needle}` || containsUsernameToken(t)) return true;
-          if (t.length < 2 || t.length > 80) return true;
+          if (t.length < 2 || t.length > 120) return true;
           if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return true;
           // Inbox-only relative time token (not a person name).
           if (/^\d{1,3}\s*[mhdw]$/i.test(t)) return true;
@@ -1332,13 +1348,30 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (t === needle || t === `@${needle}`) return 'equals_username';
           if (containsUsernameToken(t)) return 'contains_username_token';
           if (t.length < 2) return 'too_short';
-          if (t.length > 80) return 'too_long';
+          if (t.length > 120) return 'too_long';
           if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return 'ui_label';
           if (/^\d{1,3}\s*[mhdw]$/i.test(t)) return 'relative_time_token';
           return 'unknown';
         };
 
-        /** @type {{ ctx: string, rawPreview: string, splitPieces: string[], nonUserPieces: string[], usedFirstNonUserPiece: boolean, afterSplit: string, afterStripUsername: string, rejected?: string, out: string }[]} */
+        /** Remove handle when glued to display text (e.g. "…AIaquareach.aiAudio…") where token regex misses. */
+        const stripNeedleLiteralAll = (s) => {
+          let out = s;
+          const n = needle.length;
+          if (!n) return out;
+          for (;;) {
+            const idx = out.toLowerCase().indexOf(needle);
+            if (idx === -1) break;
+            out = clean(out.slice(0, idx) + out.slice(idx + n));
+          }
+          return out;
+        };
+
+        /** IG often concatenates header actions onto the title without spaces. */
+        const stripHeaderUiTail = (s) =>
+          clean(s.replace(/\s*(Audio call|Video call|Conversation information|Voice call)\b[\s\S]*$/i, ''));
+
+        /** @type {{ ctx: string, rawPreview: string, splitPieces: string[], nonUserPieces: string[], usedFirstNonUserPiece: boolean, joinedBulletSegments?: boolean, afterSplit: string, afterStripUsername: string, rejected?: string, out: string }[]} */
         const normalizationTraces = [];
 
         const normalizeCandidateName = (raw, ctx) => {
@@ -1348,6 +1381,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             splitPieces: /** @type {string[]} */ ([]),
             nonUserPieces: /** @type {string[]} */ ([]),
             usedFirstNonUserPiece: false,
+            joinedBulletSegments: false,
             afterSplit: '',
             afterStripUsername: '',
             rejected: /** @type {string|undefined} */ (undefined),
@@ -1369,11 +1403,23 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             trace.nonUserPieces = nonUserPieces.slice(0, 12);
             if (nonUserPieces.length) {
               trace.usedFirstNonUserPiece = true;
-              t = nonUserPieces[0];
+              trace.joinedBulletSegments = true;
+              t = clean(
+                nonUserPieces
+                  .map((p) => stripHeaderUiTail(stripNeedleLiteralAll(p)))
+                  .filter(Boolean)
+                  .join(' • ')
+              );
             }
           }
           trace.afterSplit = t.slice(0, 200);
-          t = clean(t.replace(/\binstagram\b/gi, '').replace(new RegExp(`@?${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'gi'), ''));
+          t = clean(
+            stripHeaderUiTail(
+              t
+                .replace(/\binstagram\b/gi, '')
+                .replace(new RegExp(`@?${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'gi'), ' ')
+            )
+          );
           trace.afterStripUsername = t.slice(0, 200);
           if (tooGeneric(t)) {
             trace.rejected = tooGenericReason(t);
@@ -1398,12 +1444,28 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
               return false;
             }
           };
-          const composers = Array.from(document.querySelectorAll('textarea, div[contenteditable="true"]')).filter(vis);
-          const compose = composers.find((el) => {
+          const composers = Array.from(
+            document.querySelectorAll(
+              'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]'
+            )
+          ).filter(vis);
+          let compose = composers.find((el) => {
             const ph = (el.getAttribute('placeholder') || '').toLowerCase();
             const aria = (el.getAttribute('aria-label') || '').toLowerCase();
             return ph.includes('message') || aria.includes('message');
           });
+          if (!compose && composers.length) {
+            const vwGuess = document.documentElement.clientWidth || 1200;
+            compose =
+              [...composers].reverse().find((el) => {
+                try {
+                  const r = el.getBoundingClientRect();
+                  return r.width > 48 && r.height > 16 && r.left > vwGuess * 0.3;
+                } catch {
+                  return false;
+                }
+              }) || null;
+          }
           if (!compose) return { el: document.body, composeFound: false };
           const vw = document.documentElement.clientWidth || 1200;
           const minLeft = Math.max(0, compose.getBoundingClientRect().left - 48);
