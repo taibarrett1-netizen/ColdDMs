@@ -1336,7 +1336,13 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 
   // When lead has no display_name/first_name in DB but template uses {{first_name}}/{{full_name}}, get name from thread page (e.g. "AI Setter Test 8 aisettertest8")
   const templateUsesName = /\{\{\s*(first_name|full_name)\s*\}\}/i.test(messageTemplate);
-  let displayNameForSubst = nameFallback.display_name ?? nameFallback.first_name ?? null;
+  const preferThreadName = sendOpts.preferThreadName === true || sendOpts.dryRunNames === true;
+  let displayNameForSubst = preferThreadName ? null : nameFallback.display_name ?? nameFallback.first_name ?? null;
+  let resolvedNameSource = displayNameForSubst
+    ? nameFallback.display_name
+      ? 'fallback_display_name'
+      : 'fallback_first_name'
+    : null;
   let nameExtractionDebugSnapshot = null;
   const nameExtractionDebugLog =
     !!sendOpts.dryRunNames ||
@@ -1344,7 +1350,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     process.env.NAME_EXTRACTION_DEBUG === '1' ||
     process.env.NAME_EXTRACTION_DEBUG === 'true';
 
-  if (templateUsesName && !displayNameForSubst && (!nameFallback.display_name || !nameFallback.first_name)) {
+  if (templateUsesName && (preferThreadName || !displayNameForSubst) && (!nameFallback.display_name || !nameFallback.first_name || preferThreadName)) {
     try {
       const extractionResult = await page.evaluate((username) => {
         const needle = username.replace(/^@/, '').toLowerCase();
@@ -1857,8 +1863,11 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           } else if (blocklist.has(normalizedFirst.toLowerCase())) {
             logger.log(`Display name from thread for @${u} not used: first name "${normalizedFirst}" is blocklisted`);
           } else {
-            displayNameForSubst = extracted;
-            logger.log(`Using display name from thread for @${u}: "${extracted}"`);
+            if (preferThreadName || !displayNameForSubst) {
+              displayNameForSubst = extracted;
+              resolvedNameSource = 'thread';
+              logger.log(`Using display name from thread for @${u}: "${extracted}"`);
+            }
           }
         }
       }
@@ -1922,6 +1931,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       first_name: derivedNames.first_name || null,
       last_name: derivedNames.last_name || null,
       full_name: fullNameOut || null,
+      resolved_name_source: resolvedNameSource,
       composeFound,
       pane_scoped_snippet: diag.paneScopedSnippet || null,
       body_snippet: diag.bodySnippet || null,
@@ -2130,6 +2140,7 @@ async function previewDmLeadNamesFromSession(body) {
 
     const result = await sendDMOnce(page, targetUsername, '{{first_name}}', nameFallback, {
       dryRunNames: true,
+      preferThreadName: true,
       firstNameBlocklist,
       senderName: senderAccountName,
     });
