@@ -221,7 +221,7 @@ async function assertHealthyInstagramSessionOrThrow(page, contextLabel) {
     throw new Error(
       `No Instagram session cookie after ${contextLabel || 'login'}. Instagram never issued a web session (Meta blocked or left the flow incomplete — not a false positive from our checker). ` +
         `Why VPS often works: same datacenter IP + browser fingerprint may already be trusted. Residential is a new IP/device every time until sticky + warmup. ` +
-        `Try: (1) Default proxy geo is UK (gb); set DECODO_GATE_COUNTRY=us (etc.) or none if wrong for that account. Reconnect so proxy_url updates. ` +
+        `Try: (1) Proxy geo is random by default; set DECODO_GATE_COUNTRY=us/gb/etc. (or none for random). Reconnect so proxy_url updates. ` +
         `(2) Log in once in Chrome/Firefox using the exact proxy_url from Supabase, finish any checkpoint, then Connect on the VPS. ` +
         `(3) Use 2FA on Connect if the account has it.`
     );

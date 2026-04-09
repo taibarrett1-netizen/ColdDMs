@@ -247,12 +247,13 @@ function normalizeDecodoGateCountryCode(code) {
 }
 
 /**
- * Fixed geo default: **UK (`gb`)** for residential (1 IG account → 1 sticky session; align exit with account locale).
- * Override: `DECODO_GATE_COUNTRY=us` (any ISO2). Disable country pin: `DECODO_GATE_COUNTRY=none`.
+ * Country pin for residential routing.
+ * Default: no pin (random pool / provider default). Set DECODO_GATE_COUNTRY=us (or any ISO2) to force a country.
+ * Disable pin explicitly: DECODO_GATE_COUNTRY=none.
  */
 function getDecodoGateCountryCodeEffective() {
   const raw = process.env.DECODO_GATE_COUNTRY;
-  if (raw === undefined || raw === null) return 'gb';
+  if (raw === undefined || raw === null) return '';
   const t = String(raw).trim().toLowerCase();
   if (t === '' || t === 'none' || t === 'off' || t === '-' || t === 'any') return '';
   return normalizeDecodoGateCountryCode(t);
