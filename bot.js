@@ -1351,6 +1351,16 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
         const tokenRegex = new RegExp(`(^|[^a-z0-9._])@?${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9._]|$)`, 'i');
         const containsUsernameToken = (s) => tokenRegex.test(clean(s).toLowerCase());
+        /** Profile link aria is often navigation copy, not a display name (e.g. "Open the profile page of user"). */
+        const isIgProfileNavAria = (s) => {
+          const x = clean(s).toLowerCase();
+          if (!x) return false;
+          if (/\bopen\s+the\s+profile\s+page\s+of\b/.test(x)) return true;
+          if (/^go\s+to\s+profile\b/.test(x)) return true;
+          if (/^see\s+profile\b/.test(x)) return true;
+          if (/^visit\s+profile\b/.test(x)) return true;
+          return false;
+        };
         const tooGeneric = (s) => {
           const t = clean(s).toLowerCase();
           if (!t) return true;
@@ -1361,6 +1371,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (/^\d{1,3}\s*[mhdw]$/i.test(t)) return true;
           // IG thread chrome (profile link parent is often only this).
           if (/^view\s*profile$/i.test(t)) return true;
+          // After stripping handle from IG nav aria-labels ("Open the profile page of {user}").
+          if (/^open\s+the\s+profile\s+page(\s+of)?$/.test(t)) return true;
           if (/^(follow|following|requested|message|share|more|options|report)$/i.test(t)) return true;
           if (/^conversation information$/i.test(t)) return true;
           return false;
@@ -1375,6 +1387,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return 'ui_label';
           if (/^\d{1,3}\s*[mhdw]$/i.test(t)) return 'relative_time_token';
           if (/^view\s*profile$/i.test(t)) return 'ig_view_profile_chrome';
+          if (/^open\s+the\s+profile\s+page(\s+of)?$/.test(t)) return 'ig_profile_nav_aria';
           if (/^(follow|following|requested|message|share|more|options|report)$/i.test(t)) return 'ig_action_chrome';
           if (/^conversation information$/i.test(t)) return 'ig_conversation_info';
           return 'unknown';
@@ -1770,7 +1783,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         for (const a of profileAnchorsWide) {
           if (!inThreadColumn(a)) continue;
           const al = (a.getAttribute('aria-label') || '').trim();
-          if (!al || /^view\s*profile$/i.test(al)) continue;
+          if (!al || /^view\s*profile$/i.test(al) || isIgProfileNavAria(al)) continue;
           const cleanedAria = al.replace(/\s*,?\s*verified\s*$/i, '').trim();
           const t = normalizeCandidateName(cleanedAria, 'step5:profile_aria_label');
           if (t) {
