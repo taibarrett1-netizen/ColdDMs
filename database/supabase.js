@@ -1657,6 +1657,38 @@ async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId 
   return rows.length;
 }
 
+/**
+ * Upsert lead identity fields discovered during DM flow.
+ * Saves canonical display_name and optional first/last names for future templating.
+ */
+async function upsertLeadIdentity(clientId, username, identity = {}) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const u = normalizeUsername(username);
+  if (!u) return false;
+
+  const displayName = typeof identity.display_name === 'string' ? identity.display_name.trim() : '';
+  const firstName = typeof identity.first_name === 'string' ? identity.first_name.trim() : '';
+  const lastName = typeof identity.last_name === 'string' ? identity.last_name.trim() : '';
+  if (!displayName && !firstName && !lastName) return false;
+
+  const row = {
+    client_id: clientId,
+    username: u,
+    added_at: new Date().toISOString(),
+  };
+  if (displayName) row.display_name = displayName;
+  if (firstName) row.first_name = firstName;
+  if (lastName) row.last_name = lastName;
+
+  const { error } = await sb.from('cold_dm_leads').upsert(row, {
+    onConflict: 'client_id,username',
+    ignoreDuplicates: false,
+  });
+  if (error) throw error;
+  return true;
+}
+
 // --- Campaigns ---
 // Campaign config (timezone, schedule, limits, delays) is read from DB on every get-next-work / can-run check. Do not cache; re-evaluate when user changes campaign in dashboard.
 /** Campaigns with status = active only (sending / queue materialization). */
@@ -2228,6 +2260,7 @@ module.exports = {
   tryVpsIdempotencyOnce,
   upsertLead,
   upsertLeadsBatch,
+  upsertLeadIdentity,
   getActiveCampaigns,
   getMessageTemplateById,
   getNextPendingCampaignLead,

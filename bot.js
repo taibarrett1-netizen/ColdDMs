@@ -925,16 +925,50 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       const extracted = await page.evaluate((username) => {
         const needle = username.replace(/^@/, '').toLowerCase();
         const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
+        const tokenRegex = new RegExp(`(^|[^a-z0-9._])@?${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9._]|$)`, 'i');
+        const containsUsernameToken = (s) => tokenRegex.test(clean(s).toLowerCase());
         const tooGeneric = (s) => {
           const t = clean(s).toLowerCase();
           if (!t) return true;
-          if (t === needle || t === `@${needle}`) return true;
+          if (t === needle || t === `@${needle}` || containsUsernameToken(t)) return true;
           if (t.length < 2 || t.length > 80) return true;
           if (/^(message|send message|chat|details|info|back|next|cancel)$/i.test(t)) return true;
           return false;
         };
+        const normalizeCandidateName = (raw) => {
+          let t = clean(raw);
+          if (!t) return '';
+          const splitPieces = t
+            .split(/[|·•]/g)
+            .map((x) => clean(x))
+            .filter(Boolean);
+          if (splitPieces.length > 1) {
+            const nonUserPieces = splitPieces.filter((p) => !containsUsernameToken(p) && !/^instagram$/i.test(p));
+            if (nonUserPieces.length) t = nonUserPieces[0];
+          }
+          t = clean(t.replace(/\binstagram\b/gi, '').replace(new RegExp(`@?${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'gi'), ''));
+          if (tooGeneric(t)) return '';
+          return t;
+        };
 
-        // 1) Prefer thread header title/name when available.
+        // 1) Prefer DM thread header relation:
+        // line with username (small) + nearby line with display name (larger).
+        const headerRoots = Array.from(document.querySelectorAll('header, [role="banner"]'));
+        for (const root of headerRoots) {
+          const lines = (root.innerText || '')
+            .split(/\n/)
+            .map((x) => clean(x))
+            .filter(Boolean);
+          for (let i = 0; i < lines.length; i++) {
+            if (!containsUsernameToken(lines[i])) continue;
+            const prev = i > 0 ? normalizeCandidateName(lines[i - 1]) : '';
+            if (prev) return prev;
+            const next = i + 1 < lines.length ? normalizeCandidateName(lines[i + 1]) : '';
+            if (next) return next;
+          }
+        }
+
+        // 2) Prefer thread header title/name when available.
         const headerCandidates = [];
         const selectors = [
           'header h1',
@@ -946,8 +980,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         ];
         for (const sel of selectors) {
           document.querySelectorAll(sel).forEach((el) => {
-            const txt = clean(el.textContent || '');
-            if (!tooGeneric(txt)) headerCandidates.push(txt);
+            const txt = normalizeCandidateName(el.textContent || '');
+            if (txt) headerCandidates.push(txt);
           });
         }
         if (headerCandidates.length) {
@@ -956,18 +990,18 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           return headerCandidates[0];
         }
 
-        // 2) Try visible links that point to this profile and use nearby text.
+        // 3) Try visible links that point to this profile and use nearby text.
         const profileLink = Array.from(document.querySelectorAll('a[href*="instagram.com/"], a[href^="/"]')).find((a) => {
           const href = (a.getAttribute('href') || '').toLowerCase();
           return href.includes(`/${needle}`) || href === `/${needle}/` || href === `/${needle}`;
         });
         if (profileLink) {
           const parent = profileLink.closest('header') || profileLink.parentElement || profileLink;
-          const txt = clean(parent.textContent || '');
-          if (!tooGeneric(txt)) return txt;
+          const txt = normalizeCandidateName(parent.textContent || '');
+          if (txt) return txt;
         }
 
-        // 3) Legacy fallback: infer from body text around username.
+        // 4) Legacy fallback: infer from body text around username.
         const body = document.body ? document.body.innerText : '';
         const idx = body.toLowerCase().indexOf(needle);
         if (idx > 0) {
@@ -975,7 +1009,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           const lines = before.split(/\n/);
           const lastPart = (lines[lines.length - 1] || '').trim();
           const candidate = lastPart.length > 0 && lastPart.length <= 80 && !/^https?:\/\//i.test(lastPart) ? lastPart : (before.length > 0 && before.length <= 80 ? before : null);
-          if (candidate && !/^\d+$/.test(candidate) && !tooGeneric(candidate)) return candidate;
+          const normalized = normalizeCandidateName(candidate || '');
+          if (candidate && !/^\d+$/.test(candidate) && normalized) return normalized;
         }
         return null;
       }, u);
@@ -1003,6 +1038,21 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     last_name: nameFallback.last_name ?? null,
     display_name: displayNameForSubst ?? nameFallback.display_name ?? null,
   };
+  const deriveNamesFromLead = (lead) => {
+    const fromDisplay = typeof lead.display_name === 'string' ? lead.display_name.trim() : '';
+    if (fromDisplay) {
+      const words = fromDisplay.split(/\s+/).filter(Boolean);
+      if (words.length > 0) {
+        const first = normalizeName(words[0]);
+        const last = words.length > 1 ? normalizeName(words.slice(1).join(' ')) : '';
+        return { first_name: first || null, last_name: last || null };
+      }
+    }
+    const f = normalizeName((lead.first_name || '').trim());
+    const l = normalizeName((lead.last_name || '').trim());
+    return { first_name: f || null, last_name: l || null };
+  };
+  const derivedNames = deriveNamesFromLead(leadFromPage);
   const msg = substituteVariables(messageTemplate, leadFromPage, {
     firstNameBlocklist: sendOpts.firstNameBlocklist || new Set(),
     onFirstNameEmpty: (reason) => logger.warn(`First name empty for @${u}: ${reason}`),
@@ -1099,6 +1149,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         finalMessage: textSent ? msg : null,
         instagramThreadId: threadId,
         display_name: leadFromPage.display_name || undefined,
+        first_name: derivedNames.first_name || undefined,
+        last_name: derivedNames.last_name || undefined,
       };
     }
     if (voiceFailure) return { ok: false, reason: voiceFailure };
@@ -1124,6 +1176,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       finalMessage: msg,
       instagramThreadId: threadId,
       display_name: leadFromPage.display_name || undefined,
+      first_name: derivedNames.first_name || undefined,
+      last_name: derivedNames.last_name || undefined,
     };
   }
 
@@ -1134,6 +1188,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       finalMessage: null,
       instagramThreadId: threadId,
       display_name: leadFromPage.display_name || undefined,
+      first_name: derivedNames.first_name || undefined,
+      last_name: derivedNames.last_name || undefined,
     };
   }
   if (voiceFailure) return { ok: false, reason: voiceFailure };
@@ -1605,6 +1661,13 @@ async function sendDM(page, username, adapter, options = {}) {
         const finalMessage = result.finalMessage != null ? result.finalMessage : (resolvedVoiceMode === 'voice_only' ? '' : messageTemplate);
         await Promise.resolve(logSent('success', finalMessage));
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent', null, sendWorkerId).catch(() => {});
+        if (options.clientId && (result.display_name || result.first_name || result.last_name) && typeof sb.upsertLeadIdentity === 'function') {
+          sb.upsertLeadIdentity(options.clientId, u, {
+            display_name: result.display_name,
+            first_name: result.first_name,
+            last_name: result.last_name,
+          }).catch(() => {});
+        }
         if (options.clientId && result.instagramThreadId) {
           const payload = {
             client_id: options.clientId,
@@ -1616,6 +1679,8 @@ async function sendDM(page, username, adapter, options = {}) {
             message_group_message_id: messageGroupMessageId || undefined,
           };
           if (result.display_name) payload.display_name = result.display_name;
+          if (result.first_name) payload.first_name = result.first_name;
+          if (result.last_name) payload.last_name = result.last_name;
           coldDmOnSend(payload).catch(() => {});
         }
         logger.log(`Sent to @${u}: ${(finalMessage || messageTemplate).slice(0, 30)}...`);
