@@ -530,11 +530,37 @@ function campaignSendLeaseStaleBeforeIso() {
   return new Date(Date.now() - staleSec * 1000).toISOString();
 }
 
-function isMissingLeaseColumnsError(error) {
+/** Postgres undefined_column or PostgREST "column does not exist" style errors. */
+function isLikelyPgMissingColumnError(error) {
   if (!error) return false;
   const code = String(error.code || '').trim();
+  if (code === '42703') return true;
   const msg = String(error.message || '').toLowerCase();
-  return code === '42703' || msg.includes('leased_by_worker') || msg.includes('leased_until') || msg.includes('lease_heartbeat_at');
+  return msg.includes('does not exist') && (msg.includes('column') || msg.includes('field'));
+}
+
+/**
+ * cold_dm_instagram_sessions + cold_dm_send_jobs use leased_until / leased_by_worker / lease_heartbeat_at.
+ * Do not match campaign send_lease_* errors (substring "leased_until" inside "send_leased_until" was bypassing the campaign mutex).
+ */
+function isMissingStandardLeaseColumnsError(error) {
+  if (!isLikelyPgMissingColumnError(error)) return false;
+  const msg = String(error.message || '').toLowerCase();
+  if (msg.includes('send_leased') || msg.includes('send_lease_heartbeat')) return false;
+  return (
+    msg.includes('leased_until') || msg.includes('leased_by_worker') || msg.includes('lease_heartbeat_at')
+  );
+}
+
+/** cold_dm_campaigns campaign-level send worker lease columns. */
+function isMissingCampaignSendLeaseColumnsError(error) {
+  if (!isLikelyPgMissingColumnError(error)) return false;
+  const msg = String(error.message || '').toLowerCase();
+  return (
+    msg.includes('send_leased_until') ||
+    msg.includes('send_leased_by_worker') ||
+    msg.includes('send_lease_heartbeat_at')
+  );
 }
 
 /**
@@ -565,7 +591,7 @@ async function claimInstagramSessionLease(sessionId, workerId, leaseSeconds = 60
     query = build(query);
     const { data, error } = await query.select('id').limit(1);
     if (!error && data && data.length > 0) return true;
-    if (isMissingLeaseColumnsError(error)) {
+    if (isMissingStandardLeaseColumnsError(error)) {
       // Backward compatibility: schema missing lease columns.
       // Treat as claimable so single-worker mode still functions until migration runs.
       const { data: exists, error: existsErr } = await sb
@@ -614,7 +640,7 @@ async function heartbeatInstagramSessionLease(sessionId, workerId, leaseSeconds 
     .eq('leased_by_worker', workerId)
     .select('id')
     .limit(1);
-  if (isMissingLeaseColumnsError(error)) return true;
+  if (isMissingStandardLeaseColumnsError(error)) return true;
   return !error && !!(data && data.length > 0);
 }
 
@@ -628,7 +654,7 @@ async function releaseInstagramSessionLease(sessionId, workerId) {
     .eq('id', sessionId);
   if (workerId) q = q.eq('leased_by_worker', workerId);
   const { error } = await q;
-  if (isMissingLeaseColumnsError(error)) return;
+  if (isMissingStandardLeaseColumnsError(error)) return;
 }
 
 /**
@@ -684,7 +710,7 @@ async function claimCampaignSendLease(campaignId, workerId, leaseSeconds = 240) 
     query = build(query);
     const { data, error } = await query.select('id').limit(1);
     if (!error && data && data.length > 0) return true;
-    if (isMissingLeaseColumnsError(error)) {
+    if (isMissingCampaignSendLeaseColumnsError(error)) {
       const { data: exists, error: existsErr } = await sb.from('cold_dm_campaigns').select('id').eq('id', campaignId).limit(1);
       if (!existsErr && exists && exists.length > 0) return true;
     }
@@ -708,7 +734,7 @@ async function heartbeatCampaignSendLease(campaignId, workerId, leaseSeconds = 2
     .eq('send_leased_by_worker', workerId)
     .select('id')
     .limit(1);
-  if (isMissingLeaseColumnsError(error)) return true;
+  if (isMissingCampaignSendLeaseColumnsError(error)) return true;
   return !error && !!(data && data.length > 0);
 }
 
@@ -727,7 +753,7 @@ async function releaseCampaignSendLease(campaignId, workerId) {
     .eq('id', campaignId);
   if (workerId) q = q.eq('send_leased_by_worker', workerId);
   const { error } = await q;
-  if (isMissingLeaseColumnsError(error)) return;
+  if (isMissingCampaignSendLeaseColumnsError(error)) return;
 }
 
 async function releaseAllCampaignSendLeases(workerId = null) {
@@ -2346,7 +2372,7 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
     .eq('campaign_id', campaignId);
   if (!existingErr) {
     existingJobs = existingWithLease || [];
-  } else if (isMissingLeaseColumnsError(existingErr) || String(existingErr.message || '').toLowerCase() === 'bad request') {
+  } else if (isMissingStandardLeaseColumnsError(existingErr) || String(existingErr.message || '').toLowerCase() === 'bad request') {
     // Backward compatibility if lease columns are missing in this DB.
     const { data: existingLegacy, error: legacyErr } = await sb
       .from('cold_dm_send_jobs')
@@ -2403,7 +2429,7 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
         updated_at: nowIso,
       })
       .in('id', staleRunningJobIds);
-    if (fullReset?.error && isMissingLeaseColumnsError(fullReset.error)) {
+    if (fullReset?.error && isMissingStandardLeaseColumnsError(fullReset.error)) {
       await sb
         .from('cold_dm_send_jobs')
         .update({
