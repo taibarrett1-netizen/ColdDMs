@@ -3158,6 +3158,30 @@ async function runBotMultiTenant() {
   let currentSessionId = null;
   /** Retries when cold_dm_control has no pause=0 yet (race right after dashboard Start). */
   let noPauseZeroEmptyRounds = 0;
+  /** Set while this worker holds an IG session lease — PM2 stop may not run `finally` before exit. */
+  let leasedSessionIdForSignal = null;
+  process.once('SIGTERM', () => {
+    void (async () => {
+      const sid = leasedSessionIdForSignal;
+      if (sid) {
+        logger.warn('[send-worker] SIGTERM: releasing Instagram session lease');
+        await sb.releaseInstagramSessionLease(sid, SEND_WORKER_ID).catch(() => {});
+        leasedSessionIdForSignal = null;
+      }
+      process.exit(0);
+    })();
+  });
+  process.once('SIGINT', () => {
+    void (async () => {
+      const sid = leasedSessionIdForSignal;
+      if (sid) {
+        logger.warn('[send-worker] SIGINT: releasing Instagram session lease');
+        await sb.releaseInstagramSessionLease(sid, SEND_WORKER_ID).catch(() => {});
+        leasedSessionIdForSignal = null;
+      }
+      process.exit(0);
+    })();
+  });
 
   function proxyKeyForSession(session) {
     return session && session.proxy_url ? String(session.proxy_url).trim() : '';
@@ -3429,6 +3453,7 @@ async function runBotMultiTenant() {
       await delay(randomDelay(5000, 15000));
       continue;
     }
+    leasedSessionIdForSignal = session.id;
     const leaseHeartbeatMs = Math.max(30000, Math.min(60000, Math.floor((SEND_LEASE_SECONDS * 1000) / 2)));
     let leaseHeartbeatTimer = null;
     let sendJobHeartbeatTimer = null;
@@ -3584,6 +3609,7 @@ async function runBotMultiTenant() {
       stopLeaseHeartbeat();
       stopSendJobHeartbeat();
       await sb.releaseInstagramSessionLease(session.id, SEND_WORKER_ID).catch(() => {});
+      leasedSessionIdForSignal = null;
     }
   }
 }

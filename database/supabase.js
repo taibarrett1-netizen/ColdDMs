@@ -514,11 +514,24 @@ function computeAvailableAtIso(delaySeconds = 0) {
   return new Date(Date.now() + sec * 1000).toISOString();
 }
 
+function instagramLeaseStaleBeforeIso(leaseSeconds = 600) {
+  const staleSec = Math.max(
+    45,
+    parseInt(process.env.INSTAGRAM_SESSION_LEASE_STALE_SEC || '120', 10) || 120
+  );
+  return new Date(Date.now() - staleSec * 1000).toISOString();
+}
+
+/**
+ * After PM2 stop / crash, leased_until can stay in the future for many minutes while no process heartbeats.
+ * Allow reclaim when heartbeat is missing or older than INSTAGRAM_SESSION_LEASE_STALE_SEC (default 120s).
+ */
 async function claimInstagramSessionLease(sessionId, workerId, leaseSeconds = 600) {
   const sb = getSupabase();
   if (!sb || !sessionId || !workerId) return false;
   const nowIso = new Date().toISOString();
   const leaseUntil = computeSendSessionLeaseUntil(leaseSeconds);
+  const staleBefore = instagramLeaseStaleBeforeIso(leaseSeconds);
   const updatePayload = {
     leased_by_worker: workerId,
     leased_until: leaseUntil,
@@ -527,6 +540,10 @@ async function claimInstagramSessionLease(sessionId, workerId, leaseSeconds = 60
   const attempts = [
     (q) => q.is('leased_until', null),
     (q) => q.lte('leased_until', nowIso),
+    (q) =>
+      q
+        .gt('leased_until', nowIso)
+        .or(`lease_heartbeat_at.lt.${staleBefore},lease_heartbeat_at.is.null`),
   ];
   for (const build of attempts) {
     let query = sb.from('cold_dm_instagram_sessions').update(updatePayload).eq('id', sessionId);
@@ -541,7 +558,16 @@ async function claimInstagramSessionForCampaign(clientId, campaignId, workerId, 
   const sessions = await getSessionsForCampaign(clientId, campaignId);
   if (!sessions?.length) return null;
   const now = Date.now();
-  const eligible = sessions.filter((s) => !s.leased_until || new Date(s.leased_until).getTime() <= now);
+  const staleMs =
+    Math.max(45, parseInt(process.env.INSTAGRAM_SESSION_LEASE_STALE_SEC || '120', 10) || 120) * 1000;
+  const heartbeatStale = (s) => {
+    if (s.lease_heartbeat_at == null || s.lease_heartbeat_at === '') return true;
+    return new Date(s.lease_heartbeat_at).getTime() < now - staleMs;
+  };
+  const eligible = sessions.filter((s) => {
+    if (!s.leased_until || new Date(s.leased_until).getTime() <= now) return true;
+    return heartbeatStale(s);
+  });
   for (const candidate of eligible) {
     const ok = await claimInstagramSessionLease(candidate.id, workerId, leaseSeconds);
     if (ok) {
@@ -576,6 +602,28 @@ async function releaseInstagramSessionLease(sessionId, workerId) {
     .eq('id', sessionId);
   if (workerId) q = q.eq('leased_by_worker', workerId);
   await q;
+}
+
+/**
+ * Clear all IG session leases. Call when send workers are stopped (e.g. dashboard Stop) so rows are not
+ * stuck until leased_until expires; PM2 often kills processes before bot.js finally runs.
+ */
+async function releaseAllInstagramSessionLeases() {
+  const sb = getSupabase();
+  if (!sb) return { released: 0 };
+  const nowIso = new Date().toISOString();
+  const { data, error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .update({
+      leased_until: null,
+      leased_by_worker: null,
+      lease_heartbeat_at: nowIso,
+      updated_at: nowIso,
+    })
+    .or('leased_by_worker.not.is.null,leased_until.not.is.null')
+    .select('id');
+  if (error) throw error;
+  return { released: (data || []).length };
 }
 
 function normalizeInstagramKey(instagramUsername) {
@@ -3252,6 +3300,7 @@ module.exports = {
   claimInstagramSessionForCampaign,
   heartbeatInstagramSessionLease,
   releaseInstagramSessionLease,
+  releaseAllInstagramSessionLeases,
   saveSession,
   isAdminUser,
   countActiveVpsInstagramSessions,

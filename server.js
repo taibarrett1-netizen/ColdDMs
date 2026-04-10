@@ -38,6 +38,7 @@ const {
   reactivateCampaignsWithPendingLeads,
   tryVpsIdempotencyOnce,
   getOrResolveColdDmProxyUrl,
+  releaseAllInstagramSessionLeases,
 } = require('./database/supabase');
 const {
   loadLeadsFromCSV,
@@ -1308,6 +1309,11 @@ app.post('/api/control/stop', (req, res) => {
   if (isSupabaseConfigured()) {
     if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
     setControlSupabase(clientId, 1).catch((e) => console.error('[API] setControlSupabase', e));
+    releaseAllInstagramSessionLeases()
+      .then((r) => {
+        if (r.released > 0) console.log(`[API] Cleared ${r.released} Instagram session lease(s) after stop`);
+      })
+      .catch((e) => console.error('[API] releaseAllInstagramSessionLeases', e));
     console.log('[API] Stop (pause=1) for clientId=', clientId);
     res.json({ ok: true, processRunning: false });
     exec(`pm2 stop ${BOT_PM2_NAME}`, () => {});
