@@ -612,7 +612,7 @@ async function releaseAllInstagramSessionLeases() {
   const sb = getSupabase();
   if (!sb) return { released: 0 };
   const nowIso = new Date().toISOString();
-  const { data, error } = await sb
+  const primary = await sb
     .from('cold_dm_instagram_sessions')
     .update({
       leased_until: null,
@@ -622,8 +622,13 @@ async function releaseAllInstagramSessionLeases() {
     })
     .or('leased_by_worker.not.is.null,leased_until.not.is.null')
     .select('id');
-  if (error) throw error;
-  return { released: (data || []).length };
+  if (!primary.error) return { released: (primary.data || []).length };
+  // Backward compatibility: older DBs may not have leased_* columns yet.
+  const msg = String(primary.error?.message || '').toLowerCase();
+  if (primary.error?.code === '42703' || msg.includes('does not exist')) {
+    return { released: 0, skipped: true, reason: 'lease_columns_missing' };
+  }
+  throw primary.error;
 }
 
 function normalizeInstagramKey(instagramUsername) {

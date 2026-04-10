@@ -1690,13 +1690,85 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     await dismissInstagramHomeModals(page, logger);
     await delay(500);
   } catch (e) {
+    // Instagram sometimes leaves us on /direct/t/... but only the inbox list is rendered (no right pane composer yet).
+    // Try one recovery pass: open the thread row / accept request / click message-like CTA, then re-check compose.
+    const recovery = await page
+      .evaluate((usernameRaw) => {
+        const username = (usernameRaw || '').replace(/^@/, '').toLowerCase().trim();
+        const visible = (el) => {
+          try {
+            return !!el && el.offsetParent !== null;
+          } catch {
+            return false;
+          }
+        };
+        const textOf = (el) => ((el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase());
+        const clickEl = (el) => {
+          if (!el) return false;
+          const btn = el.closest('button, a, [role="button"]') || el;
+          try {
+            btn.scrollIntoView({ block: 'center' });
+          } catch {}
+          try {
+            btn.click();
+            return true;
+          } catch {
+            return false;
+          }
+        };
+
+        // 1) If a request gate exists, accept/reply first so composer becomes available.
+        const ctas = Array.from(document.querySelectorAll('button, [role="button"], a')).filter(visible);
+        const acceptLike = ctas.find((el) => {
+          const t = textOf(el);
+          return (
+            t === 'accept' ||
+            t === 'allow' ||
+            t === 'reply' ||
+            t === 'message' ||
+            t === 'send message' ||
+            t === 'chat' ||
+            t === 'continue'
+          );
+        });
+        if (acceptLike && clickEl(acceptLike)) return { clicked: 'cta:' + textOf(acceptLike) };
+
+        // 2) Re-open the currently targeted thread row from list if username is visible.
+        if (username) {
+          const threadRows = Array.from(
+            document.querySelectorAll('a[href*="/direct/t/"], [role="link"][href*="/direct/t/"], div[role="button"]')
+          ).filter(visible);
+          const row = threadRows.find((el) => textOf(el).includes(username));
+          if (row && clickEl(row)) return { clicked: 'thread_row_for_username' };
+        }
+
+        // 3) Fallback: click any visible /direct/t/ link to force thread pane render.
+        const anyThreadLink = Array.from(document.querySelectorAll('a[href*="/direct/t/"]')).find(visible);
+        if (anyThreadLink && clickEl(anyThreadLink)) return { clicked: 'thread_row_generic' };
+        return { clicked: null };
+      }, u)
+      .catch(() => ({ clicked: null }));
+    if (recovery?.clicked) {
+      logger.log(`Compose recovery click: ${recovery.clicked}`);
+      await delay(1800);
+      await dismissInstagramHomeModals(page, logger);
+      try {
+        await page.waitForSelector(composeSelector, { timeout: 12000 });
+        composeFound = true;
+        noComposeReason = null;
+      } catch {}
+    }
     const diag = await runComposeDiagnostic(page, u).catch(() => ({}));
     const bodySnippet = (diag.bodySnippet || '').toLowerCase();
     if (bodySnippet.includes('this account is private') || bodySnippet.includes('account is private')) noComposeReason = 'account_private';
     else if (bodySnippet.includes("can't message") || bodySnippet.includes("can't send") || bodySnippet.includes('message request') || bodySnippet.includes("don't accept")) noComposeReason = 'messages_restricted';
     else if (bodySnippet.includes('couldn\'t find') || bodySnippet.includes('no results')) noComposeReason = 'user_not_found';
-    logger.warn('Compose wait failed ' + e.message + (noComposeReason !== 'no_compose' ? ' (page suggests: ' + noComposeReason + ')' : ''));
-    logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+    if (!composeFound) {
+      logger.warn('Compose wait failed ' + e.message + (noComposeReason !== 'no_compose' ? ' (page suggests: ' + noComposeReason + ')' : ''));
+      logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+    } else {
+      logger.log('Compose recovery succeeded; composer detected after retry action.');
+    }
   }
 
   // When lead has no display_name/first_name in DB but template uses {{first_name}}/{{full_name}}, get name from thread page (e.g. "AI Setter Test 8 aisettertest8")
