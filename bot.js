@@ -284,6 +284,32 @@ async function saveComposePostSendDebugScreenshot(page, username) {
   }
 }
 
+function wantsComposeFailureScreenshot() {
+  return (
+    process.env.DM_COMPOSE_FAILURE_SCREENSHOT === '1' ||
+    process.env.DM_COMPOSE_FAILURE_SCREENSHOT === 'true' ||
+    // If typing screenshot is enabled, also capture no_compose failures by default.
+    wantsComposeTypingScreenshot()
+  );
+}
+
+/** Screenshot when compose is missing (before returning no_compose). */
+async function saveComposeFailureDebugScreenshot(page, username, label = 'compose_missing') {
+  if (!wantsComposeFailureScreenshot() || !page) return null;
+  try {
+    fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+    const u = String(username || 'lead').replace(/^@/, '').replace(/[^a-z0-9_-]/gi, '_').slice(0, 40);
+    const safeLabel = String(label || 'compose_missing').replace(/[^a-z0-9_-]/gi, '_').slice(0, 24);
+    const out = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_${safeLabel}_${u}.png`);
+    await page.screenshot({ path: out, fullPage: true });
+    logger.log(`[compose] failure screenshot=${out}`);
+    return out;
+  } catch (e) {
+    logger.warn('[compose] failure screenshot failed: ' + (e.message || e));
+    return null;
+  }
+}
+
 async function logDmSearchFailureDiagnostics(page, username, searchPick) {
   const u = String(username || '').trim().replace(/^@/, '');
   let url = '';
@@ -1784,6 +1810,18 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         noComposeReason = null;
       } catch {}
     }
+    if (!composeFound && page.url().includes('/direct/t/')) {
+      // Thread URL is loaded but right pane sometimes fails to mount; one reload often restores composer.
+      try {
+        logger.warn('Compose still missing on /direct/t/ thread; retrying with one thread reload.');
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
+        await delay(2500);
+        await dismissInstagramHomeModals(page, logger);
+        await page.waitForSelector(composeSelector, { timeout: 12000 });
+        composeFound = true;
+        noComposeReason = null;
+      } catch {}
+    }
     const diag = await runComposeDiagnostic(page, u).catch(() => ({}));
     const bodySnippet = (diag.bodySnippet || '').toLowerCase();
     if (bodySnippet.includes('this account is private') || bodySnippet.includes('account is private')) noComposeReason = 'account_private';
@@ -1792,6 +1830,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     if (!composeFound) {
       logger.warn('Compose wait failed ' + e.message + (noComposeReason !== 'no_compose' ? ' (page suggests: ' + noComposeReason + ')' : ''));
       logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+      await saveComposeFailureDebugScreenshot(page, u, noComposeReason || 'compose_missing');
     } else {
       logger.log('Compose recovery succeeded; composer detected after retry action.');
     }
