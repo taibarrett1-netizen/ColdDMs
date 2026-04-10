@@ -47,6 +47,9 @@ const MAX_PER_HOUR = parseInt(process.env.MAX_SENDS_PER_HOUR, 10) || 20;
 const HEADLESS = process.env.HEADLESS_MODE !== 'false';
 const SEND_LEASE_SECONDS = Math.max(120, parseInt(process.env.SEND_LEASE_SECONDS || '600', 10) || 600);
 const SEND_WORKER_ID = process.env.SEND_WORKER_ID || `send-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+const SEND_WORKER_VERBOSE_LOGS =
+  String(process.env.SEND_WORKER_VERBOSE_LOGS || '').trim().toLowerCase() === '1' ||
+  String(process.env.SEND_WORKER_VERBOSE_LOGS || '').trim().toLowerCase() === 'true';
 /** When set (e.g. 80), slows Puppeteer operations for debugging voice/UI (all launch paths that use applyPuppeteerSlowMo). */
 function getPuppeteerSlowMo() {
   const n = parseInt(process.env.PUPPETEER_SLOW_MO_MS, 10);
@@ -469,13 +472,26 @@ async function dismissInstagramCookieConsent(page) {
       const roots = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"], div'));
       const targets = roots.filter((el) => {
         const t = (el.textContent || '').toLowerCase();
-        return t.includes('allow the use of cookies') || t.includes('allow all cookies') || t.includes('cookie');
+        return (
+          t.includes('allow the use of cookies') ||
+          t.includes('allow all cookies') ||
+          t.includes('cookie') ||
+          t.includes('cookies') ||
+          t.includes('die verwendung von cookies') ||
+          t.includes('cookies durch instagram')
+        );
       });
       for (const root of targets) {
         const clickables = Array.from(root.querySelectorAll('button, [role="button"], a, span'));
         const preferred =
-          clickables.find((el) => /allow all cookies|allow all|accept all/i.test((el.textContent || '').trim())) ||
-          clickables.find((el) => /decline optional cookies|only allow essential|essential cookies/i.test((el.textContent || '').trim()));
+          clickables.find((el) =>
+            /allow all cookies|allow all|accept all|alle cookies erlauben|cookies erlauben/i.test((el.textContent || '').trim())
+          ) ||
+          clickables.find((el) =>
+            /decline optional cookies|only allow essential|essential cookies|optionale cookies ablehnen|nur erforderliche cookies/i.test(
+              (el.textContent || '').trim()
+            )
+          );
         if (preferred && preferred.offsetParent) {
           const btn = preferred.closest('[role="button"]') || preferred.closest('button') || preferred;
           btn.click();
@@ -3312,11 +3328,13 @@ async function runBotMultiTenant() {
       continue;
     }
 
-    logger.log(
-      `[send-worker] claimed job ${claimedJob.id} campaign=${claimedJob.campaign_id || 'null'} ` +
-        `client=${claimedJob.client_id || 'null'} campaignLead=${claimedJob.campaign_lead_id || 'null'} ` +
-        `for ${claimedJob.username || '?'}`
-    );
+    if (SEND_WORKER_VERBOSE_LOGS) {
+      logger.log(
+        `[send-worker] claimed job ${claimedJob.id} campaign=${claimedJob.campaign_id || 'null'} ` +
+          `client=${claimedJob.client_id || 'null'} campaignLead=${claimedJob.campaign_lead_id || 'null'} ` +
+          `for ${claimedJob.username || '?'}`
+      );
+    }
     const resolved = await sb.buildSendWorkFromJob(claimedJob.id).catch((e) => {
       logger.error(`[send-worker] buildSendWorkFromJob threw: ${e?.message || e}`);
       return null;
@@ -3327,7 +3345,9 @@ async function runBotMultiTenant() {
       await delay(randomDelay(1000, 3000));
       continue;
     }
-    logger.log(`[send-worker] job ${claimedJob.id} disposition=${resolved.disposition} reason=${resolved.reason || 'none'}`);
+    if (SEND_WORKER_VERBOSE_LOGS) {
+      logger.log(`[send-worker] job ${claimedJob.id} disposition=${resolved.disposition} reason=${resolved.reason || 'none'}`);
+    }
     if (resolved.disposition === 'cancelled') {
       await sb.updateSendJob(claimedJob.id, {
         status: 'cancelled',
