@@ -522,6 +522,14 @@ function instagramLeaseStaleBeforeIso(leaseSeconds = 600) {
   return new Date(Date.now() - staleSec * 1000).toISOString();
 }
 
+function campaignSendLeaseStaleBeforeIso() {
+  const staleSec = Math.max(
+    45,
+    parseInt(process.env.CAMPAIGN_SEND_LEASE_STALE_SEC || '120', 10) || 120
+  );
+  return new Date(Date.now() - staleSec * 1000).toISOString();
+}
+
 function isMissingLeaseColumnsError(error) {
   if (!error) return false;
   const code = String(error.code || '').trim();
@@ -643,6 +651,101 @@ async function releaseAllInstagramSessionLeases() {
     .select('id');
   if (!primary.error) return { released: (primary.data || []).length };
   // Backward compatibility: older DBs may not have leased_* columns yet.
+  const msg = String(primary.error?.message || '').toLowerCase();
+  if (primary.error?.code === '42703' || msg.includes('does not exist')) {
+    return { released: 0, skipped: true, reason: 'lease_columns_missing' };
+  }
+  throw primary.error;
+}
+
+async function claimCampaignSendLease(campaignId, workerId, leaseSeconds = 240) {
+  const sb = getSupabase();
+  if (!sb || !campaignId || !workerId) return false;
+  const nowIso = new Date().toISOString();
+  const leaseUntil = computeSendSessionLeaseUntil(leaseSeconds);
+  const staleBefore = campaignSendLeaseStaleBeforeIso();
+  const updatePayload = {
+    send_leased_by_worker: workerId,
+    send_leased_until: leaseUntil,
+    send_lease_heartbeat_at: nowIso,
+    updated_at: nowIso,
+  };
+  const attempts = [
+    (q) => q.is('send_leased_until', null),
+    (q) => q.lte('send_leased_until', nowIso),
+    (q) => q.eq('send_leased_by_worker', workerId),
+    (q) =>
+      q
+        .gt('send_leased_until', nowIso)
+        .or(`send_lease_heartbeat_at.lt.${staleBefore},send_lease_heartbeat_at.is.null`),
+  ];
+  for (const build of attempts) {
+    let query = sb.from('cold_dm_campaigns').update(updatePayload).eq('id', campaignId);
+    query = build(query);
+    const { data, error } = await query.select('id').limit(1);
+    if (!error && data && data.length > 0) return true;
+    if (isMissingLeaseColumnsError(error)) {
+      const { data: exists, error: existsErr } = await sb.from('cold_dm_campaigns').select('id').eq('id', campaignId).limit(1);
+      if (!existsErr && exists && exists.length > 0) return true;
+    }
+  }
+  return false;
+}
+
+async function heartbeatCampaignSendLease(campaignId, workerId, leaseSeconds = 240) {
+  const sb = getSupabase();
+  if (!sb || !campaignId || !workerId) return false;
+  const nowIso = new Date().toISOString();
+  const leaseUntil = computeSendSessionLeaseUntil(leaseSeconds);
+  const { data, error } = await sb
+    .from('cold_dm_campaigns')
+    .update({
+      send_leased_until: leaseUntil,
+      send_lease_heartbeat_at: nowIso,
+      updated_at: nowIso,
+    })
+    .eq('id', campaignId)
+    .eq('send_leased_by_worker', workerId)
+    .select('id')
+    .limit(1);
+  if (isMissingLeaseColumnsError(error)) return true;
+  return !error && !!(data && data.length > 0);
+}
+
+async function releaseCampaignSendLease(campaignId, workerId) {
+  const sb = getSupabase();
+  if (!sb || !campaignId) return;
+  const nowIso = new Date().toISOString();
+  let q = sb
+    .from('cold_dm_campaigns')
+    .update({
+      send_leased_until: null,
+      send_leased_by_worker: null,
+      send_lease_heartbeat_at: nowIso,
+      updated_at: nowIso,
+    })
+    .eq('id', campaignId);
+  if (workerId) q = q.eq('send_leased_by_worker', workerId);
+  const { error } = await q;
+  if (isMissingLeaseColumnsError(error)) return;
+}
+
+async function releaseAllCampaignSendLeases(workerId = null) {
+  const sb = getSupabase();
+  if (!sb) return { released: 0 };
+  const nowIso = new Date().toISOString();
+  let q = sb
+    .from('cold_dm_campaigns')
+    .update({
+      send_leased_until: null,
+      send_leased_by_worker: null,
+      send_lease_heartbeat_at: nowIso,
+      updated_at: nowIso,
+    })
+    .or('send_leased_by_worker.not.is.null,send_leased_until.not.is.null');
+  if (workerId) q = q.eq('send_leased_by_worker', workerId);
+  const primary = await q.select('id');
+  if (!primary.error) return { released: (primary.data || []).length };
   const msg = String(primary.error?.message || '').toLowerCase();
   if (primary.error?.code === '42703' || msg.includes('does not exist')) {
     return { released: 0, skipped: true, reason: 'lease_columns_missing' };
@@ -2058,31 +2161,49 @@ async function getSendJob(jobId) {
 async function claimColdDmSendJob(workerId, leaseSeconds = 240) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
-  const { data, error } = await sb.rpc('claim_cold_dm_send_job', {
-    p_worker_id: workerId,
-    p_lease_seconds: leaseSeconds,
-  });
-  if (error) {
-    console.error('[claimColdDmSendJob] RPC error, using fallback:', error.message || error);
-    return claimColdDmSendJobFallback(workerId, leaseSeconds);
-  }
-  const rows = Array.isArray(data) ? data : data != null ? [data] : [];
-  if (rows.length > 0) return rows[0];
-
-  const nowIso = new Date().toISOString();
-  const { data: pendingCheck } = await sb
-    .from('cold_dm_send_jobs')
-    .select('id, status, available_at')
-    .in('status', ['pending', 'retry'])
-    .lte('available_at', nowIso)
-    .order('created_at', { ascending: true })
-    .limit(5);
-  if (pendingCheck?.length) {
-    console.error(
-      `[claimColdDmSendJob] RPC returned 0 rows but ${pendingCheck.length} ready pending/retry jobs exist. ` +
-      `First: id=${pendingCheck[0].id} status=${pendingCheck[0].status} available_at=${pendingCheck[0].available_at} now=${nowIso}`
-    );
-    return claimColdDmSendJobFallback(workerId, leaseSeconds);
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const { data, error } = await sb.rpc('claim_cold_dm_send_job', {
+      p_worker_id: workerId,
+      p_lease_seconds: leaseSeconds,
+    });
+    if (error) {
+      console.error('[claimColdDmSendJob] RPC error, using fallback:', error.message || error);
+      return claimColdDmSendJobFallback(workerId, leaseSeconds);
+    }
+    const rows = Array.isArray(data) ? data : data != null ? [data] : [];
+    const claimed = rows.length > 0 ? rows[0] : null;
+    if (!claimed) {
+      const nowIso = new Date().toISOString();
+      const { data: pendingCheck } = await sb
+        .from('cold_dm_send_jobs')
+        .select('id, status, available_at')
+        .in('status', ['pending', 'retry'])
+        .lte('available_at', nowIso)
+        .order('created_at', { ascending: true })
+        .limit(5);
+      if (pendingCheck?.length) {
+        console.error(
+          `[claimColdDmSendJob] RPC returned 0 rows but ${pendingCheck.length} ready pending/retry jobs exist. ` +
+            `First: id=${pendingCheck[0].id} status=${pendingCheck[0].status} available_at=${pendingCheck[0].available_at} now=${nowIso}`
+        );
+        return claimColdDmSendJobFallback(workerId, leaseSeconds);
+      }
+      return null;
+    }
+    if (!claimed.campaign_id) return claimed;
+    const lockOk = await claimCampaignSendLease(claimed.campaign_id, workerId, leaseSeconds);
+    if (lockOk) return claimed;
+    const retryAt = new Date(Date.now() + (5 + Math.floor(Math.random() * 10)) * 1000).toISOString();
+    await updateSendJob(
+      claimed.id,
+      {
+        status: 'retry',
+        available_at: retryAt,
+        last_error_class: 'campaign_locked',
+        last_error_message: 'campaign_locked',
+      },
+      workerId
+    ).catch(() => {});
   }
   return null;
 }
@@ -2091,38 +2212,46 @@ async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
   const nowIso = new Date().toISOString();
-  const { data: pending } = await sb
+  const { data: pendingRows } = await sb
     .from('cold_dm_send_jobs')
-    .select('id, attempt_count')
+    .select('id, campaign_id, attempt_count')
     .in('status', ['pending', 'retry'])
     .lte('available_at', nowIso)
     .order('available_at', { ascending: true })
     .order('priority', { ascending: true })
     .order('created_at', { ascending: true })
-    .limit(1)
-    .maybeSingle();
-  if (!pending?.id) return null;
-  const leaseUntil = new Date(Date.now() + Math.max(30, leaseSeconds) * 1000).toISOString();
-  const nextAttempt = (pending.attempt_count || 0) + 1;
-  const { data: updated, error } = await sb
-    .from('cold_dm_send_jobs')
-    .update({
-      status: 'running',
-      leased_by_worker: workerId,
-      leased_until: leaseUntil,
-      lease_heartbeat_at: nowIso,
-      attempt_count: nextAttempt,
-      updated_at: nowIso,
-    })
-    .eq('id', pending.id)
-    .in('status', ['pending', 'retry'])
-    .select('*')
-    .maybeSingle();
-  if (error || !updated) return null;
-  return updated;
+    .limit(20);
+  const pending = Array.isArray(pendingRows) ? pendingRows : [];
+  if (!pending.length) return null;
+  for (const candidate of pending) {
+    const campaignId = candidate.campaign_id || null;
+    if (campaignId) {
+      const lockOk = await claimCampaignSendLease(campaignId, workerId, leaseSeconds);
+      if (!lockOk) continue;
+    }
+    const leaseUntil = new Date(Date.now() + Math.max(30, leaseSeconds) * 1000).toISOString();
+    const nextAttempt = (candidate.attempt_count || 0) + 1;
+    const { data: updated, error } = await sb
+      .from('cold_dm_send_jobs')
+      .update({
+        status: 'running',
+        leased_by_worker: workerId,
+        leased_until: leaseUntil,
+        lease_heartbeat_at: nowIso,
+        attempt_count: nextAttempt,
+        updated_at: nowIso,
+      })
+      .eq('id', candidate.id)
+      .in('status', ['pending', 'retry'])
+      .select('*')
+      .maybeSingle();
+    if (!error && updated) return updated;
+    if (campaignId) await releaseCampaignSendLease(campaignId, workerId).catch(() => {});
+  }
+  return null;
 }
 
-async function heartbeatSendJobLease(jobId, workerId, leaseSeconds = 240) {
+async function heartbeatSendJobLease(jobId, workerId, leaseSeconds = 240, campaignId = null) {
   const sb = getSupabase();
   if (!sb || !jobId || !workerId) return false;
   const { data, error } = await sb.rpc('heartbeat_cold_dm_send_job', {
@@ -2130,7 +2259,10 @@ async function heartbeatSendJobLease(jobId, workerId, leaseSeconds = 240) {
     p_worker_id: workerId,
     p_lease_seconds: leaseSeconds,
   });
-  if (!error && data === true) return true;
+  if (!error && data === true) {
+    if (campaignId) await heartbeatCampaignSendLease(campaignId, workerId, leaseSeconds).catch(() => {});
+    return true;
+  }
   if (!error && data === false) return false;
   const leaseUntil = new Date(Date.now() + Math.max(30, leaseSeconds) * 1000).toISOString();
   const { data: rows, error: uerr } = await sb
@@ -2140,7 +2272,9 @@ async function heartbeatSendJobLease(jobId, workerId, leaseSeconds = 240) {
     .eq('leased_by_worker', workerId)
     .eq('status', 'running')
     .select('id');
-  return !uerr && rows && rows.length > 0;
+  const ok = !uerr && rows && rows.length > 0;
+  if (ok && campaignId) await heartbeatCampaignSendLease(campaignId, workerId, leaseSeconds).catch(() => {});
+  return ok;
 }
 
 async function syncSendJobsForCampaign(clientId, campaignId) {
@@ -2760,12 +2894,40 @@ async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId 
     return row;
   });
   if (rows.length === 0) return 0;
-  const { error } = await sb
-    .from('cold_dm_leads')
-    .upsert(rows, {
-      onConflict: 'client_id,username',
-      ignoreDuplicates: !leadGroupId,
-    });
+  if (!leadGroupId) {
+    const existingByUsername = new Map();
+    const usernames = [...new Set(rows.map((r) => r.username).filter(Boolean))];
+    const chunkSize = 150;
+    for (let i = 0; i < usernames.length; i += chunkSize) {
+      const chunk = usernames.slice(i, i + chunkSize);
+      const { data: existingRows, error: existingErr } = await sb
+        .from('cold_dm_leads')
+        .select('username, display_name, first_name, last_name')
+        .eq('client_id', clientId)
+        .in('username', chunk);
+      if (existingErr) throw existingErr;
+      for (const r of existingRows || []) {
+        existingByUsername.set(normalizeUsername(r.username), r);
+      }
+    }
+    for (const row of rows) {
+      const existing = existingByUsername.get(row.username);
+      if (!existing) continue;
+      const existingDisplay = (existing.display_name || '').trim();
+      const existingFirst = (existing.first_name || '').trim();
+      const existingLast = (existing.last_name || '').trim();
+      const incomingDisplay = (row.display_name || '').trim();
+      const incomingFirst = (row.first_name || '').trim();
+      const incomingLast = (row.last_name || '').trim();
+      if (!incomingDisplay && existingDisplay) row.display_name = existingDisplay;
+      if (!incomingFirst && existingFirst) row.first_name = existingFirst;
+      if (!incomingLast && existingLast) row.last_name = existingLast;
+    }
+  }
+  const { error } = await sb.from('cold_dm_leads').upsert(rows, {
+    onConflict: 'client_id,username',
+    ignoreDuplicates: false,
+  });
   if (error) throw error;
   return rows.length;
 }
@@ -3457,6 +3619,10 @@ module.exports = {
   heartbeatInstagramSessionLease,
   releaseInstagramSessionLease,
   releaseAllInstagramSessionLeases,
+  claimCampaignSendLease,
+  heartbeatCampaignSendLease,
+  releaseCampaignSendLease,
+  releaseAllCampaignSendLeases,
   saveSession,
   isAdminUser,
   countActiveVpsInstagramSessions,

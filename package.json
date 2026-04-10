@@ -12,6 +12,8 @@
     "worker:scrape": "node workers/scrape-worker.js",
     "download-follow-up-screenshots": "node scripts/download-follow-up-screenshots.js",
     "test:campaign-limits": "node scripts/test-campaign-limit-handling.js",
+    "test:name-fallback": "node scripts/test-name-fallback-regression.js",
+    "test:campaign-lease": "node scripts/test-campaign-send-lease.js",
     "scale:send-workers": "node scripts/scale-send-workers.js"
   },
   "keywords": [

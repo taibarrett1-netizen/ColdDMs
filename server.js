@@ -39,6 +39,7 @@ const {
   tryVpsIdempotencyOnce,
   getOrResolveColdDmProxyUrl,
   releaseAllInstagramSessionLeases,
+  releaseAllCampaignSendLeases,
 } = require('./database/supabase');
 const {
   loadLeadsFromCSV,
@@ -1322,6 +1323,11 @@ app.post('/api/control/stop', (req, res) => {
         if (r.released > 0) console.log(`[API] Cleared ${r.released} Instagram session lease(s) after stop`);
       })
       .catch((e) => console.error('[API] releaseAllInstagramSessionLeases', e));
+    releaseAllCampaignSendLeases()
+      .then((r) => {
+        if (r.released > 0) console.log(`[API] Cleared ${r.released} campaign send lease(s) after stop`);
+      })
+      .catch((e) => console.error('[API] releaseAllCampaignSendLeases', e));
     console.log('[API] Stop (pause=1) for clientId=', clientId);
     res.json({ ok: true, processRunning: false });
     exec(`pm2 stop ${BOT_PM2_NAME}`, () => {});

@@ -3299,6 +3299,8 @@ async function runBotMultiTenant() {
   let noPauseZeroEmptyRounds = 0;
   /** Set while this worker holds an IG session lease — PM2 stop may not run `finally` before exit. */
   let leasedSessionIdForSignal = null;
+  /** Campaign currently leased by this worker (one at a time). */
+  let leasedCampaignIdForSignal = null;
   process.once('SIGTERM', () => {
     void (async () => {
       const sid = leasedSessionIdForSignal;
@@ -3307,6 +3309,13 @@ async function runBotMultiTenant() {
         await sb.releaseInstagramSessionLease(sid, SEND_WORKER_ID).catch(() => {});
         leasedSessionIdForSignal = null;
       }
+      const campaignId = leasedCampaignIdForSignal;
+      if (campaignId) {
+        logger.warn('[send-worker] SIGTERM: releasing campaign send lease');
+        await sb.releaseCampaignSendLease(campaignId, SEND_WORKER_ID).catch(() => {});
+        leasedCampaignIdForSignal = null;
+      }
+      await sb.releaseAllCampaignSendLeases(SEND_WORKER_ID).catch(() => {});
       process.exit(0);
     })();
   });
@@ -3318,6 +3327,13 @@ async function runBotMultiTenant() {
         await sb.releaseInstagramSessionLease(sid, SEND_WORKER_ID).catch(() => {});
         leasedSessionIdForSignal = null;
       }
+      const campaignId = leasedCampaignIdForSignal;
+      if (campaignId) {
+        logger.warn('[send-worker] SIGINT: releasing campaign send lease');
+        await sb.releaseCampaignSendLease(campaignId, SEND_WORKER_ID).catch(() => {});
+        leasedCampaignIdForSignal = null;
+      }
+      await sb.releaseAllCampaignSendLeases(SEND_WORKER_ID).catch(() => {});
       process.exit(0);
     })();
   });
@@ -3406,6 +3422,12 @@ async function runBotMultiTenant() {
       logger.error('Failed to switch session: ' + e.message);
       return false;
     }
+  }
+
+  async function releaseClaimedCampaignLease(campaignId) {
+    if (!campaignId) return;
+    await sb.releaseCampaignSendLease(campaignId, SEND_WORKER_ID).catch(() => {});
+    if (leasedCampaignIdForSignal === campaignId) leasedCampaignIdForSignal = null;
   }
 
   for (;;) {
@@ -3506,6 +3528,7 @@ async function runBotMultiTenant() {
           `for ${claimedJob.username || '?'}`
       );
     }
+    leasedCampaignIdForSignal = claimedJob.campaign_id || null;
     const resolved = await sb.buildSendWorkFromJob(claimedJob.id).catch((e) => {
       logger.error(`[send-worker] buildSendWorkFromJob threw: ${e?.message || e}`);
       return null;
@@ -3513,6 +3536,7 @@ async function runBotMultiTenant() {
     if (!resolved) {
       logger.error(`[send-worker] job ${claimedJob.id} resolution returned null (job_resolution_failed)`);
       await sb.updateSendJob(claimedJob.id, { status: 'failed', last_error_class: 'job_resolution_failed', last_error_message: 'Could not resolve send job payload.' }, SEND_WORKER_ID).catch(() => {});
+      await releaseClaimedCampaignLease(claimedJob.campaign_id);
       await delay(randomDelay(1000, 3000));
       continue;
     }
@@ -3525,6 +3549,7 @@ async function runBotMultiTenant() {
         last_error_class: resolved.reason || 'cancelled',
         last_error_message: resolved.reason || 'cancelled',
       }, SEND_WORKER_ID).catch(() => {});
+      await releaseClaimedCampaignLease(claimedJob.campaign_id);
       await delay(randomDelay(500, 1500));
       continue;
     }
@@ -3535,6 +3560,7 @@ async function runBotMultiTenant() {
         last_error_class: resolved.reason || 'retry',
         last_error_message: resolved.reason || 'retry',
       }, SEND_WORKER_ID).catch(() => {});
+      await releaseClaimedCampaignLease(claimedJob.campaign_id);
       await delay(randomDelay(500, 1500));
       continue;
     }
@@ -3549,6 +3575,7 @@ async function runBotMultiTenant() {
         last_error_class: resolved.reason || 'failed',
         last_error_message: resolved.reason || 'failed',
       }, SEND_WORKER_ID).catch(() => {});
+      await releaseClaimedCampaignLease(claimedJob.campaign_id);
       await delay(randomDelay(500, 1500));
       continue;
     }
@@ -3564,6 +3591,7 @@ async function runBotMultiTenant() {
         last_error_class: 'client_paused',
         last_error_message: 'client_paused',
       }, SEND_WORKER_ID).catch(() => {});
+      await releaseClaimedCampaignLease(claimedJob.campaign_id);
       continue;
     }
     const built = await buildAdapterForClient(clientId);
@@ -3575,6 +3603,7 @@ async function runBotMultiTenant() {
         last_error_class: 'missing_adapter',
         last_error_message: 'missing_adapter',
       }, SEND_WORKER_ID).catch(() => {});
+      await releaseClaimedCampaignLease(claimedJob.campaign_id);
       continue;
     }
     const { adapter, minDelayMs, maxDelayMs } = built;
@@ -3589,13 +3618,16 @@ async function runBotMultiTenant() {
         last_error_class: 'waiting_for_session',
         last_error_message: 'waiting_for_session',
       }, SEND_WORKER_ID).catch(() => {});
+      await releaseClaimedCampaignLease(claimedJob.campaign_id);
       await delay(randomDelay(5000, 15000));
       continue;
     }
     leasedSessionIdForSignal = session.id;
+    leasedCampaignIdForSignal = work.campaignId;
     const leaseHeartbeatMs = Math.max(30000, Math.min(60000, Math.floor((SEND_LEASE_SECONDS * 1000) / 2)));
     let leaseHeartbeatTimer = null;
     let sendJobHeartbeatTimer = null;
+    let campaignLeaseHeartbeatTimer = null;
     const startLeaseHeartbeat = () => {
       if (leaseHeartbeatTimer) return;
       leaseHeartbeatTimer = setInterval(() => {
@@ -3606,9 +3638,16 @@ async function runBotMultiTenant() {
     const startSendJobHeartbeat = () => {
       if (sendJobHeartbeatTimer) return;
       sendJobHeartbeatTimer = setInterval(() => {
-        sb.heartbeatSendJobLease(claimedJob.id, SEND_WORKER_ID, SEND_LEASE_SECONDS).catch(() => {});
+        sb.heartbeatSendJobLease(claimedJob.id, SEND_WORKER_ID, SEND_LEASE_SECONDS, work.campaignId).catch(() => {});
       }, leaseHeartbeatMs);
       if (typeof sendJobHeartbeatTimer.unref === 'function') sendJobHeartbeatTimer.unref();
+    };
+    const startCampaignLeaseHeartbeat = () => {
+      if (campaignLeaseHeartbeatTimer) return;
+      campaignLeaseHeartbeatTimer = setInterval(() => {
+        sb.heartbeatCampaignSendLease(work.campaignId, SEND_WORKER_ID, SEND_LEASE_SECONDS).catch(() => {});
+      }, leaseHeartbeatMs);
+      if (typeof campaignLeaseHeartbeatTimer.unref === 'function') campaignLeaseHeartbeatTimer.unref();
     };
     const stopLeaseHeartbeat = () => {
       if (leaseHeartbeatTimer) clearInterval(leaseHeartbeatTimer);
@@ -3618,10 +3657,15 @@ async function runBotMultiTenant() {
       if (sendJobHeartbeatTimer) clearInterval(sendJobHeartbeatTimer);
       sendJobHeartbeatTimer = null;
     };
+    const stopCampaignLeaseHeartbeat = () => {
+      if (campaignLeaseHeartbeatTimer) clearInterval(campaignLeaseHeartbeatTimer);
+      campaignLeaseHeartbeatTimer = null;
+    };
 
     try {
       startLeaseHeartbeat();
       startSendJobHeartbeat();
+      startCampaignLeaseHeartbeat();
       const ok = await ensurePageSession(session);
       if (!ok) {
         logger.warn('Could not load session for campaign, failing lead.');
@@ -3747,8 +3791,11 @@ async function runBotMultiTenant() {
     } finally {
       stopLeaseHeartbeat();
       stopSendJobHeartbeat();
+      stopCampaignLeaseHeartbeat();
       await sb.releaseInstagramSessionLease(session.id, SEND_WORKER_ID).catch(() => {});
       leasedSessionIdForSignal = null;
+      await sb.releaseCampaignSendLease(work.campaignId, SEND_WORKER_ID).catch(() => {});
+      leasedCampaignIdForSignal = null;
     }
   }
 }
