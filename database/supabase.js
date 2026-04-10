@@ -522,6 +522,13 @@ function instagramLeaseStaleBeforeIso(leaseSeconds = 600) {
   return new Date(Date.now() - staleSec * 1000).toISOString();
 }
 
+function isMissingLeaseColumnsError(error) {
+  if (!error) return false;
+  const code = String(error.code || '').trim();
+  const msg = String(error.message || '').toLowerCase();
+  return code === '42703' || msg.includes('leased_by_worker') || msg.includes('leased_until') || msg.includes('lease_heartbeat_at');
+}
+
 /**
  * After PM2 stop / crash, leased_until can stay in the future for many minutes while no process heartbeats.
  * Allow reclaim when heartbeat is missing or older than INSTAGRAM_SESSION_LEASE_STALE_SEC (default 120s).
@@ -550,6 +557,16 @@ async function claimInstagramSessionLease(sessionId, workerId, leaseSeconds = 60
     query = build(query);
     const { data, error } = await query.select('id').limit(1);
     if (!error && data && data.length > 0) return true;
+    if (isMissingLeaseColumnsError(error)) {
+      // Backward compatibility: schema missing lease columns.
+      // Treat as claimable so single-worker mode still functions until migration runs.
+      const { data: exists, error: existsErr } = await sb
+        .from('cold_dm_instagram_sessions')
+        .select('id')
+        .eq('id', sessionId)
+        .limit(1);
+      if (!existsErr && exists && exists.length > 0) return true;
+    }
   }
   return false;
 }
@@ -589,6 +606,7 @@ async function heartbeatInstagramSessionLease(sessionId, workerId, leaseSeconds 
     .eq('leased_by_worker', workerId)
     .select('id')
     .limit(1);
+  if (isMissingLeaseColumnsError(error)) return true;
   return !error && !!(data && data.length > 0);
 }
 
@@ -601,7 +619,8 @@ async function releaseInstagramSessionLease(sessionId, workerId) {
     .update({ leased_until: null, leased_by_worker: null, lease_heartbeat_at: nowIso, updated_at: nowIso })
     .eq('id', sessionId);
   if (workerId) q = q.eq('leased_by_worker', workerId);
-  await q;
+  const { error } = await q;
+  if (isMissingLeaseColumnsError(error)) return;
 }
 
 /**

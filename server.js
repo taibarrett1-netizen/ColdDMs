@@ -191,7 +191,7 @@ const uploadVoice = multer({ dest: voiceNotesDir, limits: { fileSize: 25 * 1024 
 const BOT_PM2_NAME = 'ig-dm-send';
 const SEND_WORKER_ENTRY = process.env.SEND_WORKER_ENTRY || 'workers/send-worker.js';
 /** After the worker exits (--no-autorestart), PM2 keeps a stopped app with this name. `pm2 start script --name` then fails as duplicate; `pm2 restart name` starts the stopped process. Fallback creates the app if missing. */
-const PM2_ENSURE_SEND_WORKER_CMD = `pm2 restart ${BOT_PM2_NAME} || pm2 start ${SEND_WORKER_ENTRY} --name ${BOT_PM2_NAME} --no-autorestart`;
+const PM2_ENSURE_SEND_WORKER_CMD = `pm2 restart ${BOT_PM2_NAME} --update-env || pm2 start ${SEND_WORKER_ENTRY} --name ${BOT_PM2_NAME} --no-autorestart`;
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 
 /** Hands-free PM2 scaling: on by default when Supabase is configured. Set SCALE_SEND_WORKERS_AUTO=0 to disable (e.g. laptop without PM2). */
