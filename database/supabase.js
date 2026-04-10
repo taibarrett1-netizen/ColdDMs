@@ -123,32 +123,26 @@ function normalizeScheduleTime(value) {
  * Falls back to UTC wall clock if tz is missing/invalid.
  */
 function getClockTimeHHMMSSInTimezone(now, timezone) {
-  if (!timezone || typeof timezone !== 'string') {
-    return `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
-  }
-  const tz = timezone.trim();
+  const tz = normalizeTimezoneInput(timezone);
   if (!tz) {
     return `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
   }
-  try {
-    return new Intl.DateTimeFormat('en-CA', {
-      timeZone: tz,
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: false,
-      hourCycle: 'h23',
-    }).format(now);
-  } catch (e) {
-    return `${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')}:${String(now.getUTCSeconds()).padStart(2, '0')}`;
-  }
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    hourCycle: 'h23',
+  }).format(now);
 }
 
 /** Returns YYYY-MM-DD in the given IANA timezone; falls back to UTC if invalid/missing. */
 function getTodayInTimezone(timezone) {
-  if (!timezone || typeof timezone !== 'string') return getToday();
+  const tz = normalizeTimezoneInput(timezone);
+  if (!tz) return getToday();
   try {
-    return new Date().toLocaleDateString('en-CA', { timeZone: timezone.trim() });
+    return new Date().toLocaleDateString('en-CA', { timeZone: tz });
   } catch (e) {
     return getToday();
   }
@@ -163,20 +157,21 @@ async function getTodayForClient(clientId) {
 
 /** Returns the UTC Date for the start of the next calendar day (midnight) in the given IANA timezone. */
 function getNextMidnightInTimezone(timezone) {
-  if (!timezone || typeof timezone !== 'string') return new Date(Date.now() + 24 * 60 * 60 * 1000);
+  const tz = normalizeTimezoneInput(timezone);
+  if (!tz) return new Date(Date.now() + 24 * 60 * 60 * 1000);
   try {
     const now = new Date();
-    const todayStr = getTodayInTimezone(timezone);
+    const todayStr = getTodayInTimezone(tz);
     const [y, m, d] = todayStr.split('-').map(Number);
     const tomorrowDate = new Date(Date.UTC(y, m - 1, d + 1));
-    const tomorrowStr = tomorrowDate.toLocaleDateString('en-CA', { timeZone: timezone.trim() });
+    const tomorrowStr = tomorrowDate.toLocaleDateString('en-CA', { timeZone: tz });
     let low = now.getTime();
     let high = now.getTime() + 48 * 60 * 60 * 1000;
     while (high - low > 60000) {
       const mid = Math.floor((low + high) / 2);
       const d2 = new Date(mid);
-      const datePart = d2.toLocaleDateString('en-CA', { timeZone: timezone.trim() });
-      const timePart = d2.toLocaleTimeString('en-CA', { timeZone: timezone.trim(), hour12: false });
+      const datePart = d2.toLocaleDateString('en-CA', { timeZone: tz });
+      const timePart = d2.toLocaleTimeString('en-CA', { timeZone: tz, hour12: false });
       if (datePart < tomorrowStr || (datePart === tomorrowStr && timePart.slice(0, 5) < '00:00')) low = mid + 1;
       else high = mid;
     }
@@ -188,13 +183,13 @@ function getNextMidnightInTimezone(timezone) {
 
 /** Returns the UTC Date for the start of the next hour in the given IANA timezone. */
 function getNextHourStartInTimezone(timezone) {
-  if (!timezone || typeof timezone !== 'string') {
+  const tz = normalizeTimezoneInput(timezone);
+  if (!tz) {
     const d = new Date();
     return new Date(d.getTime() + (60 - d.getUTCMinutes()) * 60 * 1000 - d.getUTCSeconds() * 1000);
   }
   try {
     const now = new Date();
-    const tz = timezone.trim();
     const timeStr = now.toLocaleTimeString('en-CA', { timeZone: tz, hour12: false });
     const dateStr = now.toLocaleDateString('en-CA', { timeZone: tz });
     const [h] = timeStr.split(':').map(Number);
@@ -224,7 +219,8 @@ function getNextScheduleStartInTimezone(scheduleStartTime, timezone) {
   if (!startStr) return null;
   const [sh, sm] = startStr.split(':').map(Number);
   const startTime = `${String(sh).padStart(2, '0')}:${String(sm || 0).padStart(2, '0')}`;
-  if (!timezone || typeof timezone !== 'string') {
+  const tz = normalizeTimezoneInput(timezone);
+  if (!tz) {
     const now = new Date();
     let next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), sh, sm || 0, 0));
     if (next.getTime() <= now.getTime()) next = new Date(next.getTime() + 24 * 60 * 60 * 1000);
@@ -232,7 +228,6 @@ function getNextScheduleStartInTimezone(scheduleStartTime, timezone) {
   }
   try {
     const now = new Date();
-    const tz = timezone.trim();
     const todayStr = getTodayInTimezone(tz);
     const tomorrowStr = new Date(now.getTime() + 24 * 60 * 60 * 1000).toLocaleDateString('en-CA', { timeZone: tz });
     const findMoment = (dateStr) => {
@@ -260,6 +255,27 @@ function getNextScheduleStartInTimezone(scheduleStartTime, timezone) {
 function normalizeUsername(username) {
   const u = String(username).trim();
   return u.startsWith('@') ? u.slice(1) : u;
+}
+
+function normalizeTimezoneInput(timezone) {
+  if (!timezone || typeof timezone !== 'string') return null;
+  const raw = timezone.trim();
+  if (!raw) return null;
+  const compact = raw.replace(/\s+/g, ' ');
+  const slashNormalized = compact.replace(/\s*\/\s*/g, '/');
+  const aliasKey = slashNormalized.toLowerCase().replace(/\s+/g, '');
+  const aliases = {
+    singapore: 'Asia/Singapore',
+    asiasingapore: 'Asia/Singapore',
+    'asia/singapore': 'Asia/Singapore',
+  };
+  const candidate = aliases[aliasKey] || slashNormalized;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: candidate });
+    return candidate;
+  } catch {
+    return null;
+  }
 }
 
 function isMissingColumnError(error, expectedColumnName = '') {
