@@ -21,6 +21,9 @@ const {
   getLeadsTotalAndRemaining,
   setClientStatusMessage,
   saveSession,
+  isAdminUser,
+  countActiveVpsInstagramSessions,
+  countActiveGraphInstagramAccounts,
   updateSettingsInstagramUsername,
   getScraperSession,
   saveScraperSession,
@@ -159,6 +162,7 @@ function requireScopedClientId(req, res) {
 
 app.use('/api', (req, res, next) => {
   if (req.path === '/health') return next();
+  if (req.path === '/internal/scale-send-workers') return next();
   const key = getPresentedApiKey(req);
   if (!key) {
     return res.status(401).json({ error: 'Unauthorized: missing API key' });
@@ -177,6 +181,7 @@ app.use('/api', (req, res, next) => {
 });
 
 const { registerAdminLabRoutes } = require('./admin_lab/http');
+const { runScaleSendWorkers } = require('./lib/scaleSendWorkers');
 registerAdminLabRoutes(app);
 
 const upload = multer({ dest: projectRoot, limits: { fileSize: 1024 * 1024 } });
@@ -187,6 +192,77 @@ const SEND_WORKER_ENTRY = process.env.SEND_WORKER_ENTRY || 'workers/send-worker.
 /** After the worker exits (--no-autorestart), PM2 keeps a stopped app with this name. `pm2 start script --name` then fails as duplicate; `pm2 restart name` starts the stopped process. Fallback creates the app if missing. */
 const PM2_ENSURE_SEND_WORKER_CMD = `pm2 restart ${BOT_PM2_NAME} || pm2 start ${SEND_WORKER_ENTRY} --name ${BOT_PM2_NAME} --no-autorestart`;
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
+
+/** Hands-free PM2 scaling: on by default when Supabase is configured. Set SCALE_SEND_WORKERS_AUTO=0 to disable (e.g. laptop without PM2). */
+function shouldAutoScaleSendWorkers() {
+  const v = (process.env.SCALE_SEND_WORKERS_AUTO || '').trim().toLowerCase();
+  if (v === '0' || v === 'false' || v === 'off' || v === 'no') return false;
+  if (v === '1' || v === 'true' || v === 'on' || v === 'yes') return true;
+  return isSupabaseConfigured();
+}
+
+const SCALE_SEND_WORKERS_AUTO_INTERVAL_MS = Math.max(
+  60 * 1000,
+  (Math.max(1, parseInt(process.env.SCALE_SEND_WORKERS_AUTO_INTERVAL_MINUTES || '5', 10) || 5)) * 60 * 1000
+);
+
+let scaleSendWorkersInFlight = false;
+let scaleSendWorkersDebounce = null;
+
+function runAutoScaleSendWorkersTick(reason) {
+  if (!shouldAutoScaleSendWorkers()) return;
+  if (scaleSendWorkersInFlight) return;
+  scaleSendWorkersInFlight = true;
+  runScaleSendWorkers({ dryRun: false, pm2AppName: BOT_PM2_NAME })
+    .then((r) => {
+      if (r.scaled) {
+        console.log(
+          `[scale-send-workers:auto:${reason}] scaled to ${r.target} (pauseZero=${r.pauseZeroClients}, sessions=${r.instagramSessionsForActiveClients})`
+        );
+      }
+    })
+    .catch((e) => console.warn(`[scale-send-workers:auto:${reason}]`, e.message))
+    .finally(() => {
+      scaleSendWorkersInFlight = false;
+    });
+}
+
+/** After Start or on a timer; debounced so many clients starting at once trigger one pm2 scale. */
+function scheduleAutoScaleSendWorkers(reason) {
+  if (!shouldAutoScaleSendWorkers()) return;
+  clearTimeout(scaleSendWorkersDebounce);
+  scaleSendWorkersDebounce = setTimeout(() => {
+    scaleSendWorkersDebounce = null;
+    runAutoScaleSendWorkersTick(reason);
+  }, 8000);
+}
+
+// Internal: scale send cluster from Supabase (pause=0 clients + their IG session count). Set SCALE_SEND_WORKERS_SECRET; call with header x-scale-send-workers-secret.
+app.post('/api/internal/scale-send-workers', async (req, res) => {
+  const secret = (process.env.SCALE_SEND_WORKERS_SECRET || '').trim();
+  if (!secret) {
+    return res.status(503).json({ ok: false, error: 'SCALE_SEND_WORKERS_SECRET not set' });
+  }
+  const hdr = (req.headers['x-scale-send-workers-secret'] || '').toString().trim();
+  if (hdr !== secret) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+  const dryRun =
+    req.body?.dryRun === true ||
+    String(req.query?.dryRun || '').toLowerCase() === '1' ||
+    String(req.query?.dryRun || '').toLowerCase() === 'true';
+  try {
+    const result = await runScaleSendWorkers({ dryRun, pm2AppName: BOT_PM2_NAME });
+    if (result.error) {
+      const code = result.error === 'send_worker_not_in_pm2' ? 409 : 502;
+      return res.status(code).json({ ok: false, ...result });
+    }
+    return res.json({ ok: true, ...result });
+  } catch (e) {
+    console.error('[API] scale-send-workers', e);
+    return res.status(500).json({ ok: false, error: e.message || 'scale failed' });
+  }
+});
 
 function getBotProcessRunning(cb) {
   exec('pm2 jlist', { maxBuffer: 1024 * 1024 }, (err, stdout) => {
@@ -727,6 +803,16 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
   }
   try {
+    const isAdmin = await isAdminUser(clientId).catch(() => false);
+    if (!isAdmin) {
+      const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
+      if (activeCount > 0) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Only one automation Instagram account is allowed for this account. Remove the current session before connecting another.',
+        });
+      }
+    }
     const igKey = String(username)
       .trim()
       .replace(/^@/, '')
@@ -819,6 +905,17 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
   pending2FAMap.delete(pending2FAId);
   try {
     const result = await completeInstagram2FA(pending.page, pending.browser, twoFactorCode, pending.username);
+    const isAdmin = await isAdminUser(clientId).catch(() => false);
+    if (!isAdmin) {
+      const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
+      if (activeCount > 0) {
+        if (pending.browser) pending.browser.close().catch(() => {});
+        return res.status(400).json({
+          ok: false,
+          error: 'Only one automation Instagram account is allowed for this account. Remove the current session before connecting another.',
+        });
+      }
+    }
     await saveSession(clientId, { cookies: result.cookies }, result.username, {
       proxyUrl: pending.proxyUrl,
       proxyAssignmentId: pending.proxyAssignmentId,
@@ -870,6 +967,17 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
   pendingEmailVerifyMap.delete(pendingEmailId);
   try {
     const result = await completeInstagramEmailVerification(pending.page, pending.browser, emailCode, pending.username);
+    const isAdmin = await isAdminUser(clientId).catch(() => false);
+    if (!isAdmin) {
+      const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
+      if (activeCount > 0) {
+        if (pending.browser) pending.browser.close().catch(() => {});
+        return res.status(400).json({
+          ok: false,
+          error: 'Only one automation Instagram account is allowed for this account. Remove the current session before connecting another.',
+        });
+      }
+    }
     await saveSession(clientId, { cookies: result.cookies }, result.username, {
       proxyUrl: pending.proxyUrl,
       proxyAssignmentId: pending.proxyAssignmentId,
@@ -951,6 +1059,7 @@ app.post('/api/control/start', async (req, res) => {
         }
         if (out) console.log('[API] pm2 ensure send worker:', out.slice(0, 800));
         else if (!err) console.log('[API] pm2 ensure send worker finished (no stdout).');
+        if (!err || alreadyRunning) scheduleAutoScaleSendWorkers('after_start');
       }
     );
     return;
@@ -960,9 +1069,11 @@ app.post('/api/control/start', async (req, res) => {
   res.json({ ok: true, processRunning: true });
   exec(PM2_ENSURE_SEND_WORKER_CMD, { cwd: projectRoot }, (err, stdout, stderr) => {
     const out = ((stdout || '') + (stderr || '')).trim();
+    const alreadyRunning = /already (running|launched)|online|restart|Process successfully started/i.test(out);
     if (err) console.error('[API] pm2 ensure send worker failed (legacy)', err, stderr);
     else if (out) console.log('[API] pm2 ensure send worker (legacy):', out.slice(0, 800));
     else console.log('[API] Bot start command finished (legacy).');
+    if (!err || alreadyRunning) scheduleAutoScaleSendWorkers('after_start');
   });
 });
 
@@ -1210,4 +1321,12 @@ app.post('/api/control/stop', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Dashboard at http://0.0.0.0:${PORT}`);
+  if (shouldAutoScaleSendWorkers()) {
+    const min = SCALE_SEND_WORKERS_AUTO_INTERVAL_MS / 60000;
+    console.log(
+      `[scale-send-workers] auto: every ${min}m + after Start (set SCALE_SEND_WORKERS_AUTO=0 to disable)`
+    );
+    setInterval(() => runAutoScaleSendWorkersTick('interval'), SCALE_SEND_WORKERS_AUTO_INTERVAL_MS);
+    setTimeout(() => runAutoScaleSendWorkersTick('startup'), 60_000);
+  }
 });

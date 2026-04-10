@@ -11,7 +11,8 @@
     "worker:send": "node workers/send-worker.js",
     "worker:scrape": "node workers/scrape-worker.js",
     "download-follow-up-screenshots": "node scripts/download-follow-up-screenshots.js",
-    "test:campaign-limits": "node scripts/test-campaign-limit-handling.js"
+    "test:campaign-limits": "node scripts/test-campaign-limit-handling.js",
+    "scale:send-workers": "node scripts/scale-send-workers.js"
   },
   "keywords": [
     "instagram",

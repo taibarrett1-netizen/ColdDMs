@@ -85,6 +85,41 @@ function setClientId(clientId) {
   } catch (e) {}
 }
 
+async function isAdminUser(userId) {
+  const sb = getSupabase();
+  if (!sb || !userId) return false;
+  try {
+    const { data, error } = await sb.rpc('is_admin', { _user_id: userId });
+    if (error) return false;
+    return data === true;
+  } catch {
+    return false;
+  }
+}
+
+async function countActiveVpsInstagramSessions(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return 0;
+  const { count, error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .select('*', { count: 'exact', head: true })
+    .eq('client_id', clientId);
+  if (error) throw error;
+  return count ?? 0;
+}
+
+async function countActiveGraphInstagramAccounts(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return 0;
+  const { count, error } = await sb
+    .from('instagram_accounts')
+    .select('*', { count: 'exact', head: true })
+    .eq('client_id', clientId)
+    .eq('is_active', true);
+  if (error) throw error;
+  return count ?? 0;
+}
+
 function getToday() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -844,6 +879,48 @@ async function getClientIdsWithPauseZero() {
     .order('client_id', { ascending: true });
   if (error) throw error;
   return (data || []).map((r) => r.client_id).filter(Boolean);
+}
+
+/**
+ * Suggested PM2 cluster size for `ig-dm-send`: max of (clients with sending on) and
+ * (Instagram automation sessions belonging to those clients), clamped to SEND_WORKER_MIN / SEND_WORKER_MAX.
+ * When every client is paused, returns 1 so one worker can still claim jobs if state changes.
+ */
+async function getRecommendedSendWorkerInstanceCount() {
+  const minN = Math.max(1, parseInt(process.env.SEND_WORKER_MIN || '1', 10) || 1);
+  const maxN = Math.max(minN, parseInt(process.env.SEND_WORKER_MAX || '64', 10) || 64);
+  const sb = getSupabase();
+  if (!sb) {
+    return {
+      recommended: minN,
+      pauseZeroClients: 0,
+      instagramSessionsForActiveClients: 0,
+      minN,
+      maxN,
+      reason: 'no_supabase',
+    };
+  }
+  const clientIds = await getClientIdsWithPauseZero();
+  const pauseZero = clientIds.length;
+  let instagramSessionsForActiveClients = 0;
+  if (clientIds.length > 0) {
+    const { count, error } = await sb
+      .from('cold_dm_instagram_sessions')
+      .select('*', { count: 'exact', head: true })
+      .in('client_id', clientIds);
+    if (error) throw error;
+    instagramSessionsForActiveClients = count ?? 0;
+  }
+  const raw =
+    pauseZero === 0 ? 1 : Math.max(1, pauseZero, instagramSessionsForActiveClients);
+  const recommended = Math.max(minN, Math.min(maxN, raw));
+  return {
+    recommended,
+    pauseZeroClients: pauseZero,
+    instagramSessionsForActiveClients,
+    minN,
+    maxN,
+  };
 }
 
 /**
@@ -3176,6 +3253,9 @@ module.exports = {
   heartbeatInstagramSessionLease,
   releaseInstagramSessionLease,
   saveSession,
+  isAdminUser,
+  countActiveVpsInstagramSessions,
+  countActiveGraphInstagramAccounts,
   alreadySent,
   logSentMessage,
   getDailyStats,
@@ -3228,6 +3308,7 @@ module.exports = {
   getNextPendingCampaignLead,
   updateCampaignLeadStatus,
   getClientIdsWithPauseZero,
+  getRecommendedSendWorkerInstanceCount,
   getNextPendingWorkAnyClient,
   getOrResolveColdDmProxyUrl,
   getClientOutsideScheduleStatus,

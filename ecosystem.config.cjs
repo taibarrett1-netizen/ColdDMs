@@ -5,6 +5,8 @@
  * Recommended VPS env:
  *   SCRAPE_DEFER_TO_WORKER=1   — enqueue scrapes only; ig-dm-scrape runs workers/scrape-worker.js
  *   SEND_WORKER_ENTRY=workers/send-worker.js — used by dashboard "Start" to launch the sender
+ *   SEND_WORKER_MIN / SEND_WORKER_MAX — bounds for getRecommendedSendWorkerInstanceCount + scripts/scale-send-workers.js
+ *   npm run scale:send-workers — optional; ig-dm-dashboard auto-scales by default when Supabase is set (SCALE_SEND_WORKERS_AUTO=0 to disable)
  */
 module.exports = {
   apps: [
@@ -16,7 +18,19 @@ module.exports = {
     {
       name: 'ig-dm-send',
       script: 'workers/send-worker.js',
-      instances: Math.max(1, parseInt(process.env.SEND_WORKER_INSTANCES || '8', 10) || 8),
+      instances: Math.max(
+        1,
+        parseInt(
+          process.env.SEND_WORKER_INSTANCES ||
+            String(
+              Math.max(
+                1,
+                parseInt(process.env.COLD_DM_MAX_CONCURRENT_SENDERS || process.env.COLD_DM_ACTIVE_SESSION_COUNT || '1', 10) || 1
+              )
+            ),
+          10
+        ) || 1
+      ),
       exec_mode: 'cluster',
       autorestart: false,
       max_restarts: 20,
