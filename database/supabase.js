@@ -2070,15 +2070,74 @@ async function buildSendWorkFromJob(jobId) {
   if (!sb || !jobId) return null;
   const job = await getSendJob(jobId);
   if (!job || !job.client_id || !job.campaign_id || !job.campaign_lead_id) return null;
-  const { data: campaign } = await sb
-    .from('cold_dm_campaigns')
-    .select(
-      'id, client_id, name, status, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec, send_voice_note, voice_note_storage_path, voice_note_mode'
-    )
-    .eq('id', job.campaign_id)
-    .eq('client_id', job.client_id)
-    .maybeSingle();
+  let campaign = null;
+  let campaignLookupError = null;
+  try {
+    const { data, error } = await sb
+      .from('cold_dm_campaigns')
+      .select(
+        'id, client_id, name, status, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec, send_voice_note, voice_note_storage_path, voice_note_mode'
+      )
+      .eq('id', job.campaign_id)
+      .eq('client_id', job.client_id)
+      .maybeSingle();
+    if (error) throw error;
+    campaign = data || null;
+  } catch (e) {
+    campaignLookupError = e;
+    console.error(
+      '[buildSendWorkFromJob] campaign lookup with voice-note columns failed',
+      JSON.stringify({
+        jobId: job.id,
+        campaignId: job.campaign_id,
+        clientId: job.client_id,
+        errorCode: e?.code || null,
+        errorMessage: e?.message || String(e),
+        errorDetails: e?.details || null,
+      })
+    );
+    const { data: fallbackCampaign, error: fallbackError } = await sb
+      .from('cold_dm_campaigns')
+      .select(
+        'id, client_id, name, status, message_template_id, message_group_id, schedule_start_time, schedule_end_time, timezone, daily_send_limit, hourly_send_limit, min_delay_sec, max_delay_sec'
+      )
+      .eq('id', job.campaign_id)
+      .eq('client_id', job.client_id)
+      .maybeSingle();
+    if (fallbackError) {
+      console.error(
+        '[buildSendWorkFromJob] campaign fallback lookup failed',
+        JSON.stringify({
+          jobId: job.id,
+          campaignId: job.campaign_id,
+          clientId: job.client_id,
+          errorCode: fallbackError?.code || null,
+          errorMessage: fallbackError?.message || String(fallbackError),
+          errorDetails: fallbackError?.details || null,
+        })
+      );
+    } else if (fallbackCampaign) {
+      campaign = {
+        ...fallbackCampaign,
+        send_voice_note: false,
+        voice_note_storage_path: null,
+        voice_note_mode: 'after_text',
+      };
+      campaignLookupError = null;
+      console.warn(
+        `[buildSendWorkFromJob] campaign fallback lookup succeeded for campaign=${job.campaign_id} client=${job.client_id}. ` +
+          'Apply migration 010_voice_notes.sql to add voice-note columns to cold_dm_campaigns.'
+      );
+    }
+  }
   if (!campaign) {
+    if (campaignLookupError) {
+      return { job, disposition: 'retry', reason: 'campaign_lookup_error', availableAt: computeAvailableAtIso(2 * 60) };
+    }
+    console.warn(
+      `[buildSendWorkFromJob] campaign not found for job=${job.id} campaign=${job.campaign_id} client=${job.client_id}. ` +
+        'If this repeats, verify cold_dm_send_jobs.client_id/campaign_id values and campaign ownership.'
+    );
     return { job, disposition: 'cancelled', reason: 'campaign_not_found' };
   }
   if (campaign.status !== 'active') {

@@ -3303,7 +3303,11 @@ async function runBotMultiTenant() {
       continue;
     }
 
-    logger.log(`[send-worker] claimed job ${claimedJob.id} for ${claimedJob.username || '?'}`);
+    logger.log(
+      `[send-worker] claimed job ${claimedJob.id} campaign=${claimedJob.campaign_id || 'null'} ` +
+        `client=${claimedJob.client_id || 'null'} campaignLead=${claimedJob.campaign_lead_id || 'null'} ` +
+        `for ${claimedJob.username || '?'}`
+    );
     const resolved = await sb.buildSendWorkFromJob(claimedJob.id).catch((e) => {
       logger.error(`[send-worker] buildSendWorkFromJob threw: ${e?.message || e}`);
       return null;
