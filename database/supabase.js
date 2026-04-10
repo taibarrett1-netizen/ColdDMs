@@ -2180,7 +2180,12 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
   if (leadIds.length === 0) return 0;
   // Chunk large IN filters to avoid PostgREST "Bad Request" on long query strings.
   const leads = [];
-  const leadChunkSize = 500;
+  // Keep URL/query length below PostgREST header/url limits when using .in('id', [...uuid]).
+  // UUID filters can overflow around a few hundred ids depending on URL/base headers.
+  const leadChunkSize = Math.max(
+    20,
+    Math.min(120, parseInt(process.env.SEND_SYNC_LEAD_ID_CHUNK || '80', 10) || 80)
+  );
   for (let i = 0; i < leadIds.length; i += leadChunkSize) {
     const chunk = leadIds.slice(i, i + leadChunkSize);
     const { data: part, error: leadsErr } = await sb
