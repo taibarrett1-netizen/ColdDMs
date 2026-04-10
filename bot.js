@@ -1979,6 +1979,19 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           return t;
         };
 
+        const isNameLikeCandidate = (raw) => {
+          const t = clean(raw);
+          if (!t) return false;
+          if (containsUsernameToken(t)) return false;
+          if (/^view\s*profile$/i.test(t)) return false;
+          if (/^message$/i.test(t)) return false;
+          if (/^instagram$/i.test(t)) return false;
+          if (/^\d{1,3}\s*[mhdw]$/i.test(t)) return false;
+          if (/·\s*instagram\s*·?\s*view\s*profile/i.test(t)) return false;
+          if (t.length < 2 || t.length > 80) return false;
+          return true;
+        };
+
         /**
          * Open conversation column only: anchor minLeft to the Message composer’s X position;
          * stop climbing when a parent spans too wide (inbox + thread row).
@@ -2136,6 +2149,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         });
         const otherHeaders = allHeaderRoots.filter((h) => !headerMatchesNeedle(h));
         let hi = 0;
+        const headerCandidateBuffers = [];
         for (const root of [...matchingHeaders, ...otherHeaders]) {
           const ra = root.getBoundingClientRect();
           const headerDebug = {
@@ -2150,11 +2164,25 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           const got = extractNameFromHeaderRoot(root, headerDebug);
           headerDebug.extractNameFromHeaderRoot = got;
           debug.headersTried.push(headerDebug);
+          if (!got) {
+            const text = clean(root.innerText || '');
+            if (text && isNameLikeCandidate(text)) {
+              headerCandidateBuffers.push(text);
+            }
+          }
           hi += 1;
           if (got) {
             debug.winningPath = 'step1_header_banner_line_adjacent_to_handle';
             return { extracted: got, debug };
           }
+        }
+
+        if (headerCandidateBuffers.length) {
+          const sorted = [...new Set(headerCandidateBuffers)].sort((a, b) => b.length - a.length);
+          const chosen = sorted[0];
+          debug.winningPath = 'step1_header_banner_text_fallback';
+          debug.step1Fallback = { candidates: sorted.slice(0, 10), chosen };
+          return { extracted: chosen, debug };
         }
 
         // 2) Prefer thread header title/name when available (pane only).
@@ -2324,7 +2352,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         };
 
         if (step5Candidates.length) {
-          const uniq = [...new Set(step5Candidates)];
+          const uniq = [...new Set(step5Candidates)].filter((candidate) => !/^view\s*profile$/i.test(candidate));
           uniq.sort((a, b) => b.length - a.length);
           const chosen = uniq[0];
           debug.step5WideColumn.chosen = chosen;
