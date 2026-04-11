@@ -353,18 +353,24 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     let profileListOpened = await tryOpenProfileList(page, cleanTarget, listKind);
     if (!profileListOpened) {
       try {
-        const handled = await dismissReviewDialogs(page);
-        if (handled) {
-          logger.log(`[Scraper] Dismissed additional Review/Terms dialog before retrying ${listKind} modal`);
-          await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
-        }
+        await dismissInstagramPopups(page, logger);
+        await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
       } catch (e) {
-        logger.warn('[Scraper] Failed to handle Review/Terms dialog on retry: ' + e.message);
+        logger.warn('[Scraper] Failed to dismiss popups before retry: ' + e.message);
       }
       profileListOpened = await tryOpenProfileList(page, cleanTarget, listKind);
     }
 
     if (!profileListOpened) {
+      // Log the current URL + first 300 chars of page text so we can diagnose
+      // what Instagram showed without needing to pull the screenshot every time.
+      try {
+        const diagUrl = page.url();
+        const diagText = await page.evaluate(() =>
+          ((document.body && document.body.innerText) || '').slice(0, 300).replace(/\s+/g, ' ').trim()
+        ).catch(() => '');
+        logger.error(`[Scraper] Modal open failed. url=${diagUrl} page_text="${diagText}"`);
+      } catch (_) {}
       try {
         const debugDir = path.join(process.cwd(), 'scraper-debug');
         if (!fs.existsSync(debugDir)) {
@@ -373,7 +379,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         const tag = listKind === 'following' ? 'following' : 'followers';
         const screenshotPath = path.join(debugDir, `${tag}_modal_fail_${String(jobId)}.png`);
         await page.screenshot({ path: screenshotPath, fullPage: true });
-        logger.error('[Scraper] Could not open %s modal – screenshot saved at %s', tag, screenshotPath);
+        logger.error('[Scraper] Screenshot saved: %s', screenshotPath);
       } catch (screenshotErr) {
         logger.error('[Scraper] Failed to capture screenshot on modal error: %s', screenshotErr.message);
       }

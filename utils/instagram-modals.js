@@ -121,7 +121,13 @@ async function dismissInstagramProfileContinue(page) {
     });
 
     if (clicked) {
-      await delay(1000);
+      // Wait for the navigation that follows the "Continue" click to settle.
+      try {
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 });
+      } catch (_) {
+        // Navigation may not always fire (e.g. SPA route change) — that's fine.
+        await delay(1500);
+      }
       return true;
     }
     await delay(800);
