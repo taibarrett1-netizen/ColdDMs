@@ -1629,6 +1629,22 @@ function normalizePlatformSessionRowForPuppeteer(row) {
 }
 
 /**
+ * Count how many platform scraper sessions exist in the pool that are active
+ * and have Puppeteer cookies.  Ignores transient lease / cooldown state so
+ * the number reflects the true pool size (both primary and backup/overflow
+ * sessions), not just what is free right now.  Used by the scrape-worker to
+ * auto-set its concurrency limit.
+ */
+async function countActivePlatformScraperSessions() {
+  const sessions = await getPlatformScraperSessions();
+  return sessions.filter(
+    (s) =>
+      (s.account_state || 'active').toLowerCase() === 'active' &&
+      platformSessionHasPuppeteerCookies(s)
+  ).length;
+}
+
+/**
  * One-line summary for logs when reserve fails (empty pool, no cookies, all leased, etc.).
  */
 async function describePlatformScraperPoolForLogs() {
@@ -1815,13 +1831,24 @@ async function heartbeatPlatformScraperSessionLease(sessionId, workerId, leaseSe
   return !error && !!(data && data.length > 0);
 }
 
-async function releasePlatformScraperSessionLease(sessionId, workerId) {
+async function releasePlatformScraperSessionLease(sessionId, workerId, { cooldownSec = 0 } = {}) {
   const sb = getSupabase();
   if (!sb || !sessionId) return;
   const nowIso = new Date().toISOString();
+  const cooldownUntil =
+    cooldownSec > 0
+      ? new Date(Date.now() + cooldownSec * 1000).toISOString()
+      : null;
+  const updatePayload = {
+    leased_until: null,
+    leased_by_worker: null,
+    lease_heartbeat_at: nowIso,
+    updated_at: nowIso,
+    ...(cooldownUntil ? { cooldown_until: cooldownUntil } : {}),
+  };
   let q = sb
     .from('cold_dm_platform_scraper_sessions')
-    .update({ leased_until: null, leased_by_worker: null, lease_heartbeat_at: nowIso, updated_at: nowIso })
+    .update(updatePayload)
     .eq('id', sessionId);
   if (workerId) q = q.eq('leased_by_worker', workerId);
   await q;
@@ -3903,6 +3930,7 @@ module.exports = {
   getPuppeteerCookiesFromSessionData,
   normalizePlatformSessionRowForPuppeteer,
   pickScraperSessionForJob,
+  countActivePlatformScraperSessions,
   describePlatformScraperPoolForLogs,
   reservePlatformScraperSessionForWorker,
   heartbeatPlatformScraperSessionLease,
