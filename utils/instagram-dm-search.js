@@ -45,9 +45,12 @@ async function clickInstagramDmSearchResult(page, username) {
 
     // Text-only combined match — deliberately excludes href to avoid false positives from
     // URL query params like utm_source=<username> appearing in thread items.
+    // Uses innerText (layout-aware, preserves newlines between display-name/username/bio)
+    // rather than textContent (which collapses "BRYGHTbryght.social" into one token with no boundary).
     function combinedMatchText(el) {
-      const bits = [el.textContent || '', el.getAttribute('aria-label') || '', el.getAttribute('title') || ''];
-      return bits.join(' ').toLowerCase();
+      const text = el.innerText || el.textContent || '';
+      const bits = [text, el.getAttribute('aria-label') || '', el.getAttribute('title') || ''];
+      return bits.join('\n').toLowerCase();
     }
 
     function isReservedPathSegment(seg) {
@@ -82,8 +85,8 @@ async function clickInstagramDmSearchResult(page, username) {
     }
 
     function isChromeOnlyRow(el) {
-      const raw = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      const shortNav = /^(back|next|close|cancel|done|ok|chat|not now|compose|skip|new message|new|clear search)$/i;
+      const raw = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const shortNav = /^(back|next|close|cancel|done|ok|chat|not now|compose|skip|new message|new|clear search|send message)$/i;
       if (raw.length <= 2) return true;
       if (raw.length <= 48 && shortNav.test(raw)) return true;
       return false;
