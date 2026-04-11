@@ -362,32 +362,59 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     }
 
     if (!profileListOpened) {
-      // Log the current URL + first 300 chars of page text so we can diagnose
-      // what Instagram showed without needing to pull the screenshot every time.
+      // Diagnose what Instagram actually showed so we can give a precise error.
+      let diagUrl = '';
+      let diagText = '';
       try {
-        const diagUrl = page.url();
-        const diagText = await page.evaluate(() =>
-          ((document.body && document.body.innerText) || '').slice(0, 300).replace(/\s+/g, ' ').trim()
+        diagUrl = page.url();
+        diagText = await page.evaluate(() =>
+          ((document.body && document.body.innerText) || '').slice(0, 400).replace(/\s+/g, ' ').trim()
         ).catch(() => '');
         logger.error(`[Scraper] Modal open failed. url=${diagUrl} page_text="${diagText}"`);
       } catch (_) {}
+
       try {
         const debugDir = path.join(process.cwd(), 'scraper-debug');
-        if (!fs.existsSync(debugDir)) {
-          fs.mkdirSync(debugDir, { recursive: true });
-        }
+        if (!fs.existsSync(debugDir)) fs.mkdirSync(debugDir, { recursive: true });
         const tag = listKind === 'following' ? 'following' : 'followers';
         const screenshotPath = path.join(debugDir, `${tag}_modal_fail_${String(jobId)}.png`);
         await page.screenshot({ path: screenshotPath, fullPage: true });
         logger.error('[Scraper] Screenshot saved: %s', screenshotPath);
       } catch (screenshotErr) {
-        logger.error('[Scraper] Failed to capture screenshot on modal error: %s', screenshotErr.message);
+        logger.error('[Scraper] Failed to capture screenshot: %s', screenshotErr.message);
       }
-      const modalFailMsg =
-        listKind === 'following'
-          ? 'Could not open following list. Profile may be private or link not found.'
-          : 'Could not open followers list. Profile may be private or link not found.';
-      await failScrapeJob(jobId, modalFailMsg);
+
+      // Detect rate limiting (429) specifically.
+      const is429 =
+        diagUrl.includes('chrome-error://') ||
+        /429|rate.?limit|too many request/i.test(diagText);
+
+      if (is429) {
+        // Re-queue the job with a fresh session slot so it retries automatically
+        // once another (non-rate-limited) session is available.  Clear the
+        // platform_scraper_session_id so the worker reserves a different one.
+        logger.error(
+          `[Scraper] Job ${jobId} rate-limited (429) by Instagram — re-queuing with fresh session`
+        );
+        await updateScrapeJob(jobId, {
+          status: 'retry',
+          available_at: new Date().toISOString(), // available immediately
+          error_message: 'Instagram rate limit (429). Re-queued for a different session.',
+          last_error_class: 'rate_limited_429',
+          platform_scraper_session_id: null, // force fresh session on next claim
+        });
+      } else {
+        const modalFailMsg =
+          listKind === 'following'
+            ? 'Could not open following list. Profile may be private, or the link was not found.'
+            : 'Could not open followers list. Profile may be private, or the link was not found.';
+        await updateScrapeJob(jobId, {
+          status: 'failed',
+          error_message: modalFailMsg,
+          last_error_class: 'modal_open_failed',
+        });
+        logger.error(`[Scraper] Job ${jobId} failed: ${modalFailMsg}`);
+      }
       return;
     }
 

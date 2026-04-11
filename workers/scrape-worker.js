@@ -29,6 +29,8 @@ const { runFollowerScrape, runCommentScrape } = require('../scraper');
 const SCRAPER_POLL_MS = Math.max(1000, parseInt(process.env.SCRAPER_WORKER_POLL_MS || '2000', 10) || 2000);
 const LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 const FAILURE_COOLDOWN_SEC = Math.max(0, parseInt(process.env.SCRAPE_FAILURE_COOLDOWN_SEC || '300', 10) || 300);
+// Rate-limit (429) gets a much longer cooldown so the session can recover.
+const RATE_LIMIT_COOLDOWN_SEC = Math.max(0, parseInt(process.env.SCRAPE_RATE_LIMIT_COOLDOWN_SEC || '3600', 10) || 3600);
 // Optional hard cap. When unset (0), concurrency is auto-derived from the pool.
 const MAX_CONCURRENT_CAP = Math.max(0, parseInt(process.env.SCRAPE_MAX_CONCURRENT || '0', 10) || 0);
 // Re-check pool size every this many ms so concurrency adjusts when sessions are added/removed.
@@ -53,6 +55,7 @@ function normalizeTarget(job) {
 async function processOneJob(workerId, job) {
   let reservedPlatformId = null;
   let jobFailed = false;
+  let finalErrorClass = null;
   try {
     if (!job.platform_scraper_session_id) {
       const reserved = await sb.reservePlatformScraperSessionForWorker(workerId, LEASE_SEC);
@@ -112,7 +115,30 @@ async function processOneJob(workerId, job) {
     }
 
     logger.log(`[scrape-worker] scrape routine returned job=${job.id} (status updated in DB by scraper)`);
-    return true;
+
+    // The scraper updates the DB itself — check the final status so we know
+    // whether to apply a session cooldown even when no exception was thrown.
+    try {
+      const finalJob = await sb.getScrapeJob(job.id);
+      if (finalJob) {
+        finalErrorClass = finalJob.last_error_class || null;
+        if (finalJob.status === 'failed') {
+          jobFailed = true;
+          logger.log(
+            `[scrape-worker] job ${job.id} failed by scraper (error_class=${finalErrorClass || 'none'})`
+          );
+        } else if (finalJob.status === 'retry') {
+          // 429 re-queue: the session still needs its cooldown applied but the
+          // job itself is not permanently failed.
+          jobFailed = true;
+          logger.log(
+            `[scrape-worker] job ${job.id} re-queued by scraper (error_class=${finalErrorClass || 'none'}) — cooldown will apply to session`
+          );
+        }
+      }
+    } catch (_) {}
+
+    return !jobFailed;
   } catch (e) {
     jobFailed = true;
     logger.error(`[scrape-worker] job ${job.id} error`, e);
@@ -124,10 +150,17 @@ async function processOneJob(workerId, job) {
     return false;
   } finally {
     if (reservedPlatformId) {
-      const cooldownSec = jobFailed ? FAILURE_COOLDOWN_SEC : 0;
+      // Use a longer cooldown for rate-limit failures so the session can recover.
+      let cooldownSec = 0;
+      if (jobFailed) {
+        cooldownSec = finalErrorClass === 'rate_limited_429'
+          ? RATE_LIMIT_COOLDOWN_SEC
+          : FAILURE_COOLDOWN_SEC;
+      }
       if (cooldownSec > 0) {
         logger.log(
-          `[scrape-worker] applying ${cooldownSec}s cooldown to session ${reservedPlatformId} after failure`
+          `[scrape-worker] session ${reservedPlatformId} cooldown=${cooldownSec}s` +
+          (finalErrorClass ? ` (${finalErrorClass})` : '')
         );
       }
       await sb.releasePlatformScraperSessionLease(reservedPlatformId, workerId, { cooldownSec }).catch(() => {});
