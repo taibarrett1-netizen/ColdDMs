@@ -2842,22 +2842,24 @@ async function buildSendWorkFromJob(jobId) {
   if (campaign.status !== 'active') {
     // Drain stale queued jobs for inactive/paused/completed campaigns so workers
     // do not repeatedly claim+cancel them one-by-one.
-    await sb
-      .from('cold_dm_send_jobs')
-      .update({
-        status: 'cancelled',
-        finished_at: new Date().toISOString(),
-        leased_until: null,
-        leased_by_worker: null,
-        last_error_class: 'campaign_inactive',
-        last_error_message: `campaign_inactive:${campaign.status}`,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('client_id', job.client_id)
-      .eq('campaign_id', job.campaign_id)
-      .in('status', ['pending', 'retry', 'running'])
-      .neq('id', job.id)
-      .catch(() => {});
+    try {
+      const nowIso = new Date().toISOString();
+      await sb
+        .from('cold_dm_send_jobs')
+        .update({
+          status: 'cancelled',
+          finished_at: nowIso,
+          leased_until: null,
+          leased_by_worker: null,
+          last_error_class: 'campaign_inactive',
+          last_error_message: `campaign_inactive:${campaign.status}`,
+          updated_at: nowIso,
+        })
+        .eq('client_id', job.client_id)
+        .eq('campaign_id', job.campaign_id)
+        .in('status', ['pending', 'retry', 'running'])
+        .neq('id', job.id);
+    } catch {}
     return { job, disposition: 'cancelled', reason: 'campaign_inactive' };
   }
   const { data: leadLink } = await sb
