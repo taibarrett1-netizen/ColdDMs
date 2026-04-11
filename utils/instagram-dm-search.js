@@ -106,7 +106,25 @@ async function clickInstagramDmSearchResult(page, username) {
     function rowLooksLikeSearchHit(el) {
       const c = combinedMatchText(el);
       if (c.includes('more accounts')) return false;
-      // Require a bounded username token; do not allow loose substring matches.
+      // Require an exact username line/token from the visible row (left results list),
+      // not just a token found somewhere in combined text (e.g. URL query preview).
+      const rawText = (el.innerText || el.textContent || '').replace(/\r/g, '');
+      const lines = rawText
+        .split(/\n+/)
+        .map((x) => x.replace(/\s+/g, ' ').trim().toLowerCase())
+        .filter(Boolean);
+      const exactLineMatch = lines.some((ln) => ln.replace(/^@/, '') === needle);
+      if (!exactLineMatch) {
+        // Some IG layouts flatten text into one line; allow exact token among short text chunks only.
+        const shortChunks = rawText
+          .split(/[·•|,:;()\-\/\\]+|\s{2,}/g)
+          .map((x) => x.replace(/\s+/g, ' ').trim().toLowerCase())
+          .filter(Boolean)
+          .filter((x) => x.length <= 40);
+        const exactChunkMatch = shortChunks.some((ch) => ch.replace(/^@/, '') === needle);
+        if (!exactChunkMatch) return false;
+      }
+      // Keep token requirement as a secondary guard.
       if (!needleTokenRe.test(c)) return false;
       if (isChromeOnlyRow(el, c)) return false;
       return true;
@@ -201,6 +219,25 @@ async function clickInstagramDmSearchResult(page, username) {
     if (byText) {
       byText.click();
       return { ok: true, detail: 'text_or_aria_match' };
+    }
+
+    // Fallback for Instagram layouts that do not expose listbox/dialog roles on /direct/new.
+    // Scan visible clickable rows, but keep strict token matching + chrome filtering.
+    const genericClickables = Array.from(document.querySelectorAll('div[role="button"], button, a')).filter(visible);
+    const genericSorted = genericClickables.sort((a, b) => {
+      const ay = rowCenterY(a);
+      const by = rowCenterY(b);
+      if (moreAccountsY != null) {
+        const aInMore = ay > moreAccountsY + 8 ? 1 : 0;
+        const bInMore = by > moreAccountsY + 8 ? 1 : 0;
+        if (aInMore !== bInMore) return bInMore - aInMore;
+      }
+      return ay - by;
+    });
+    const genericRowHit = genericSorted.find((el) => rowLooksLikeSearchHit(el));
+    if (genericRowHit) {
+      genericRowHit.click();
+      return { ok: true, detail: 'generic_clickable_row_match' };
     }
 
     /** Secondary: profile links under dialog/listbox only (avoid sidebar / global nav) */
