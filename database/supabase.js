@@ -39,6 +39,25 @@ function platformScraperReserveDebugEnabled() {
   );
 }
 
+function coldDmMetricsDebugEnabled() {
+  const v = String(process.env.COLD_DM_METRICS_DEBUG || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+function logColdDmMetricsDebug(message, details = null) {
+  if (!coldDmMetricsDebugEnabled()) return;
+  const prefix = '[cold-dm-metrics-debug] ';
+  if (details == null) {
+    console.log(prefix + message);
+    return;
+  }
+  try {
+    console.log(prefix + message + ' ' + JSON.stringify(details));
+  } catch {
+    console.log(prefix + message);
+  }
+}
+
 /** Logs why a compare-and-swap reserve did not return a row (always) or verbose success (when PLATFORM_SCRAPER_RESERVE_DEBUG=1). */
 function logPlatformScraperReserve(message, details = null, opts = {}) {
   const { always = false } = opts;
@@ -912,6 +931,14 @@ async function logSentMessage(
   const skipDailyStats = options && options.skipDailyStats === true;
   const u = normalizeUsername(username);
   const date = await getTodayForClient(clientId);
+  let settingsTimezoneForDebug = null;
+  if (coldDmMetricsDebugEnabled()) {
+    try {
+      settingsTimezoneForDebug = (await getSettings(clientId))?.timezone ?? null;
+    } catch (e) {
+      settingsTimezoneForDebug = { error: e && e.message ? String(e.message) : 'getSettings failed' };
+    }
+  }
   const insertPayload = {
     client_id: clientId,
     username: u,
@@ -924,6 +951,17 @@ async function logSentMessage(
   if (status === 'failed' && failureReason) insertPayload.failure_reason = failureReason;
   const { error: insertErr } = await sb.from('cold_dm_sent_messages').insert(insertPayload);
   if (insertErr) throw insertErr;
+  logColdDmMetricsDebug('insert cold_dm_sent_messages ok', {
+    clientId,
+    username: u,
+    status,
+    campaignId: campaignId || null,
+    messageGroupId: messageGroupId || null,
+    messageGroupMessageId: messageGroupMessageId || null,
+    skipDailyStats,
+    dailyStatsDate: skipDailyStats ? null : date,
+    settingsTimezone: settingsTimezoneForDebug,
+  });
   if (skipDailyStats) return;
 
   // Optimistic CAS retry to avoid lost updates under concurrent writes.
@@ -947,6 +985,12 @@ async function logSentMessage(
         { onConflict: 'client_id,date', ignoreDuplicates: true }
       );
       if (insertStatErr) throw insertStatErr;
+      logColdDmMetricsDebug('daily_stats upsert new row (retry read)', {
+        clientId,
+        date,
+        attempt,
+        status,
+      });
       continue;
     }
 
@@ -962,7 +1006,23 @@ async function logSentMessage(
       .select('client_id')
       .limit(1);
     if (updateErr) throw updateErr;
-    if (updated && updated.length > 0) return;
+    if (updated && updated.length > 0) {
+      logColdDmMetricsDebug('daily_stats CAS update ok', {
+        clientId,
+        date,
+        attempt,
+        status,
+        prev: { total_sent: existing.total_sent, total_failed: existing.total_failed },
+        next: { total_sent: nextTotalSent, total_failed: nextTotalFailed },
+      });
+      return;
+    }
+    logColdDmMetricsDebug('daily_stats CAS miss (retry)', {
+      clientId,
+      date,
+      attempt,
+      expected: { total_sent: existing.total_sent, total_failed: existing.total_failed },
+    });
   }
   throw new Error('Failed to atomically update daily stats after retries');
 }

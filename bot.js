@@ -1854,6 +1854,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 
   if (templateUsesName && (preferThreadName || !displayNameForSubst) && (!nameFallback.display_name || !nameFallback.first_name || preferThreadName)) {
     try {
+      const settleMs = Math.max(0, parseInt(process.env.NAME_EXTRACTION_SETTLE_MS || '0', 10) || 0);
+      if (settleMs) await delay(settleMs);
       const extractionResult = await page.evaluate((username) => {
         const needle = username.replace(/^@/, '').toLowerCase();
         const clean = (s) => (s || '').replace(/\s+/g, ' ').trim();
@@ -2233,6 +2235,35 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             debug.winningPath = 'step3_profile_link_parent';
             return { extracted: txt, debug };
           }
+          // 3b) IG often puts the display name in a sibling of the profile link (or sibling flex cell), not in the link/parent text.
+          const step3bPeers = [];
+          const tryPeerText = (raw, ctx) => {
+            const t = normalizeCandidateName(raw, ctx);
+            if (t) step3bPeers.push(t);
+          };
+          let sEl = profileLink.previousElementSibling;
+          while (sEl) {
+            tryPeerText(sEl.innerText || sEl.textContent || '', 'step3b:prevSibling');
+            sEl = sEl.previousElementSibling;
+          }
+          let anc = profileLink.parentElement;
+          for (let depth = 0; depth < 8 && anc; depth++) {
+            for (const k of Array.from(anc.children || [])) {
+              if (k === profileLink || k.contains(profileLink)) continue;
+              const raw = (k.innerText || k.textContent || '').trim();
+              if (!raw || raw.length > 200) continue;
+              tryPeerText(raw, `step3b:ancestorChild depth=${depth}`);
+            }
+            anc = anc.parentElement;
+          }
+          debug.step3Profile.step3bPeers = step3bPeers.slice(0, 16);
+          if (step3bPeers.length) {
+            const uniq = [...new Set(step3bPeers)].sort((a, b) => b.length - a.length);
+            const chosen = uniq[0];
+            debug.winningPath = 'step3b_profile_row_peer';
+            debug.step3Profile.step3bChosen = chosen;
+            return { extracted: chosen, debug };
+          }
         } else {
           debug.step3Profile = { found: false };
         }
@@ -2308,6 +2339,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           colLeftStep5,
           fromAria: [],
           fromHeadings: [],
+          fromDirAuto: [],
         };
 
         const profileAnchorsWide = Array.from(wideRoot.querySelectorAll('a[href*="instagram.com/"], a[href^="/"]')).filter(
@@ -2344,6 +2376,39 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
             step5Log.fromHeadings.push(t);
           }
         });
+
+        const spanNearProfileAnchor = (spanEl, anchors) => {
+          try {
+            const rs = spanEl.getBoundingClientRect();
+            const cy = rs.top + rs.height / 2;
+            for (const a of anchors) {
+              const ra = a.getBoundingClientRect();
+              const ay = ra.top + ra.height / 2;
+              if (Math.abs(cy - ay) < 140 && Math.abs(rs.left - ra.left) < 420) return true;
+            }
+          } catch {
+            return false;
+          }
+          return false;
+        };
+        if (profileAnchorsWide.length) {
+          wideRoot.querySelectorAll('span[dir="auto"]').forEach((el) => {
+            try {
+              if (!el.offsetParent) return;
+            } catch {
+              return;
+            }
+            if (!inThreadColumn(el)) return;
+            if (!spanNearProfileAnchor(el, profileAnchorsWide)) return;
+            const raw = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (!raw || raw.length > 120) return;
+            const t = normalizeCandidateName(raw, 'step5:span_dir_auto');
+            if (t) {
+              step5Candidates.push(t);
+              step5Log.fromDirAuto.push(t);
+            }
+          });
+        }
 
         debug.step5WideColumn = {
           ...step5Log,
