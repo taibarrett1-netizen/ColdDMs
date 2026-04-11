@@ -73,23 +73,28 @@ async function dismissInstagramCookieConsent(page) {
  * Dismiss the account-switcher overlay that Instagram shows on the home page
  * or when landing on a profile — the one with a "Continue" (or "Continue as X")
  * button next to "Log in to another profile" / "Create new account".
- * Also handles "Continue" buttons on general consent/agree interstitials.
+ *
+ * Uses getBoundingClientRect() for visibility (not offsetParent) because
+ * Instagram's account-switcher page uses position:fixed containers where
+ * offsetParent is always null even for fully visible elements.
  */
 async function dismissInstagramProfileContinue(page) {
   for (let attempt = 0; attempt < 3; attempt++) {
     const clicked = await page.evaluate(() => {
+      // offsetParent is null for position:fixed elements — Instagram's account-
+      // switcher page uses fixed containers, so use getBoundingClientRect instead.
       function visible(el) {
-        return !!(el && el.offsetParent);
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
       }
 
-      // Detect the account-switcher context: page or dialog contains "Continue" +
-      // one of the surrounding signals.
       const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
       const hasContinueContext =
+        bodyText.includes('use another profile') ||
         bodyText.includes('log in to another') ||
         bodyText.includes('create new account') ||
         bodyText.includes('continue as') ||
-        // Generic consent/interstitial "Continue" button
         bodyText.includes('agree and continue') ||
         bodyText.includes('continue to instagram');
 
@@ -98,18 +103,15 @@ async function dismissInstagramProfileContinue(page) {
       const candidates = Array.from(
         document.querySelectorAll('button, [role="button"], div[role="button"], a')
       );
-      // Prefer the primary blue "Continue" / "Continue as …" button.
-      const hit =
-        candidates.find(
-          (el) =>
-            visible(el) &&
-            /^continue(\s+as\s+\S+)?$/i.test((el.textContent || '').replace(/\s+/g, ' ').trim())
-        ) ||
-        candidates.find(
-          (el) =>
-            visible(el) &&
-            /agree and continue/i.test((el.textContent || '').trim())
+      const hit = candidates.find((el) => {
+        if (!visible(el)) return false;
+        const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
+        return (
+          /^continue(\s+as\b.*)?$/i.test(txt) ||
+          /^agree and continue$/i.test(txt) ||
+          /^continue to instagram$/i.test(txt)
         );
+      });
 
       if (hit) {
         hit.click();
@@ -117,10 +119,14 @@ async function dismissInstagramProfileContinue(page) {
       }
       return false;
     });
-    if (!clicked) return false;
+
+    if (clicked) {
+      await delay(1000);
+      return true;
+    }
     await delay(800);
   }
-  return true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -257,6 +263,9 @@ async function dismissInstagramPopups(page, logger) {
     const cookieDismissed = await dismissInstagramCookieConsent(page);
     if (cookieDismissed && logger) {
       logger.log('[instagram-modals] Dismissed cookie consent popup');
+      // Give the page a moment to re-render after the cookie sheet closes before
+      // checking for the account-switcher "Continue" button underneath.
+      await delay(1200);
     }
   } catch (e) {
     if (logger) logger.log('[instagram-modals] cookie consent check error: ' + e.message);
