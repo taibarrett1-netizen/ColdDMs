@@ -3769,9 +3769,19 @@ async function runBotMultiTenant() {
 
     const work = resolved.work;
     const clientId = work.clientId;
+    logger.log(
+      `[send-worker] preparing claimed job ${claimedJob.id} client=${clientId} campaign=${work.campaignId} username=@${work.username}`
+    );
     sb.setClientStatusMessage(clientId, 'Preparing send…').catch(() => {});
     noPauseZeroEmptyRounds = 0;
-    const pause = await sb.getControl(clientId);
+    const pause = await withTimeout(
+      sb.getControl(clientId),
+      SEND_STAGE_TIMEOUT_MS,
+      `getControl timeout after ${SEND_STAGE_TIMEOUT_MS}ms`
+    ).catch((e) => {
+      logger.error(`[send-worker] getControl failed for client ${clientId}: ${e?.message || e}`);
+      return 1;
+    });
     if (pause === '1' || pause === 1) {
       await sb.updateSendJob(claimedJob.id, {
         status: 'retry',
@@ -3782,7 +3792,14 @@ async function runBotMultiTenant() {
       await releaseClaimedCampaignLease(claimedJob.campaign_id);
       continue;
     }
-    const built = await buildAdapterForClient(clientId);
+    const built = await withTimeout(
+      buildAdapterForClient(clientId),
+      SEND_STAGE_TIMEOUT_MS,
+      `buildAdapterForClient timeout after ${SEND_STAGE_TIMEOUT_MS}ms`
+    ).catch((e) => {
+      logger.error(`[send-worker] buildAdapterForClient failed for client ${clientId}: ${e?.message || e}`);
+      return null;
+    });
     if (!built) {
       logger.warn('No adapter for client ' + clientId + ', skipping.');
       await sb.updateSendJob(claimedJob.id, {
@@ -3796,6 +3813,7 @@ async function runBotMultiTenant() {
     }
     const { adapter, minDelayMs, maxDelayMs } = built;
 
+    logger.log(`[send-worker] claiming Instagram session for campaign ${work.campaignId}`);
     const session = await withTimeout(
       sb.claimInstagramSessionForCampaign(clientId, work.campaignId, SEND_WORKER_ID, SEND_LEASE_SECONDS),
       SEND_STAGE_TIMEOUT_MS,
@@ -3861,6 +3879,7 @@ async function runBotMultiTenant() {
       startLeaseHeartbeat();
       startSendJobHeartbeat();
       startCampaignLeaseHeartbeat();
+      logger.log(`[send-worker] restoring Instagram session for @${work.username}`);
       const ok = await withTimeout(
         ensurePageSession(session),
         SEND_STAGE_TIMEOUT_MS,
@@ -3899,6 +3918,7 @@ async function runBotMultiTenant() {
         voice_note_path: work.voiceNotePath || VOICE_NOTE_FILE || null,
         voice_note_mode: work.voiceNoteMode || VOICE_NOTE_MODE || 'after_text',
       };
+      logger.log(`[send-worker] sending DM to @${work.username}`);
       sb.setClientStatusMessage(clientId, 'Sending…').catch(() => {});
 
       // NEW: For voice notes, close browser, convert audio, relaunch so Chrome loads the new file.
