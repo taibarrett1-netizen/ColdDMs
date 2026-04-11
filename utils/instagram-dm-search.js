@@ -18,6 +18,8 @@ async function clickInstagramDmSearchResult(page, username) {
   }
   return page.evaluate((needleRaw) => {
     const needle = needleRaw.toLowerCase();
+    const needleEsc = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const needleTokenRe = new RegExp(`(^|[^a-z0-9._])@?${needleEsc}([^a-z0-9._]|$)`, 'i');
     const body = document.body && document.body.innerText ? document.body.innerText : '';
     const lowerBody = body.toLowerCase();
 
@@ -104,10 +106,8 @@ async function clickInstagramDmSearchResult(page, username) {
     function rowLooksLikeSearchHit(el) {
       const c = combinedMatchText(el);
       if (c.includes('more accounts')) return false;
-      // Require a bounded username token; do not allow loose substring matches
-      // from message previews/URLs (e.g. utm_source containing the needle).
-      const tokenRe = new RegExp(`(^|[^a-z0-9._])@?${needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([^a-z0-9._]|$)`, 'i');
-      if (!tokenRe.test(c)) return false;
+      // Require a bounded username token; do not allow loose substring matches.
+      if (!needleTokenRe.test(c)) return false;
       if (isChromeOnlyRow(el, c)) return false;
       return true;
     }
@@ -142,10 +142,47 @@ async function clickInstagramDmSearchResult(page, username) {
       return out;
     }
 
-    /** Prefer profile links, then listbox options, then buttons with handle in text */
-    const candidates = collectCandidates();
+    function rowCenterY(el) {
+      try {
+        const r = el.getBoundingClientRect();
+        return r.top + r.height / 2;
+      } catch {
+        return Number.POSITIVE_INFINITY;
+      }
+    }
 
-    const byHref = candidates.find((el) => {
+    function nearestMoreAccountsHeadingY() {
+      const headings = Array.from(document.querySelectorAll('*')).filter((el) => {
+        if (!visible(el)) return false;
+        const t = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        return t === 'more accounts';
+      });
+      if (!headings.length) return null;
+      let best = null;
+      for (const h of headings) {
+        const y = rowCenterY(h);
+        if (!Number.isFinite(y)) continue;
+        if (best == null || y < best) best = y;
+      }
+      return best;
+    }
+
+    /** Prefer profile links, then listbox options with exact handle token */
+    const candidates = collectCandidates();
+    const moreAccountsY = nearestMoreAccountsHeadingY();
+
+    const sortedCandidates = [...candidates].sort((a, b) => {
+      const ay = rowCenterY(a);
+      const by = rowCenterY(b);
+      if (moreAccountsY != null) {
+        const aInMore = ay > moreAccountsY + 8 ? 1 : 0;
+        const bInMore = by > moreAccountsY + 8 ? 1 : 0;
+        if (aInMore !== bInMore) return bInMore - aInMore;
+      }
+      return ay - by;
+    });
+
+    const byHref = sortedCandidates.find((el) => {
       const h = resolveInstagramHref(el);
       return h && hrefMatches(h);
     });
@@ -160,7 +197,7 @@ async function clickInstagramDmSearchResult(page, username) {
       return { ok: true, detail: 'href_profile_match' };
     }
 
-    const byText = candidates.find((el) => rowLooksLikeSearchHit(el));
+    const byText = sortedCandidates.find((el) => rowLooksLikeSearchHit(el));
     if (byText) {
       byText.click();
       return { ok: true, detail: 'text_or_aria_match' };

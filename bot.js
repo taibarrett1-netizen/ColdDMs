@@ -2214,7 +2214,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           });
         };
 
-        // 1) DM thread header: prefer header/banner whose text includes the handle (smallest area first), then others.
+        // 1) DM thread top header bar (pfp + display + username): authoritative source.
         const allHeaderRoots = Array.from(pane.querySelectorAll('header, [role="banner"]'));
         const headerMatchesNeedle = (root) => containsUsernameToken(root.innerText || '');
         const matchingHeaders = allHeaderRoots.filter(headerMatchesNeedle).sort((a, b) => {
@@ -2252,6 +2252,47 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
           if (got) {
             debug.winningPath = 'step1_header_banner_line_adjacent_to_handle';
             return { extracted: got, debug };
+          }
+        }
+
+        // 1b) Top-strip direct parser: first line is display name, second line is username.
+        // This mirrors the visible header on desktop and avoids body/list contamination.
+        const topStrip = Array.from(pane.querySelectorAll('header, [role="banner"], [role="navigation"]'))
+          .filter((el) => {
+            try {
+              return !!el && el.offsetParent !== null;
+            } catch {
+              return false;
+            }
+          })
+          .sort((a, b) => {
+            const ra = a.getBoundingClientRect();
+            const rb = b.getBoundingClientRect();
+            return ra.top - rb.top;
+          })[0];
+        if (topStrip) {
+          const lines = (topStrip.innerText || '')
+            .split(/\n/)
+            .map((x) => clean(x))
+            .filter(Boolean);
+          const usernameLineIdx = lines.findIndex((ln) => containsUsernameToken(ln));
+          if (usernameLineIdx > 0) {
+            const rawDisplay = lines[usernameLineIdx - 1];
+            const parsed = normalizeCandidateName(
+              rawDisplay,
+              'step1b:top_header_display_line',
+              { allowEqualsUsername: true }
+            );
+            debug.step1TopBar = {
+              lineCount: lines.length,
+              usernameLineIdx,
+              displayLine: rawDisplay || null,
+              parsed: parsed || null,
+            };
+            if (parsed) {
+              debug.winningPath = 'step1b_top_header_display_above_username';
+              return { extracted: parsed, debug };
+            }
           }
         }
 
