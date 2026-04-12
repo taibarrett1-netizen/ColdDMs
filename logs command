@@ -9,8 +9,9 @@ pm2 logs ig-dm-bot
 For both dashboard and bot:
 pm2 logs --lines 0
 
-cd ~/ColdDMs && git pull origin main && npm install && pm2 restart all
-cd ~/ColdDMs && git pull origin main && npm install && pm2 restart ig-dm-dashboard
+ cd ~/ColdDMs && git pull origin main && npm install && pm2 restart all
+
+ cd ~/ColdDMs && git pull origin main && npm install && pm2 restart ig-dm-dashboard
 
 screenshot=/root/ColdDMs/logs/login-debug/1775764011860_before_submit.png
 cd /root/ColdDMs

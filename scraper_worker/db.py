@@ -1,6 +1,7 @@
 import json
 import os
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 
 import psycopg2
 import psycopg2.extras
@@ -209,4 +210,77 @@ def insert_lead_if_new(conn, client_id, username, source, lead_group_id=None):
     row = cur.fetchone()
   conn.commit()
   return bool(row)
+
+
+def _format_reset_in_text(delta: timedelta) -> str:
+  total_minutes = max(0, int((delta.total_seconds() + 59) // 60))
+  if total_minutes <= 1:
+    return "less than 1 minute"
+  days = total_minutes // (60 * 24)
+  hours = (total_minutes % (60 * 24)) // 60
+  minutes = total_minutes % 60
+  parts = []
+  if days > 0:
+    parts.append(f"{days}d")
+  if hours > 0:
+    parts.append(f"{hours}h")
+  if minutes > 0 and days == 0:
+    parts.append(f"{minutes}m")
+  return " ".join(parts)
+
+
+def get_scrape_quota_status(conn, client_id):
+  limit = 1000
+  now = datetime.now(timezone.utc)
+  window_start = now - timedelta(days=7)
+  with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+    cur.execute(
+      """
+      SELECT COUNT(*)::int AS used
+      FROM cold_dm_leads
+      WHERE client_id = %s
+        AND added_at >= %s
+        AND (
+          source ILIKE 'followers:%%'
+          OR source ILIKE 'following:%%'
+          OR source ILIKE 'comments:%%'
+        )
+      """,
+      (client_id, window_start),
+    )
+    row = cur.fetchone() or {}
+    used = int(row.get("used") or 0)
+    remaining = max(0, limit - used)
+    reset_at = None
+    if used > 0:
+      cur.execute(
+        """
+        SELECT added_at
+        FROM cold_dm_leads
+        WHERE client_id = %s
+          AND added_at >= %s
+          AND (
+            source ILIKE 'followers:%%'
+            OR source ILIKE 'following:%%'
+            OR source ILIKE 'comments:%%'
+          )
+        ORDER BY added_at ASC
+        LIMIT 1
+        """,
+        (client_id, window_start),
+      )
+      oldest = cur.fetchone()
+      oldest_added_at = oldest.get("added_at") if oldest else None
+      if oldest_added_at is not None:
+        reset_at = oldest_added_at + timedelta(days=7)
+    reset_delta = (reset_at - now) if reset_at is not None else timedelta()
+    reset_in_text = _format_reset_in_text(reset_delta)
+    return {
+      "limit": limit,
+      "used": used,
+      "remaining": remaining,
+      "reset_at": reset_at,
+      "reset_in_text": reset_in_text,
+      "message": f"1000 leads maximum reached, please wait for your scraping usage to reset in {reset_in_text}.",
+    }
 

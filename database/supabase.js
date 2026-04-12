@@ -679,6 +679,42 @@ async function claimInstagramSessionForCampaign(clientId, campaignId, workerId, 
   return null;
 }
 
+/**
+ * Best-effort human-readable reason when a campaign is waiting for a leased Instagram session.
+ * Uses the same campaign/session assignment scope as claimInstagramSessionForCampaign.
+ */
+async function getWaitingInstagramSessionReason(clientId, campaignId) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !campaignId) return null;
+  const sessions = await getSessionsForCampaign(clientId, campaignId);
+  if (!sessions?.length) return null;
+  const now = Date.now();
+  const leased = sessions
+    .filter((s) => s?.leased_until && new Date(s.leased_until).getTime() > now)
+    .sort((a, b) => new Date(a.leased_until).getTime() - new Date(b.leased_until).getTime());
+  if (leased.length === 0) return null;
+
+  const locked = leased[0];
+  const username = locked.instagram_username ? `@${String(locked.instagram_username).trim().replace(/^@/, '')}` : 'an Instagram account';
+  const workerId = locked.leased_by_worker ? String(locked.leased_by_worker).trim() : '';
+  if (!workerId) return `Waiting for ${username} to become available.`;
+
+  const { data: blockingCampaign } = await sb
+    .from('cold_dm_campaigns')
+    .select('id, name')
+    .eq('client_id', clientId)
+    .eq('status', 'active')
+    .neq('id', campaignId)
+    .eq('send_leased_by_worker', workerId)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (blockingCampaign?.name) {
+    return `Waiting for ${username} to finish "${String(blockingCampaign.name)}".`;
+  }
+  return `Waiting for ${username} to become available.`;
+}
+
 async function heartbeatInstagramSessionLease(sessionId, workerId, leaseSeconds = 600) {
   const sb = getSupabase();
   if (!sb || !sessionId || !workerId) return false;
@@ -1077,6 +1113,37 @@ async function getDailyStats(clientId) {
     : { date, total_sent: 0, total_failed: 0 };
 }
 
+async function getDailyStatsForTimezone(clientId, timezone) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return { date: getToday(), total_sent: 0, total_failed: 0 };
+  const tz = normalizeTimezoneInput(timezone) || 'UTC';
+  const date = getTodayInTimezone(tz);
+  const sinceIso = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+  const { data, error } = await sb
+    .from('cold_dm_sent_messages')
+    .select('status, sent_at')
+    .eq('client_id', clientId)
+    .gte('sent_at', sinceIso)
+    .in('status', ['success', 'failed']);
+  if (error) throw error;
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  let total_sent = 0;
+  let total_failed = 0;
+  for (const row of data || []) {
+    if (!row?.sent_at) continue;
+    const rowDate = fmt.format(new Date(row.sent_at));
+    if (rowDate !== date) continue;
+    if (row.status === 'success') total_sent += 1;
+    else if (row.status === 'failed') total_failed += 1;
+  }
+  return { date, total_sent, total_failed };
+}
+
 async function getHourlySent(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return 0;
@@ -1096,7 +1163,7 @@ async function getCampaignLimitsById(campaignId) {
   if (!sb || !campaignId) return null;
   const { data, error } = await sb
     .from('cold_dm_campaigns')
-    .select('id, daily_send_limit, hourly_send_limit')
+    .select('id, daily_send_limit, hourly_send_limit, timezone')
     .eq('id', campaignId)
     .maybeSingle();
   if (error) throw error;
@@ -2026,6 +2093,78 @@ async function createScrapeJob(
     .single();
   if (error) throw error;
   return data?.id;
+}
+
+function formatRelativeDuration(ms) {
+  const safeMs = Math.max(0, Number(ms) || 0);
+  const totalMinutes = Math.ceil(safeMs / 60000);
+  if (totalMinutes <= 1) return 'less than 1 minute';
+  const days = Math.floor(totalMinutes / (60 * 24));
+  const hours = Math.floor((totalMinutes % (60 * 24)) / 60);
+  const minutes = totalMinutes % 60;
+  const parts = [];
+  if (days > 0) parts.push(`${days}d`);
+  if (hours > 0) parts.push(`${hours}h`);
+  if (minutes > 0 && days === 0) parts.push(`${minutes}m`);
+  return parts.join(' ');
+}
+
+function scrapeQuotaReachedMessage(resetInText) {
+  return `1000 leads maximum reached, please wait for your scraping usage to reset in ${resetInText}.`;
+}
+
+function applyScrapedLeadSourceFilter(query) {
+  return query.or('source.ilike.followers:%,source.ilike.following:%,source.ilike.comments:%');
+}
+
+async function getScrapeQuotaStatus(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const limit = 1000;
+  const windowMs = 7 * 24 * 60 * 60 * 1000;
+  const nowMs = Date.now();
+  const windowStartIso = new Date(nowMs - windowMs).toISOString();
+
+  let countQuery = sb
+    .from('cold_dm_leads')
+    .select('id', { count: 'exact', head: true })
+    .eq('client_id', clientId)
+    .gte('added_at', windowStartIso);
+  countQuery = applyScrapedLeadSourceFilter(countQuery);
+  const { count, error: countErr } = await countQuery;
+  if (countErr) throw countErr;
+  const used = Math.max(0, Number(count || 0));
+  const remaining = Math.max(0, limit - used);
+
+  let resetAtIso = null;
+  if (used > 0) {
+    let oldestQuery = sb
+      .from('cold_dm_leads')
+      .select('added_at')
+      .eq('client_id', clientId)
+      .gte('added_at', windowStartIso)
+      .order('added_at', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    oldestQuery = applyScrapedLeadSourceFilter(oldestQuery);
+    const { data: oldestRow, error: oldestErr } = await oldestQuery;
+    if (oldestErr) throw oldestErr;
+    const oldestAddedAt = oldestRow?.added_at ? new Date(oldestRow.added_at).getTime() : NaN;
+    if (Number.isFinite(oldestAddedAt)) {
+      resetAtIso = new Date(oldestAddedAt + windowMs).toISOString();
+    }
+  }
+  const resetInMs = resetAtIso ? Math.max(0, new Date(resetAtIso).getTime() - nowMs) : 0;
+  const resetInText = formatRelativeDuration(resetInMs);
+  return {
+    limit,
+    used,
+    remaining,
+    resetAtIso,
+    resetInMs,
+    resetInText,
+    message: scrapeQuotaReachedMessage(resetInText),
+  };
 }
 
 async function updateScrapeJob(jobId, updates) {
@@ -3897,6 +4036,7 @@ module.exports = {
   getInstagramSessionByIdForClient,
   getSessions,
   getSessionsForCampaign,
+  getWaitingInstagramSessionReason,
   claimInstagramSessionLease,
   claimInstagramSessionForCampaign,
   heartbeatInstagramSessionLease,
@@ -3913,6 +4053,7 @@ module.exports = {
   alreadySent,
   logSentMessage,
   getDailyStats,
+  getDailyStatsForTimezone,
   getHourlySent,
   getCampaignLimitsById,
   getControl,
@@ -3941,6 +4082,7 @@ module.exports = {
   getScrapeBlocklistUsernames,
   getSentUsernames,
   createScrapeJob,
+  getScrapeQuotaStatus,
   updateScrapeJob,
   retryScrapeJob,
   getScrapeJob,

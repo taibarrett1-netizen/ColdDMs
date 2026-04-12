@@ -21,6 +21,7 @@ const {
   retryScrapeJob,
   getScrapeJob,
   upsertLeadsBatch,
+  getScrapeQuotaStatus,
   getConversationParticipantUsernames,
   getSentUsernames,
   getScrapeBlocklistUsernames,
@@ -38,6 +39,17 @@ const { dismissInstagramPopups } = require('./utils/instagram-modals');
 async function failScrapeJob(jobId, errorMessage) {
   logger.error(`[Scraper] Job ${jobId} failed: ${errorMessage}`);
   await updateScrapeJob(jobId, { status: 'failed', error_message: errorMessage });
+}
+
+async function completeScrapeJobForQuota(jobId, clientId, scrapedCount) {
+  const quota = await getScrapeQuotaStatus(clientId);
+  const msg = quota?.message || '1000 leads maximum reached, please wait for your scraping usage to reset.';
+  logger.warn(`[Scraper] Job ${jobId} quota stop: ${msg}`);
+  await updateScrapeJob(jobId, {
+    status: 'completed',
+    scraped_count: Math.max(0, Number(scrapedCount) || 0),
+    error_message: msg,
+  });
 }
 
 /**
@@ -653,6 +665,14 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       if (effectiveMax && totalScraped + newLeads.length > effectiveMax) {
         newLeads = newLeads.slice(0, effectiveMax - totalScraped);
       }
+      const quotaStatus = await getScrapeQuotaStatus(clientId).catch(() => null);
+      if (quotaStatus && quotaStatus.remaining <= 0) {
+        await completeScrapeJobForQuota(jobId, clientId, totalScraped);
+        return;
+      }
+      if (quotaStatus && newLeads.length > quotaStatus.remaining) {
+        newLeads = newLeads.slice(0, quotaStatus.remaining);
+      }
       for (const lead of newLeads) {
         const u = (typeof lead === 'string' ? lead : lead.username).trim().replace(/^@/, '').toLowerCase();
         seenUsernames.add(u);
@@ -678,6 +698,11 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         if (effectiveMax && totalScraped >= effectiveMax) {
           logger.log(`[Scraper] Reached limit (${effectiveMax}). Stopping.`);
           break;
+        }
+        const quotaAfterInsert = await getScrapeQuotaStatus(clientId).catch(() => null);
+        if (quotaAfterInsert && quotaAfterInsert.remaining <= 0) {
+          await completeScrapeJobForQuota(jobId, clientId, totalScraped);
+          return;
         }
       } else {
         if (noNewCount >= MAX_NO_NEW) {
@@ -1249,6 +1274,14 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
             (!postAuthor || u !== postAuthor)
         );
         newUsernames = [...new Set(newUsernames)];
+        const quotaStatus = await getScrapeQuotaStatus(clientId).catch(() => null);
+        if (quotaStatus && quotaStatus.remaining <= 0) {
+          await completeScrapeJobForQuota(jobId, clientId, totalScraped);
+          return;
+        }
+        if (quotaStatus && newUsernames.length > quotaStatus.remaining) {
+          newUsernames = newUsernames.slice(0, quotaStatus.remaining);
+        }
         if (maxLeads && totalScraped + newUsernames.length > maxLeads) {
           newUsernames = newUsernames.slice(0, maxLeads - totalScraped);
         }
@@ -1260,6 +1293,11 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           await updateScrapeJob(jobId, { scraped_count: totalScraped });
           noNewCount = 0;
           logger.log('[Scraper] Comments: +' + newUsernames.length + ' new, total ' + totalScraped);
+          const quotaAfterInsert = await getScrapeQuotaStatus(clientId).catch(() => null);
+          if (quotaAfterInsert && quotaAfterInsert.remaining <= 0) {
+            await completeScrapeJobForQuota(jobId, clientId, totalScraped);
+            return;
+          }
           if (maxLeads && totalScraped >= maxLeads) break;
         } else {
           noNewCount++;

@@ -19,6 +19,7 @@ from .db import (
   get_status_for_job,
   load_filter_sets,
   insert_lead_if_new,
+  get_scrape_quota_status,
 )
 from .instagram_client import build_client_from_session
 
@@ -104,6 +105,22 @@ def _should_cancel(conn, job_id: str) -> bool:
   return status and status != "running"
 
 
+def _stop_job_for_quota(conn, job: dict, scraped_new: int) -> bool:
+  quota = get_scrape_quota_status(conn, job["client_id"])
+  if quota.get("remaining", 0) > 0:
+    return False
+  msg = quota.get("message") or "1000 leads maximum reached, please wait for your scraping usage to reset."
+  logger.info("Quota reached for client=%s job=%s: %s", job.get("client_id"), job.get("id"), msg)
+  update_scrape_job(
+    conn,
+    job["id"],
+    status="completed",
+    scraped_count=int(scraped_new or 0),
+    error_message=str(msg)[:500],
+  )
+  return True
+
+
 def scrape_followers(conn, job: dict):
   client_id = job["client_id"]
   target_username = (job.get("target_username") or "").strip().lstrip("@").lower()
@@ -142,6 +159,8 @@ def scrape_followers(conn, job: dict):
   ) = load_filter_sets(conn, client_id)
 
   scraped_new = int(job.get("scraped_count") or 0)
+  if _stop_job_for_quota(conn, job, scraped_new):
+    return
 
   max_leads = job.get("max_leads") or None
   if max_leads is not None:
@@ -205,11 +224,15 @@ def scrape_followers(conn, job: dict):
     ):
       continue
 
+    if _stop_job_for_quota(conn, job, scraped_new):
+      return
     is_new = insert_lead_if_new(conn, client_id, username, source, lead_group_id)
     if is_new:
       existing_leads.add(username)
       scraped_new += 1
       batch_new += 1
+      if _stop_job_for_quota(conn, job, scraped_new):
+        return
 
     if max_leads is not None and scraped_new >= max_leads:
       logger.info("Reached max_leads=%s, completing job. Total new leads: %d", max_leads, scraped_new)
@@ -280,6 +303,8 @@ def scrape_following(conn, job: dict):
   ) = load_filter_sets(conn, client_id)
 
   scraped_new = int(job.get("scraped_count") or 0)
+  if _stop_job_for_quota(conn, job, scraped_new):
+    return
 
   max_leads = job.get("max_leads") or None
   if max_leads is not None:
@@ -338,11 +363,15 @@ def scrape_following(conn, job: dict):
     ):
       continue
 
+    if _stop_job_for_quota(conn, job, scraped_new):
+      return
     is_new = insert_lead_if_new(conn, client_id, username, source, lead_group_id)
     if is_new:
       existing_leads.add(username)
       scraped_new += 1
       batch_new += 1
+      if _stop_job_for_quota(conn, job, scraped_new):
+        return
 
     if max_leads is not None and scraped_new >= max_leads:
       logger.info("Reached max_leads=%s, completing job. Total new leads: %d", max_leads, scraped_new)
@@ -452,6 +481,8 @@ def scrape_followers_via_graphql(conn, job: dict):
   ) = load_filter_sets(conn, client_id)
 
   scraped_new = int(job.get("scraped_count") or 0)
+  if _stop_job_for_quota(conn, job, scraped_new):
+    return
 
   max_leads = job.get("max_leads") or None
   if max_leads is not None:
@@ -712,6 +743,8 @@ def scrape_comments(conn, job: dict):
   ) = load_filter_sets(conn, client_id)
 
   scraped_new = int(job.get("scraped_count") or 0)
+  if _stop_job_for_quota(conn, job, scraped_new):
+    return
 
   for raw_url in post_urls:
     if max_leads is not None and scraped_new >= max_leads:
@@ -758,10 +791,14 @@ def scrape_comments(conn, job: dict):
       ):
         continue
 
+      if _stop_job_for_quota(conn, job, scraped_new):
+        return
       is_new = insert_lead_if_new(conn, client_id, username, source, lead_group_id)
       if is_new:
         existing_leads.add(username)
         scraped_new += 1
+        if _stop_job_for_quota(conn, job, scraped_new):
+          return
 
       if max_leads is not None and scraped_new >= max_leads:
         logger.info("Reached max_leads=%s, completing job. Total new leads: %d", max_leads, scraped_new)

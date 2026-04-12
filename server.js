@@ -28,6 +28,7 @@ const {
   getScraperSession,
   saveScraperSession,
   getLatestScrapeJob,
+  getScrapeQuotaStatus,
   createScrapeJob,
   cancelScrapeJob,
   savePlatformScraperSession,
@@ -1301,10 +1302,19 @@ app.post('/api/scraper/start', async (req, res) => {
   }
 
   try {
+    const quota = await getScrapeQuotaStatus(clientId);
+    if (quota.remaining <= 0) {
+      return res.status(400).json({
+        ok: false,
+        error: quota.message,
+        scrapeQuota: quota,
+      });
+    }
     const targetForJob =
       scrapeType === 'comments' ? '_comment_scrape' : target_username.trim().replace(/^@/, '');
     const requestedMaxLeads = max_leads != null && max_leads > 0 ? max_leads : null;
-    const effectiveMaxLeads = requestedMaxLeads != null && requestedMaxLeads > 0 ? requestedMaxLeads : null;
+    const boundedMax = requestedMaxLeads != null && requestedMaxLeads > 0 ? Math.min(requestedMaxLeads, quota.remaining) : quota.remaining;
+    const effectiveMaxLeads = boundedMax > 0 ? boundedMax : null;
     const jobId = await createScrapeJob(
       clientId,
       targetForJob,
@@ -1320,6 +1330,11 @@ app.post('/api/scraper/start', async (req, res) => {
       jobId,
       mode: 'queued',
       deferred: true,
+      scrapeQuota: {
+        used: quota.used,
+        remaining: quota.remaining,
+        limit: quota.limit,
+      },
       hint: 'Run PM2 process ig-dm-scrape (workers/scrape-worker.js) to drain scrape jobs.',
     });
   } catch (e) {

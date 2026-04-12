@@ -3336,7 +3336,7 @@ async function sendDM(page, username, adapter, options = {}) {
       : null;
   const effectiveDailyLimit = freshCampaignLimits ? freshCampaignLimits.daily_send_limit : dailySendLimit;
   const effectiveHourlyLimit = freshCampaignLimits ? freshCampaignLimits.hourly_send_limit : hourlySendLimit;
-  const stats = await Promise.resolve(adapter.getDailyStats());
+  const stats = await Promise.resolve(adapter.getDailyStats(campaignId, effectiveDailyLimit));
   const hourlySent = await Promise.resolve(adapter.getHourlySent());
   const limitState = evaluateCampaignLimitState({
     sentToday: stats.total_sent,
@@ -3508,7 +3508,16 @@ async function buildAdapterForClient(clientId) {
     alreadySent: (u) => sb.alreadySent(clientId, u),
     logSentMessage: (u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason) =>
       sb.logSentMessage(clientId, u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason),
-    getDailyStats: () => sb.getDailyStats(clientId),
+    getDailyStats: async (campaignId = null, campaignDailyLimit = null) => {
+      if (campaignId && campaignDailyLimit != null && Number.isFinite(Number(campaignDailyLimit))) {
+        const limits = await sb.getCampaignLimitsById(campaignId).catch(() => null);
+        const campaignTz = limits?.timezone ?? null;
+        if (campaignTz && typeof sb.getDailyStatsForTimezone === 'function') {
+          return sb.getDailyStatsForTimezone(clientId, campaignTz);
+        }
+      }
+      return sb.getDailyStats(clientId);
+    },
     getHourlySent: () => sb.getHourlySent(clientId),
     getControl: () => sb.getControl(clientId),
     setControl: (v) => sb.setControl(clientId, v),
@@ -3908,12 +3917,15 @@ async function runBotMultiTenant() {
     });
     if (!session) {
       logger.warn(`No Instagram session available for campaign ${work.campaignId}, waiting.`);
-      await sb.setClientStatusMessage(clientId, 'Waiting for an available Instagram session…').catch(() => {});
+      const waitingReason =
+        (await sb.getWaitingInstagramSessionReason(clientId, work.campaignId).catch(() => null)) ||
+        'Waiting for an available Instagram session…';
+      await sb.setClientStatusMessage(clientId, waitingReason).catch(() => {});
       await sb.updateSendJob(claimedJob.id, {
         status: 'retry',
         available_at: new Date(Date.now() + randomDelay(15, 45) * 1000).toISOString(),
         last_error_class: 'waiting_for_session',
-        last_error_message: 'waiting_for_session',
+        last_error_message: waitingReason,
       }, SEND_WORKER_ID).catch(() => {});
       await releaseClaimedCampaignLease(claimedJob.campaign_id);
       await delay(randomDelay(5000, 15000));
@@ -3921,6 +3933,7 @@ async function runBotMultiTenant() {
     }
     leasedSessionIdForSignal = session.id;
     leasedCampaignIdForSignal = work.campaignId;
+    await sb.updateSendJob(claimedJob.id, { instagram_session_id: session.id }, SEND_WORKER_ID).catch(() => {});
     const leaseHeartbeatMs = Math.max(30000, Math.min(60000, Math.floor((SEND_LEASE_SECONDS * 1000) / 2)));
     let leaseHeartbeatTimer = null;
     let sendJobHeartbeatTimer = null;
