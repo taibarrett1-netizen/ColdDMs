@@ -59,6 +59,26 @@ const SEND_STAGE_TIMEOUT_MS = Math.max(
   15000,
   parseInt(process.env.SEND_STAGE_TIMEOUT_MS || '30000', 10) || 30000
 );
+/** When daily cap is hit, push the whole campaign queue forward at least this long (default 1h). Shorter values caused a claim → restore → limit → repeat log storm. */
+const SEND_DAILY_LIMIT_DEFER_MS = Math.max(
+  5 * 60 * 1000,
+  parseInt(process.env.SEND_DAILY_LIMIT_DEFER_MS || String(60 * 60 * 1000), 10) || 60 * 60 * 1000
+);
+/** Min interval between identical send-limit logs per campaign (default 10m). */
+const SEND_LIMIT_LOG_THROTTLE_MS = Math.max(
+  30_000,
+  parseInt(process.env.SEND_LIMIT_LOG_THROTTLE_MS || String(10 * 60 * 1000), 10) || 10 * 60 * 1000
+);
+const sendLimitLogLast = new Map();
+
+function throttleSendLimitLog(key, emit) {
+  const now = Date.now();
+  const prev = sendLimitLogLast.get(key) || 0;
+  if (now - prev < SEND_LIMIT_LOG_THROTTLE_MS) return;
+  sendLimitLogLast.set(key, now);
+  emit();
+}
+
 const COLD_DM_CONCURRENCY_DEBUG =
   String(process.env.COLD_DM_CONCURRENCY_DEBUG || '').trim().toLowerCase() === '1' ||
   String(process.env.COLD_DM_CONCURRENCY_DEBUG || '').trim().toLowerCase() === 'true' ||
@@ -3355,7 +3375,9 @@ async function sendDM(page, username, adapter, options = {}) {
     hourlySendLimit: effectiveHourlyLimit,
   });
   if (limitState.blocked) {
-    logger.warn(limitState.statusMessage);
+    throttleSendLimitLog(`sendDM:${campaignId || 'no-campaign'}:${limitState.reason}`, () => {
+      logger.warn(limitState.statusMessage);
+    });
     return { ok: false, reason: limitState.reason, statusMessage: limitState.statusMessage };
   }
 
@@ -3903,10 +3925,6 @@ async function runBotMultiTenant() {
 
     const work = resolved.work;
     const clientId = work.clientId;
-    logger.log(
-      `[send-worker] preparing claimed job ${claimedJob.id} client=${clientId} campaign=${work.campaignId} username=@${work.username}`
-    );
-    sb.setClientStatusMessage(clientId, 'Preparing send…').catch(() => {});
     noPauseZeroEmptyRounds = 0;
     const pause = await withTimeout(
       sb.getControl(clientId),
@@ -3946,6 +3964,59 @@ async function runBotMultiTenant() {
       continue;
     }
     const { adapter, minDelayMs, maxDelayMs } = built;
+
+    const campaignLimitsEarly =
+      work.campaignId && typeof sb.getCampaignLimitsById === 'function'
+        ? await sb.getCampaignLimitsById(work.campaignId).catch(() => null)
+        : null;
+    const effDailyEarly = campaignLimitsEarly?.daily_send_limit ?? work.dailySendLimit;
+    const effHourlyEarly = campaignLimitsEarly?.hourly_send_limit ?? work.hourlySendLimit;
+    try {
+      const statsEarly = await adapter.getDailyStats(work.campaignId, effDailyEarly);
+      const hourlyEarly = await adapter.getHourlySent();
+      const limEarly = evaluateCampaignLimitState({
+        sentToday: statsEarly.total_sent,
+        sentThisHour: hourlyEarly,
+        dailySendLimit: effDailyEarly,
+        hourlySendLimit: effHourlyEarly,
+      });
+      if (limEarly.blocked) {
+        const msg = limEarly.statusMessage || limEarly.reason;
+        const isDaily = limEarly.reason === 'daily_limit';
+        const deferMs = isDaily
+          ? SEND_DAILY_LIMIT_DEFER_MS
+          : randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
+        const untilIso = new Date(Date.now() + deferMs).toISOString();
+        throttleSendLimitLog(`early:${work.campaignId}:${limEarly.reason}`, () => {
+          logger.warn(msg);
+          logger.log(
+            `[send-worker] Deferring campaign ${work.campaignId} queue ~${Math.round(deferMs / 60000)} min (${limEarly.reason}).`
+          );
+        });
+        await sb.setClientStatusMessage(clientId, msg).catch(() => {});
+        await sb.updateSendJob(
+          claimedJob.id,
+          {
+            status: 'retry',
+            available_at: untilIso,
+            last_error_class: limEarly.reason,
+            last_error_message: msg,
+          },
+          SEND_WORKER_ID
+        ).catch(() => {});
+        await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, untilIso).catch(() => {});
+        await releaseClaimedCampaignLease(claimedJob.campaign_id);
+        await delay(400);
+        continue;
+      }
+    } catch (e) {
+      logger.warn(`[send-worker] early send limit check failed (continuing): ${e.message || e}`);
+    }
+
+    logger.log(
+      `[send-worker] preparing claimed job ${claimedJob.id} client=${clientId} campaign=${work.campaignId} username=@${work.username}`
+    );
+    sb.setClientStatusMessage(clientId, 'Preparing send…').catch(() => {});
 
     logger.log(`[send-worker] claiming Instagram session for campaign ${work.campaignId}`);
     const session = await withTimeout(
@@ -4107,7 +4178,9 @@ async function runBotMultiTenant() {
       if (!sendResult.ok && sendResult.reason === 'hourly_limit') {
         delayMs = randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
         const msg = sendResult.statusMessage || 'hourly limit reached';
-        logger.log(`${msg}. Sleeping ${Math.round(delayMs / 60000)} minutes until window resets.`);
+        throttleSendLimitLog(`postSend:hourly:${work.campaignId}`, () => {
+          logger.log(`${msg}. Sleeping ${Math.round(delayMs / 60000)} minutes until window resets.`);
+        });
         sb.setClientStatusMessage(clientId, `${msg}. Next send in ~60 min.`).catch(() => {});
         sendJobStatus = 'retry';
         sendJobUpdates = {
@@ -4116,9 +4189,11 @@ async function runBotMultiTenant() {
           last_error_message: msg,
         };
       } else if (!sendResult.ok && sendResult.reason === 'daily_limit') {
-        delayMs = randomDelay(5 * 60 * 1000, 10 * 60 * 1000);
+        delayMs = SEND_DAILY_LIMIT_DEFER_MS;
         const msg = sendResult.statusMessage || 'daily limit reached';
-        logger.log(`${msg}. Rechecking in ${Math.round(delayMs / 60000)} minutes.`);
+        throttleSendLimitLog(`postSend:daily:${work.campaignId}`, () => {
+          logger.log(`${msg}. Rechecking in ~${Math.round(delayMs / 60000)} minutes.`);
+        });
         sb.setClientStatusMessage(clientId, msg).catch(() => {});
         sendJobStatus = 'retry';
         sendJobUpdates = {
@@ -4174,21 +4249,26 @@ async function runBotMultiTenant() {
       }
       await sb.updateSendJob(claimedJob.id, { status: sendJobStatus, ...sendJobUpdates }, SEND_WORKER_ID).catch(() => {});
 
-      // ── Cooldown: stamp available_at on remaining campaign jobs instead of blocking sleep ──
-      // This lets this worker immediately claim work from OTHER clients while the campaign
-      // cooldown ticks down. The job claiming query already filters `available_at <= now`,
-      // so campaign B's jobs are picked up right away while campaign A waits.
-      // Only apply the stamp for genuine send cooldowns (not hourly/daily limit retries,
-      // which already set available_at directly on the job via sendJobUpdates).
-      const isSendCooldown = sendJobStatus === 'completed' || sendJobStatus === 'failed';
-      if (isSendCooldown && delayMs > 1000 && work && work.campaignId) {
-        const cooldownUntilIso = new Date(Date.now() + delayMs).toISOString();
-        await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, cooldownUntilIso).catch(() => {});
-        // Brief yield so the DB write propagates before the next claim attempt.
+      // ── Cooldown / limits: stamp available_at on remaining campaign jobs instead of blocking sleep ──
+      // This lets this worker immediately claim work from OTHER clients while the campaign waits.
+      const limitWholeCampaignDefer =
+        sendJobStatus === 'retry' &&
+        work?.campaignId &&
+        sendJobUpdates.available_at &&
+        (sendJobUpdates.last_error_class === 'daily_limit' ||
+          sendJobUpdates.last_error_class === 'hourly_limit');
+      if (limitWholeCampaignDefer) {
+        await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, sendJobUpdates.available_at).catch(() => {});
         await delay(500);
       } else {
-        // For non-send-cooldown cases (already_sent, short delays) keep a short sleep.
-        await delay(Math.min(delayMs, 1500));
+        const isSendCooldown = sendJobStatus === 'completed' || sendJobStatus === 'failed';
+        if (isSendCooldown && delayMs > 1000 && work && work.campaignId) {
+          const cooldownUntilIso = new Date(Date.now() + delayMs).toISOString();
+          await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, cooldownUntilIso).catch(() => {});
+          await delay(500);
+        } else {
+          await delay(Math.min(delayMs, 1500));
+        }
       }
     } catch (e) {
       logger.error(`Unexpected send loop error for client ${clientId} campaign ${work.campaignId}: ${e.message}`, e);
