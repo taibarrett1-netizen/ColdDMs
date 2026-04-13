@@ -8,6 +8,10 @@
  *   - Account-switcher / profile "Continue" confirmation
  *   - "Turn on Notifications" / "Save your login" dialogs
  *   - "Review and Agree" / terms / privacy update dialogs
+ *   - "See this post in the app" / comment upsell (close only, not Open Instagram)
+ *
+ * For /accounts/login with saved cookies, call activateInstagramSavedSessionFromLoginPage
+ * (used by comment scraper after home load) to tap "Continue as @user" without a password.
  */
 
 function delay(ms) {
@@ -200,6 +204,165 @@ async function dismissInstagramHomeModals(page, logger) {
 }
 
 // ---------------------------------------------------------------------------
+// "Open app" / web upsell (mobile web often blocks comments behind this sheet)
+// ---------------------------------------------------------------------------
+
+/**
+ * Dismiss "See this post in the app" / "Use the app to view all comments" sheets.
+ * Prefers close/dismiss controls — never clicks "Open Instagram" (would leave web).
+ */
+async function dismissInstagramAppWebUpsell(page, logger) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const action = await page.evaluate(() => {
+      const body = ((document.body && document.body.innerText) || '').toLowerCase();
+      const upsell =
+        body.includes('see this post in the app') ||
+        body.includes('use the app to view all comments') ||
+        (body.includes('open instagram') &&
+          (body.includes('sign up') || body.includes('see this post')));
+      if (!upsell) return null;
+
+      function rectVisible(el) {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 4 && r.height > 4;
+      }
+
+      const all = Array.from(
+        document.querySelectorAll('[aria-label], button, [role="button"], a, div[role="button"]')
+      );
+      for (let i = 0; i < all.length; i++) {
+        const el = all[i];
+        if (!rectVisible(el)) continue;
+        const al = (el.getAttribute('aria-label') || '').toLowerCase();
+        if (
+          /\bclose\b/.test(al) ||
+          /\bdismiss\b/.test(al) ||
+          al === 'back' ||
+          al.includes('close') ||
+          al.includes('schlie') /* de */
+        ) {
+          (el.closest('[role="button"]') || el.closest('button') || el).click();
+          return 'aria_label_close';
+        }
+      }
+
+      const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="presentation"]'));
+      for (let d = 0; d < dialogs.length; d++) {
+        const root = dialogs[d];
+        const svgs = root.querySelectorAll('svg');
+        for (let s = 0; s < svgs.length; s++) {
+          const btn = svgs[s].closest('button, [role="button"], a, div[role="button"]');
+          if (!btn || !rectVisible(btn)) continue;
+          const r = btn.getBoundingClientRect();
+          if (r.top < 140 && r.right > window.innerWidth * 0.5) {
+            btn.click();
+            return 'dialog_corner_svg';
+          }
+        }
+      }
+
+      return 'try_escape';
+    });
+
+    if (action === 'try_escape') {
+      await page.keyboard.press('Escape').catch(() => {});
+      await delay(700);
+      continue;
+    }
+    if (action) {
+      if (logger) logger.log('[instagram-modals] Dismissed app/web upsell: ' + action);
+      await delay(1100);
+      continue;
+    }
+    break;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Saved session on /accounts/login (tap profile / "Continue as" — no password)
+// ---------------------------------------------------------------------------
+
+/**
+ * When cookies exist but IG shows the login chooser, click through to the known
+ * pool username without entering a password.
+ */
+async function activateInstagramSavedSessionFromLoginPage(page, logger, usernameHint) {
+  const url = page.url() || '';
+  if (!url.includes('instagram.com') || !url.includes('/accounts/login')) return false;
+
+  const hint = String(usernameHint || '')
+    .trim()
+    .replace(/^@/, '')
+    .toLowerCase();
+  if (!hint) return false;
+
+  const clicked = await page.evaluate((un) => {
+    function rectVisible(el) {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 4 && r.height > 4;
+    }
+
+    const candidates = Array.from(
+      document.querySelectorAll('a[href], button, [role="button"], div[role="button"]')
+    );
+
+    for (let i = 0; i < candidates.length; i++) {
+      const el = candidates[i];
+      if (!rectVisible(el)) continue;
+      const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      const low = t.toLowerCase();
+      if (/create new account|sign up for instagram|sign up with phone/i.test(low)) continue;
+      if (/^log in to another profile$/i.test(low) || /^use another profile$/i.test(low)) continue;
+
+      if (/^continue as\b/i.test(t)) {
+        if (!un || low.includes(un)) {
+          el.click();
+          return 'continue_as';
+        }
+      }
+      if (un && low === un && t.length <= 40) {
+        el.click();
+        return 'username_tile';
+      }
+    }
+
+    for (let i = 0; i < candidates.length; i++) {
+      const el = candidates[i];
+      if (el.tagName !== 'A') continue;
+      const href = (el.getAttribute('href') || '').toLowerCase();
+      if (!href) continue;
+      const profilePath = '/' + un + '/';
+      const looksLikeProfile =
+        href.includes(profilePath) ||
+        href.endsWith('/' + un) ||
+        href.includes('/' + un + '?');
+      if (!looksLikeProfile) continue;
+      if (href.includes('/accounts/signup') || href.includes('/accounts/emailsignup')) continue;
+      if (rectVisible(el)) {
+        el.click();
+        return 'profile_href';
+      }
+    }
+
+    return false;
+  }, hint);
+
+  if (clicked && logger) {
+    logger.log('[instagram-modals] Activated saved session from login page: ' + clicked + ' (@' + hint + ')');
+  }
+  if (clicked) {
+    try {
+      await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 12000 });
+    } catch (_) {
+      await delay(2000);
+    }
+  }
+  return Boolean(clicked);
+}
+
+// ---------------------------------------------------------------------------
 // Review / Terms / Privacy update dialogs
 // ---------------------------------------------------------------------------
 
@@ -297,6 +460,12 @@ async function dismissInstagramPopups(page, logger) {
   } catch (e) {
     if (logger) logger.log('[instagram-modals] review dialog check error: ' + e.message);
   }
+
+  try {
+    await dismissInstagramAppWebUpsell(page, logger);
+  } catch (e) {
+    if (logger) logger.log('[instagram-modals] app web upsell check error: ' + e.message);
+  }
 }
 
 /** Close sticker picker / GIF / emoji popovers that steal clicks from the mic. */
@@ -312,6 +481,8 @@ module.exports = {
   dismissInstagramProfileContinue,
   dismissInstagramHomeModals,
   dismissInstagramReviewDialogs,
+  dismissInstagramAppWebUpsell,
+  activateInstagramSavedSessionFromLoginPage,
   dismissInstagramPopups,
   closeDmComposerOverlays,
   delay,

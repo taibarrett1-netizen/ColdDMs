@@ -33,7 +33,7 @@ const {
 } = require('./database/supabase');
 const logger = require('./utils/logger');
 const { applyMobileEmulation } = require('./utils/mobile-viewport');
-const { dismissInstagramPopups } = require('./utils/instagram-modals');
+const { dismissInstagramPopups, activateInstagramSavedSessionFromLoginPage } = require('./utils/instagram-modals');
 
 /** Log + persist failure (early returns used to only update the DB, so PM2 showed nothing after "claimed job"). */
 async function failScrapeJob(jobId, errorMessage) {
@@ -1213,16 +1213,28 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     const page = await browser.newPage();
     await applyMobileEmulation(page);
     await page.setCookie(...session.session_data.cookies);
+
+    const preferredIgUser = (session?.instagram_username || '').trim().replace(/^@/, '').toLowerCase();
+    const scraperDebug = scraperDebugEnabled();
+
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(randomDelay(1500, 3500));
+
+    await dismissInstagramPopups(page, logger).catch(() => {});
+    await activateInstagramSavedSessionFromLoginPage(page, logger, preferredIgUser).catch(() => {});
+    await dismissInstagramPopups(page, logger).catch(() => {});
+    if (page.url().includes('/accounts/login')) {
+      await delay(1800 + Math.floor(Math.random() * 1000));
+      await activateInstagramSavedSessionFromLoginPage(page, logger, preferredIgUser).catch(() => {});
+      await dismissInstagramPopups(page, logger).catch(() => {});
+    }
+
+    await commentScrapeDebugScreenshot(page, logger, scraperDebug, jobId, 'home', 'after-home-session-check');
 
     if (page.url().includes('/accounts/login')) {
       await failScrapeJob(jobId, 'Scraper session expired. Reconnect scraper.');
       return;
     }
-
-    // Dismiss any blocking popups on home page load.
-    await dismissInstagramPopups(page, logger).catch(() => {});
 
     logger.log('[Scraper] Warming session before comment scrape...');
     await delay(3000 + Math.floor(Math.random() * 5000));
@@ -1230,7 +1242,6 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     await delay(2000 + Math.floor(Math.random() * 3000));
 
     logger.log('[Scraper] Comment scrape: ' + postUrls.length + ' post(s)');
-    const scraperDebug = scraperDebugEnabled();
     let totalScraped = 0;
     const seenUsernames = new Set();
     const [inConvos, sentUsernames, blocklistUsernames] = await Promise.all([

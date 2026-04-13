@@ -22,7 +22,7 @@
  *   SCRAPER_DEBUG=1                — verbose scrape logs; comment jobs also log DOM snapshots
  *                                    (href samples, igAbsProfileHints, dialogs, view-all text)
  *                                    and write viewport PNGs under logs/comment-scrape-debug/
- *                                    (warm-scroll-start / warm-scroll-end per post)
+ *                                    (after-home-session-check, warm-scroll-start / -end per post)
  */
 require('dotenv').config();
 const os = require('os');
