@@ -1119,6 +1119,28 @@ async function logCommentScrapeDomDebug(page, logger, label, extra = null) {
   logger.log('[Scraper] comment DOM debug [' + label + '] url=' + page.url() + tail + ' ' + JSON.stringify(d));
 }
 
+function safeCommentDebugFilePart(s) {
+  return String(s || 'x').replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 64);
+}
+
+/** Viewport PNG when SCRAPER_DEBUG is on — see logs/comment-scrape-debug/ */
+async function commentScrapeDebugScreenshot(page, logger, enabled, jobId, shortcode, phase) {
+  if (!enabled) return;
+  try {
+    const dir = path.join(__dirname, 'logs', 'comment-scrape-debug');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const ts = Date.now();
+    const out = path.join(
+      dir,
+      `${safeCommentDebugFilePart(jobId)}_${safeCommentDebugFilePart(shortcode || 'post')}_${phase}_${ts}.png`
+    );
+    await page.screenshot({ path: out, type: 'png', fullPage: false });
+    logger.log('[Scraper] comment scrape debug screenshot ' + phase + ' -> ' + out);
+  } catch (e) {
+    logger.warn('[Scraper] comment scrape debug screenshot failed ' + phase + ': ' + (e.message || e));
+  }
+}
+
 /**
  * Run comment scrape: navigate to post URLs, extract commenter usernames.
  * @param {string} clientId
@@ -1301,6 +1323,8 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       let anchorCount = await page.evaluate(() => document.querySelectorAll('a[href^="/"]').length);
       if (scraperDebug) logger.log('[Scraper] After open: anchors=' + anchorCount);
 
+      await commentScrapeDebugScreenshot(page, logger, scraperDebug, jobId, shortcode, 'warm-scroll-start');
+
       for (let s = 0; s < 8; s++) {
         await page.evaluate(function () {
           const all = document.querySelectorAll('div, section, main, [role="main"]');
@@ -1318,6 +1342,8 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         if (scraperDebug) logger.log('[Scraper] Scroll ' + s + ': anchors=' + anchorCount);
         if (anchorCount > 15 && anchorCount === prev) break;
       }
+
+      await commentScrapeDebugScreenshot(page, logger, scraperDebug, jobId, shortcode, 'warm-scroll-end');
 
       if (scraperDebug) await logCommentScrapeDomDebug(page, logger, 'after-warm-scrolls', { anchorCount });
 

@@ -21,6 +21,7 @@ admin_lab/.cache/
 
 # Logs
 logs/*.log
+logs/comment-scrape-debug/
 
 # Follow-up debug screenshots (may contain DMs)
 follow-up-screenshots/
