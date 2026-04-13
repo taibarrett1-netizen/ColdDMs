@@ -19,6 +19,8 @@
  *                                    failure (default: 300 = 5 min)
  *   SCRAPER_WORKER_POLL_MS         — idle poll when no jobs queued (default: 2000 ms)
  *   SCRAPER_SESSION_LEASE_SEC      — session lease duration (default: 240 s)
+ *   SCRAPER_DEBUG=1                — verbose scrape logs; comment jobs also log DOM snapshots
+ *                                    (href samples, igAbsProfileHints, dialogs, view-all text)
  */
 require('dotenv').config();
 const os = require('os');
@@ -150,20 +152,44 @@ async function processOneJob(workerId, job) {
     return false;
   } finally {
     if (reservedPlatformId) {
-      // Use a longer cooldown for rate-limit failures so the session can recover.
-      let cooldownSec = 0;
+      let skipRelease = false;
       if (jobFailed) {
-        cooldownSec = finalErrorClass === 'rate_limited_429'
-          ? RATE_LIMIT_COOLDOWN_SEC
-          : FAILURE_COOLDOWN_SEC;
+        let errClass = finalErrorClass || 'scrape_failure';
+        let errMsg = '';
+        try {
+          const em = await sb.getScrapeJob(job.id);
+          errMsg = (em && (em.last_error_message || em.error_message)) || '';
+          if (!finalErrorClass && em?.last_error_class) errClass = em.last_error_class;
+        } catch (_) {}
+        const cooldownSec =
+          errClass === 'rate_limited_429' ? RATE_LIMIT_COOLDOWN_SEC : FAILURE_COOLDOWN_SEC;
+        const reported = await sb
+          .reportPlatformScraperScrapeFailure(job.id, reservedPlatformId, workerId, errClass, errMsg, {
+            cooldownSec,
+          })
+          .catch(() => ({ ok: false }));
+        if (reported && reported.ok) {
+          skipRelease = true;
+          logger.log(
+            `[scrape-worker] session ${reservedPlatformId} failure reported via RPC ` +
+              `(requeued=${reported.requeued} final_failure=${reported.final_failure})`
+          );
+        }
       }
-      if (cooldownSec > 0) {
-        logger.log(
-          `[scrape-worker] session ${reservedPlatformId} cooldown=${cooldownSec}s` +
-          (finalErrorClass ? ` (${finalErrorClass})` : '')
-        );
+      if (!skipRelease) {
+        let cooldownSec = 0;
+        if (jobFailed) {
+          cooldownSec =
+            finalErrorClass === 'rate_limited_429' ? RATE_LIMIT_COOLDOWN_SEC : FAILURE_COOLDOWN_SEC;
+        }
+        if (cooldownSec > 0) {
+          logger.log(
+            `[scrape-worker] session ${reservedPlatformId} cooldown=${cooldownSec}s` +
+            (finalErrorClass ? ` (${finalErrorClass})` : '')
+          );
+        }
+        await sb.releasePlatformScraperSessionLease(reservedPlatformId, workerId, { cooldownSec }).catch(() => {});
       }
-      await sb.releasePlatformScraperSessionLease(reservedPlatformId, workerId, { cooldownSec }).catch(() => {});
     }
   }
 }

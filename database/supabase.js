@@ -1758,6 +1758,9 @@ async function describePlatformScraperPoolForLogs() {
 async function reservePlatformScraperSessionForWorker(workerId, leaseSec = 180) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
+  const fromRpc = await tryLeasePlatformScraperSessionViaRpc(workerId, leaseSec);
+  if (fromRpc) return fromRpc;
+
   const nowIso = new Date().toISOString();
   const leaseUntil = computeLeaseUntil(leaseSec);
   const sessions = await getPlatformScraperSessions();
@@ -1886,6 +1889,13 @@ async function reservePlatformScraperSessionForWorker(workerId, leaseSec = 180) 
 async function heartbeatPlatformScraperSessionLease(sessionId, workerId, leaseSec = 180) {
   const sb = getSupabase();
   if (!sb || !sessionId || !workerId) return false;
+  const { data: rpcOk, error: rpcErr } = await sb.rpc('heartbeat_platform_scraper_session', {
+    p_session_id: sessionId,
+    p_worker_id: workerId,
+    p_lease_seconds: leaseSec,
+  });
+  if (!rpcErr && rpcOk === true) return true;
+
   const nowIso = new Date().toISOString();
   const leaseUntil = computeLeaseUntil(leaseSec);
   const { data, error } = await sb
@@ -1896,6 +1906,44 @@ async function heartbeatPlatformScraperSessionLease(sessionId, workerId, leaseSe
     .select('id')
     .limit(1);
   return !error && !!(data && data.length > 0);
+}
+
+/**
+ * Mid-scrape failure: cooldown session, error_events, requeue job (RPC). Best-effort.
+ * Falls back to releasePlatformScraperSessionLease in scrape-worker when this returns ok:false.
+ */
+async function reportPlatformScraperScrapeFailure(
+  jobId,
+  platformSessionId,
+  workerId,
+  errorClass,
+  errorMessage,
+  opts = {}
+) {
+  const sb = getSupabase();
+  if (!sb || !jobId || !platformSessionId || !workerId) {
+    return { ok: false, error: 'missing args' };
+  }
+  const cooldownSec = opts.cooldownSec != null ? Number(opts.cooldownSec) : null;
+  const cooldownMinutes =
+    opts.cooldownMinutes != null
+      ? Math.max(5, parseInt(opts.cooldownMinutes, 10) || 45)
+      : cooldownSec != null && cooldownSec > 0
+        ? Math.max(5, Math.ceil(cooldownSec / 60))
+        : 45;
+  const { data, error } = await sb.rpc('report_platform_scraper_scrape_failure', {
+    p_scrape_job_id: jobId,
+    p_platform_session_id: platformSessionId,
+    p_worker_id: workerId,
+    p_error_class: (errorClass && String(errorClass).slice(0, 120)) || 'unknown',
+    p_error_message: (errorMessage && String(errorMessage).slice(0, 2000)) || '',
+    p_cooldown_minutes: cooldownMinutes,
+    p_quarantine_session: !!opts.quarantine,
+  });
+  if (error) return { ok: false, error: error.message };
+  const row = data && typeof data === 'object' ? data : null;
+  if (row && row.ok === true) return { ok: true, requeued: row.requeued, final_failure: row.final_failure };
+  return { ok: false, error: (row && row.error) || 'rpc not ok' };
 }
 
 async function releasePlatformScraperSessionLease(sessionId, workerId, { cooldownSec = 0 } = {}) {
@@ -1919,6 +1967,38 @@ async function releasePlatformScraperSessionLease(sessionId, workerId, { cooldow
     .eq('id', sessionId);
   if (workerId) q = q.eq('leased_by_worker', workerId);
   await q;
+}
+
+/**
+ * Prefer Postgres lease_platform_scraper_session (primary-before-backup, SKIP LOCKED).
+ * Validates Puppeteer cookies + daily usage in JS (RPC does not enforce those).
+ */
+async function tryLeasePlatformScraperSessionViaRpc(workerId, leaseSec = 180) {
+  const sb = getSupabase();
+  if (!sb || !workerId) return null;
+  const { data, error } = await sb.rpc('lease_platform_scraper_session', {
+    p_worker_id: workerId,
+    p_lease_seconds: leaseSec,
+  });
+  if (error) return null;
+  const rows = Array.isArray(data) ? data : data != null ? [data] : [];
+  const row = rows[0];
+  if (!row?.id) return null;
+  if (!platformSessionHasPuppeteerCookies(row)) {
+    await releasePlatformScraperSessionLease(row.id, workerId, { cooldownSec: 0 });
+    return null;
+  }
+  const usage = await getPlatformScraperUsageToday([row.id]);
+  const lim = row.daily_actions_limit || 500;
+  if ((usage[row.id] || 0) >= lim) {
+    await releasePlatformScraperSessionLease(row.id, workerId, { cooldownSec: 0 });
+    return null;
+  }
+  return {
+    id: row.id,
+    session_data: row.session_data,
+    instagram_username: row.instagram_username,
+  };
 }
 
 async function getPlatformScraperUsageToday(sessionIds) {
@@ -4076,6 +4156,7 @@ module.exports = {
   reservePlatformScraperSessionForWorker,
   heartbeatPlatformScraperSessionLease,
   releasePlatformScraperSessionLease,
+  reportPlatformScraperScrapeFailure,
   recordScraperActions,
   savePlatformScraperSession,
   getConversationParticipantUsernames,

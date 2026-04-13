@@ -1044,6 +1044,80 @@ function getShortcodeFromPostUrl(url) {
   return m ? m[1] : null;
 }
 
+function scraperDebugEnabled() {
+  const v = String(process.env.SCRAPER_DEBUG || '').trim().toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+/**
+ * In-browser snapshot for comment-scrape debugging (href shapes, dialogs, "view all" text).
+ * Helps when extract uses a[href^="/"] but IG serves full URLs or a different shell.
+ */
+async function logCommentScrapeDomDebug(page, logger, label, extra = null) {
+  const d = await page.evaluate(function () {
+    const hrefsRelSample = [];
+    document.querySelectorAll('a[href^="/"]').forEach(function (a, i) {
+      if (i < 22) hrefsRelSample.push((a.getAttribute('href') || '').slice(0, 140));
+    });
+    const hrefsAnySample = [];
+    document.querySelectorAll('a[href]').forEach(function (a, i) {
+      if (i < 32) hrefsAnySample.push((a.getAttribute('href') || '').slice(0, 140));
+    });
+    const skip = {
+      p: 1,
+      reel: 1,
+      reels: 1,
+      stories: 1,
+      explore: 1,
+      accounts: 1,
+      direct: 1,
+      tv: 1,
+      tags: 1,
+      graphql: 1,
+      legal: 1,
+      privacy: 1,
+    };
+    const igProfileFromAbs = [];
+    document.querySelectorAll('a[href*="instagram.com"]').forEach(function (a) {
+      const h = a.getAttribute('href') || '';
+      const m = h.match(/instagram\.com\/([A-Za-z0-9._]{1,30})(?:\/|\?|#|$)/i);
+      if (m && !skip[m[1].toLowerCase()]) igProfileFromAbs.push(m[1].toLowerCase());
+    });
+    const viewAllLike = [];
+    document.querySelectorAll('a, span, div[role="button"], button, [role="button"]').forEach(function (el) {
+      const t = (el.textContent || '').trim().replace(/\s+/g, ' ');
+      if (!t || t.length > 100) return;
+      const low = t.toLowerCase();
+      if (low.indexOf('view all') !== -1 || low.indexOf('comment') !== -1 || /^\d+\s*comments?$/i.test(t)) {
+        if (viewAllLike.length < 14) viewAllLike.push(t);
+      }
+    });
+    const usernameFromRel = [];
+    document.querySelectorAll('a[href^="/"]').forEach(function (a) {
+      const href = (a.getAttribute('href') || '').trim();
+      const m = href.match(/^\/([^/?#]+)\/?$/);
+      if (!m) return;
+      const u = m[1].toLowerCase();
+      if (u && u.length >= 2 && u.length <= 30 && /^[a-z0-9._]+$/.test(u)) usernameFromRel.push(u);
+    });
+    return {
+      hrefRelCount: document.querySelectorAll('a[href^="/"]').length,
+      hrefAnyCount: document.querySelectorAll('a[href]').length,
+      hrefIgHostCount: document.querySelectorAll('a[href*="instagram.com"]').length,
+      hrefsRelSample: hrefsRelSample,
+      hrefsAnySample: hrefsAnySample,
+      extractStyleUsernames: [...new Set(usernameFromRel)],
+      igAbsProfileHints: [...new Set(igProfileFromAbs)].slice(0, 28),
+      roleDialog: document.querySelectorAll('[role="dialog"]').length,
+      rolePresentation: document.querySelectorAll('[role="presentation"]').length,
+      articles: document.querySelectorAll('article').length,
+      viewAllLikeTexts: viewAllLike,
+    };
+  });
+  const tail = extra ? ' ' + JSON.stringify(extra) : '';
+  logger.log('[Scraper] comment DOM debug [' + label + '] url=' + page.url() + tail + ' ' + JSON.stringify(d));
+}
+
 /**
  * Run comment scrape: navigate to post URLs, extract commenter usernames.
  * @param {string} clientId
@@ -1133,6 +1207,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     await delay(2000 + Math.floor(Math.random() * 3000));
 
     logger.log('[Scraper] Comment scrape: ' + postUrls.length + ' post(s)');
+    const scraperDebug = scraperDebugEnabled();
     let totalScraped = 0;
     const seenUsernames = new Set();
     const [inConvos, sentUsernames, blocklistUsernames] = await Promise.all([
@@ -1155,6 +1230,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
       await dismissInstagramPopups(page, logger).catch(() => {});
+      if (scraperDebug) await logCommentScrapeDomDebug(page, logger, 'post-loaded', { shortcode: shortcode || null });
 
       const candidateAuthors = await page.evaluate(function () {
         const blacklist = ['explore', 'direct', 'accounts', 'reels', 'stories', 'p', 'tv', 'tags'];
@@ -1209,11 +1285,20 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         await delay(randomDelay(800, 1500));
       }
 
+      if (scraperDebug) {
+        await logCommentScrapeDomDebug(page, logger, 'after-view-all-attempts', {
+          commentsOpened,
+          attemptsUsed: commentsOpened ? 'ok' : 'none',
+        });
+      }
+      if (!commentsOpened) {
+        logger.warn('[Scraper] Comment scrape: never clicked "View all comments" — check viewAllLikeTexts in prior DOM debug line');
+      }
+
       await delay(randomDelay(3000, 5000));
 
-      const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
       let anchorCount = await page.evaluate(() => document.querySelectorAll('a[href^="/"]').length);
-      if (SCRAPER_DEBUG) logger.log('[Scraper] After open: anchors=' + anchorCount);
+      if (scraperDebug) logger.log('[Scraper] After open: anchors=' + anchorCount);
 
       for (let s = 0; s < 8; s++) {
         await page.evaluate(function () {
@@ -1229,9 +1314,11 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         await delay(randomDelay(1500, 3000));
         const prev = anchorCount;
         anchorCount = await page.evaluate(() => document.querySelectorAll('a[href^="/"]').length);
-        if (SCRAPER_DEBUG) logger.log('[Scraper] Scroll ' + s + ': anchors=' + anchorCount);
+        if (scraperDebug) logger.log('[Scraper] Scroll ' + s + ': anchors=' + anchorCount);
         if (anchorCount > 15 && anchorCount === prev) break;
       }
+
+      if (scraperDebug) await logCommentScrapeDomDebug(page, logger, 'after-warm-scrolls', { anchorCount });
 
       let noNewCount = 0;
       let scrollCount = 0;
@@ -1250,8 +1337,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           return [...new Set(out)];
         });
 
-        const SCRAPER_DEBUG = process.env.SCRAPER_DEBUG === '1' || process.env.SCRAPER_DEBUG === 'true';
-        if (SCRAPER_DEBUG) {
+        if (scraperDebug) {
           const why = usernames.map((u) => {
             if (seenUsernames.has(u)) return u + ':seen';
             if (BLACKLIST.has(u)) return u + ':blacklist';
@@ -1262,6 +1348,9 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
             return u + ':new';
           });
           logger.log('[Scraper] Comment extract: raw=' + usernames.length + ' [' + usernames.join(',') + '] seen=' + Array.from(seenUsernames).join(',') + ' why=' + why.join(' '));
+        }
+        if (scraperDebug && usernames.length === 0 && noNewCount === 0) {
+          await logCommentScrapeDomDebug(page, logger, 'extract-iteration-raw-0', { scrollCount, noNewCount });
         }
 
         let newUsernames = usernames.filter(
@@ -1301,10 +1390,15 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           if (maxLeads && totalScraped >= maxLeads) break;
         } else {
           noNewCount++;
-          if (!SCRAPER_DEBUG && usernames.length > 0 && noNewCount === 1) {
+          if (!scraperDebug && usernames.length > 0 && noNewCount === 1) {
             logger.log('[Scraper] Comment extract: raw=' + usernames.length + ', new=0 (set SCRAPER_DEBUG=1 for details)');
           }
-          if (noNewCount >= 3) break;
+          if (noNewCount >= 3) {
+            if (scraperDebug && usernames.length === 0) {
+              await logCommentScrapeDomDebug(page, logger, 'giving-up-raw-0-after-3-empty-rounds', { scrollCount });
+            }
+            break;
+          }
         }
 
         const commentsOpened = await page.evaluate(function () {
@@ -1329,7 +1423,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           });
           return { count: scrollables.length, items: info, anchors: document.querySelectorAll('a[href^="/"]').length };
         });
-        if (SCRAPER_DEBUG) {
+        if (scraperDebug) {
           logger.log('[Scraper] Scroll: containers=' + scrollDebug.count + ' anchors=' + scrollDebug.anchors + ' ' + scrollDebug.items.join(' '));
         }
 
