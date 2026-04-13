@@ -38,6 +38,7 @@ const {
   dismissInstagramPopups,
   ensurePoolScraperInstagramWebSession,
   detectInstagramPasswordReauthScreen,
+  instagramPoolOneTapLoginChooserVisible,
 } = require('./utils/instagram-modals');
 
 /** Log + persist failure (early returns used to only update the DB, so PM2 showed nothing after "claimed job"). */
@@ -1171,6 +1172,15 @@ async function instagramMobilePostLooksLikeLoggedOutGuest(page) {
   }
 }
 
+/** Pool scraper cannot scrape until this is false (login path, password, one-tap chooser, or guest signup shell). */
+async function poolScraperWebSessionBlocksWork(page, usernameHint) {
+  if (!page) return true;
+  if (await poolScraperPageLooksLoggedOut(page)) return true;
+  if (await instagramPoolOneTapLoginChooserVisible(page, usernameHint)) return true;
+  if (await instagramMobilePostLooksLikeLoggedOutGuest(page)) return true;
+  return false;
+}
+
 async function commentScrapeDebugScreenshot(page, logger, enabled, jobId, shortcode, phase) {
   if (!enabled) return;
   try {
@@ -1267,11 +1277,11 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(randomDelay(1500, 3500));
 
-    await ensurePoolScraperInstagramWebSession(page, logger, preferredIgUser, jobId);
+    const poolEstablishedHome = await ensurePoolScraperInstagramWebSession(page, logger, preferredIgUser, jobId);
 
     await commentScrapeDebugScreenshot(page, logger, scraperDebug, jobId, 'home', 'after-home-session-check');
 
-    if (await poolScraperPageLooksLoggedOut(page)) {
+    if (!poolEstablishedHome || (await poolScraperWebSessionBlocksWork(page, preferredIgUser))) {
       await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape home');
       return;
     }
@@ -1313,8 +1323,8 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         );
         await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
         await delay(1500 + Math.floor(Math.random() * 900));
-        await ensurePoolScraperInstagramWebSession(page, logger, scraperUsername, jobId);
-        if (await poolScraperPageLooksLoggedOut(page)) {
+        const poolOkGuest = await ensurePoolScraperInstagramWebSession(page, logger, scraperUsername, jobId);
+        if (!poolOkGuest || (await poolScraperWebSessionBlocksWork(page, scraperUsername))) {
           await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape after guest retry');
           return;
         }

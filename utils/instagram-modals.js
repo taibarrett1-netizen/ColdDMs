@@ -144,12 +144,17 @@ async function resolveContinueButtonDiagnostics(page, usernameHint) {
     }
 
     const buttonEls = Array.from(document.querySelectorAll('button')).filter(visible);
-    const samples = buttonEls.slice(0, 20).map(function (b) {
-      return {
-        tag: b.tagName,
-        text: normalizeLabel(b).slice(0, 100),
-      };
-    });
+    const samples = [];
+    for (let i = 0; i < Math.min(buttonEls.length, 14); i++) {
+      samples.push({ tag: 'BUTTON', text: normalizeLabel(buttonEls[i]).slice(0, 100) });
+    }
+    const roleBtnEls = Array.from(document.querySelectorAll('div[role="button"], a[role="button"]')).filter(visible);
+    for (let i = 0; i < Math.min(roleBtnEls.length, 10); i++) {
+      samples.push({
+        tag: roleBtnEls[i].tagName + '[role=button]',
+        text: normalizeLabel(roleBtnEls[i]).slice(0, 100),
+      });
+    }
 
     const candidates = [];
     const roles = Array.from(
@@ -379,11 +384,12 @@ async function clickInstagramProfileContinueIfPresent(page, logger, usernameHint
   }
 
   try {
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 });
-  } catch (_) {
-    await delay(2500);
-  }
-  await delay(1800);
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 9000 }).catch(() => {}),
+      delay(3500),
+    ]);
+  } catch (_) {}
+  await delay(1400);
 
   await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'round' + strategyIndex + '-after-continue');
 
@@ -401,6 +407,8 @@ async function dismissInstagramProfileContinue(page, logger, usernameHint) {
  * Comment / pool scraper: cookie consent → Continue as pool user → modals →
  * optional /accounts/login saved-tap. Repeats until the one-tap shell is gone
  * or max rounds (stale cookies still fail later on /accounts/login).
+ *
+ * @returns {Promise<boolean>} true if the chooser/login shell is gone and home does not look like a logged-out guest strip.
  */
 async function ensurePoolScraperInstagramWebSession(page, logger, usernameHint, debugJobId) {
   const hint = (usernameHint || '').trim().replace(/^@/, '').toLowerCase();
@@ -409,6 +417,14 @@ async function ensurePoolScraperInstagramWebSession(page, logger, usernameHint, 
       logger.log('[instagram-modals] Pool scraper session ensure round ' + (round + 1) + '/5 url=' + page.url());
     }
     await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'round' + round + '-loop-start');
+
+    if (await detectInstagramPasswordReauthScreen(page)) {
+      if (logger) {
+        logger.warn('[instagram-modals] Pool scraper: password re-auth screen — cookies cannot continue without dashboard reconnect');
+      }
+      await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'password-reauth-abort');
+      return false;
+    }
 
     try {
       const cookieDismissed = await dismissInstagramCookieConsent(page);
@@ -420,8 +436,9 @@ async function ensurePoolScraperInstagramWebSession(page, logger, usernameHint, 
       if (logger) logger.log('[instagram-modals] cookie consent check error: ' + e.message);
     }
 
+    // Prefer DOM pointer/click strategies first; mouse-center often misses React/IG one-tap buttons.
     await clickInstagramProfileContinueIfPresent(page, logger, hint || null, {
-      strategyIndex: round,
+      strategyIndex: (round + 2) % 4,
       debugJobId: debugJobId != null ? debugJobId : null,
     });
 
@@ -448,22 +465,42 @@ async function ensurePoolScraperInstagramWebSession(page, logger, usernameHint, 
 
     const url = page.url() || '';
     if (url.indexOf('/accounts/login') !== -1) {
+      if (await detectInstagramPasswordReauthScreen(page)) {
+        if (logger) {
+          logger.warn('[instagram-modals] Pool scraper: /accounts/login with password field — session dead');
+        }
+        return false;
+      }
       await delay(1000);
       continue;
     }
 
-    const stillOnOneTap = await page.evaluate((h) => {
-      const b = ((document.body && document.body.innerText) || '').toLowerCase();
-      if (!/\bcontinue\b/.test(b)) return false;
-      if (!(b.indexOf('create new account') !== -1 || b.indexOf('use another profile') !== -1)) return false;
-      if (h && b.indexOf(h) === -1) return false;
-      return true;
-    }, hint);
+    const stillOnOneTap = await instagramPoolOneTapLoginChooserVisible(page, hint);
 
     if (!stillOnOneTap) {
-      if (logger) logger.log('[instagram-modals] Pool scraper: left one-tap / login chooser shell');
-      await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'round' + round + '-success-exit');
-      return;
+      const guestStripHome = await page.evaluate(() => {
+        const b = ((document.body && document.body.innerText) || '').toLowerCase();
+        if (b.indexOf('sign up for instagram') !== -1) return true;
+        if (
+          b.indexOf('join ') !== -1 &&
+          b.indexOf('on instagram') !== -1 &&
+          document.querySelector('a[href*="/accounts/login"]')
+        ) {
+          return true;
+        }
+        return false;
+      });
+      if (guestStripHome) {
+        if (logger) {
+          logger.warn(
+            '[instagram-modals] Pool scraper: Continue UI cleared but home still looks logged-out (signup strip) — retrying'
+          );
+        }
+      } else {
+        if (logger) logger.log('[instagram-modals] Pool scraper: left one-tap / login chooser shell');
+        await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'round' + round + '-success-exit');
+        return true;
+      }
     }
     if (logger) {
       logger.log(
@@ -478,7 +515,11 @@ async function ensurePoolScraperInstagramWebSession(page, logger, usernameHint, 
     await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'round' + round + '-still-one-tap');
     await delay(1000);
   }
+  if (logger) {
+    logger.warn('[instagram-modals] Pool scraper: session ensure exhausted (one-tap / guest shell) — caller should re-queue job');
+  }
   await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'exhausted-5-rounds');
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -824,14 +865,33 @@ async function closeDmComposerOverlays(page) {
  */
 async function detectInstagramPasswordReauthScreen(page) {
   try {
-    const u = page.url() || '';
-    if (!/\/accounts\/login/i.test(u)) return false;
+    const u = (page.url() || '').toLowerCase();
+    if (!u.includes('instagram.com')) return false;
     return await page.evaluate(() => {
       const pw = document.querySelector('input[type="password"], input[name="pass"], input[name="password"]');
       if (!pw || !pw.offsetParent) return false;
       const body = ((document.body && document.body.innerText) || '').toLowerCase();
-      return /log in|anmelden|accedi|iniciar sesión/.test(body);
+      const hasLogin = /log in|anmelden|accedi|iniciar sesión|ログイン/.test(body);
+      if (!hasLogin) return false;
+      if (location.pathname.indexOf('accounts/login') !== -1) return true;
+      return /forgot password|passwort vergessen|mot de passe oublié/.test(body);
     });
+  } catch (_) {
+    return false;
+  }
+}
+
+/** True while the saved-account one-tap chooser is visible (Continue / Use another profile / …). */
+async function instagramPoolOneTapLoginChooserVisible(page, usernameHint) {
+  const hint = (usernameHint || '').trim().replace(/^@/, '').toLowerCase();
+  try {
+    return await page.evaluate((h) => {
+      const b = ((document.body && document.body.innerText) || '').toLowerCase();
+      if (!/\bcontinue\b/.test(b)) return false;
+      if (!(b.indexOf('create new account') !== -1 || b.indexOf('use another profile') !== -1)) return false;
+      if (h && b.indexOf(h) === -1) return false;
+      return true;
+    }, hint);
   } catch (_) {
     return false;
   }
@@ -850,5 +910,6 @@ module.exports = {
   dismissInstagramPopups,
   closeDmComposerOverlays,
   detectInstagramPasswordReauthScreen,
+  instagramPoolOneTapLoginChooserVisible,
   delay,
 };
