@@ -2103,56 +2103,19 @@ async function recordScraperActions(platformSessionId, count) {
 async function savePlatformScraperSession(sessionData, instagramUsername, dailyActionsLimit = 500, opts = {}) {
   const sb = getSupabase();
   if (!sb) throw new Error('Supabase not configured');
-  const username = (instagramUsername || '').trim().replace(/^@/, '');
+  const username = (instagramUsername || '').trim().replace(/^@/, '').toLowerCase();
   if (!username) throw new Error('Instagram username required');
   const limit = Math.max(1, parseInt(dailyActionsLimit, 10) || 500);
   const forceInsert = opts && (opts.forceInsert === true || opts.allowDuplicateUsername === true);
-  if (forceInsert) {
-    const { data, error } = await sb
-      .from('cold_dm_platform_scraper_sessions')
-      .insert({
-        session_data: sessionData,
-        instagram_username: username,
-        daily_actions_limit: limit,
-      })
-      .select('id')
-      .single();
-    if (error) throw error;
-    return data?.id;
-  }
-  const { data: existing, error: selErr } = await sb
-    .from('cold_dm_platform_scraper_sessions')
-    .select('id')
-    .eq('instagram_username', username)
-    .order('created_at', { ascending: true })
-    .limit(1)
-    .maybeSingle();
-  if (selErr) throw selErr;
-  if (existing?.id) {
-    const { data, error } = await sb
-      .from('cold_dm_platform_scraper_sessions')
-      .update({
-        session_data: sessionData,
-        daily_actions_limit: limit,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', existing.id)
-      .select('id')
-      .single();
-    if (error) throw error;
-    return data?.id;
-  }
-  const { data, error } = await sb
-    .from('cold_dm_platform_scraper_sessions')
-    .insert({
-      session_data: sessionData,
-      instagram_username: username,
-      daily_actions_limit: limit,
-    })
-    .select('id')
-    .single();
+  const { data, error } = await sb.rpc('service_upsert_platform_scraper_from_connect', {
+    p_username: username,
+    p_session_data: sessionData,
+    p_daily_limit: limit,
+    p_backup_slot: !!forceInsert,
+  });
   if (error) throw error;
-  return data?.id;
+  const row = data && typeof data === 'object' ? data : null;
+  return row && row.id ? row.id : null;
 }
 
 // --- Scrape jobs ---
