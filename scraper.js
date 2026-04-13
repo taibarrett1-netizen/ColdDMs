@@ -133,6 +133,13 @@ const SCROLL_CHUNK_PX = 300;
 const SCROLL_CHUNKS_PER_ITER = 8;
 const SCROLL_CHUNK_DELAY_MS = 600;
 const HEADLESS = process.env.SCRAPER_HEADLESS !== 'false';
+/** page.goto timeout; 30s is often too tight for IG + 2+ concurrent Chromium on a small VPS. */
+const SCRAPER_NAV_TIMEOUT_MS = Math.max(15000, parseInt(process.env.SCRAPER_NAV_TIMEOUT_MS || '60000', 10) || 60000);
+const LIST_SCRAPE_NAV_WAIT_UNTIL = (() => {
+  const w = String(process.env.SCRAPER_LIST_NAV_WAIT_UNTIL || 'domcontentloaded').trim().toLowerCase();
+  if (w === 'networkidle2' || w === 'networkidle0' || w === 'load' || w === 'domcontentloaded') return w;
+  return 'domcontentloaded';
+})();
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -233,7 +240,10 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       logger.log('[Scraper] Using desktop viewport for profile list scrape (mobile scroll fails)');
     }
     await page.setCookie(...session.session_data.cookies);
-    await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.goto('https://www.instagram.com/', {
+      waitUntil: LIST_SCRAPE_NAV_WAIT_UNTIL,
+      timeout: SCRAPER_NAV_TIMEOUT_MS,
+    });
     await delay(randomDelay(1500, 3500));
 
     if (await poolScraperPageLooksLoggedOut(page)) {
@@ -269,8 +279,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     logger.log(`[Scraper] Starting ${listKind} scrape for @${cleanTarget}${maxLeads ? ` (max ${maxLeads})` : ''}`);
 
     await page.goto(`https://www.instagram.com/${encodeURIComponent(cleanTarget)}/`, {
-      waitUntil: 'networkidle2',
-      timeout: 30000,
+      waitUntil: LIST_SCRAPE_NAV_WAIT_UNTIL,
+      timeout: SCRAPER_NAV_TIMEOUT_MS,
     });
     await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
 
@@ -1033,7 +1043,10 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     );
 
     try {
-      await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.goto('https://www.instagram.com/', {
+        waitUntil: 'domcontentloaded',
+        timeout: SCRAPER_NAV_TIMEOUT_MS,
+      });
       await delay(3000 + Math.floor(Math.random() * 5000));
       await page.evaluate(() => window.scrollTo(0, 200));
       await delay(5000 + Math.floor(Math.random() * 8000));
@@ -1466,7 +1479,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     const preferredIgUser = (session?.instagram_username || '').trim().replace(/^@/, '').toLowerCase();
     const scraperDebug = scraperDebugEnabled();
 
-    await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: SCRAPER_NAV_TIMEOUT_MS });
     await delay(randomDelay(1500, 3500));
 
     const poolEstablishedHome = await ensurePoolScraperInstagramWebSession(page, logger, preferredIgUser, jobId);
@@ -1524,7 +1537,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       }
       const shortcode = getShortcodeFromPostUrl(normalizedUrl);
       const commentsListUrl = buildInstagramPostCommentsUrl(normalizedUrl);
-      await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+      await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: SCRAPER_NAV_TIMEOUT_MS });
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
       await dismissInstagramPopups(page, logger).catch(() => {});
 
@@ -1534,14 +1547,14 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           '[Scraper] Post page looks like logged-out guest UI; re-establishing pool session from home' +
             (guestRetry ? ' (retry)' : '')
         );
-        await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: SCRAPER_NAV_TIMEOUT_MS });
         await delay(1500 + Math.floor(Math.random() * 900));
         const poolOkGuest = await ensurePoolScraperInstagramWebSession(page, logger, scraperUsername, jobId);
         if (!poolOkGuest || (await poolScraperWebSessionBlocksWork(page, scraperUsername))) {
           await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape after guest retry');
           return;
         }
-        await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: SCRAPER_NAV_TIMEOUT_MS });
         await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
         await dismissInstagramPopups(page, logger).catch(() => {});
       }
@@ -1605,7 +1618,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
           let u = page.url() || '';
           if (!/\/p\/[^/]+\/comments\//i.test(u)) {
             logger.warn('[Scraper] Did not land on /comments/ after click — opening comments URL');
-            await page.goto(commentsListUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+            await page.goto(commentsListUrl, { waitUntil: 'networkidle2', timeout: SCRAPER_NAV_TIMEOUT_MS });
             await delay(randomDelay(1200, 2200));
             await dismissInstagramPopups(page, logger).catch(() => {});
             u = page.url() || '';
@@ -1625,7 +1638,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       }
       if (!commentsThreadUrl) {
         logger.warn('[Scraper] Comment scrape: opening thread via /comments/ URL (no in-page "View all" or still on post view)');
-        await page.goto(commentsListUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto(commentsListUrl, { waitUntil: 'networkidle2', timeout: SCRAPER_NAV_TIMEOUT_MS });
         await delay(randomDelay(1500, 2800));
         await dismissInstagramPopups(page, logger).catch(() => {});
         commentsThreadUrl = page.url() || commentsListUrl;
@@ -1675,7 +1688,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         if (commentsThreadUrl && !/\/p\/[^/]+\/comments\//i.test(page.url() || '')) {
           const cur = page.url() || '';
           logger.warn('[Scraper] Left comments thread (' + cur.slice(0, 96) + ') — restoring');
-          await page.goto(commentsThreadUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+          await page.goto(commentsThreadUrl, { waitUntil: 'networkidle2', timeout: SCRAPER_NAV_TIMEOUT_MS });
           await delay(randomDelay(1200, 2200));
           await dismissInstagramPopups(page, logger).catch(() => {});
           noNewCount = Math.max(0, noNewCount - 2);
@@ -1811,7 +1824,10 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     }
 
     try {
-      await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.goto('https://www.instagram.com/', {
+        waitUntil: 'domcontentloaded',
+        timeout: SCRAPER_NAV_TIMEOUT_MS,
+      });
       await delay(3000 + Math.floor(Math.random() * 5000));
       await page.evaluate(() => window.scrollTo(0, 200));
       await delay(5000 + Math.floor(Math.random() * 8000));
