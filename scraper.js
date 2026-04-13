@@ -193,6 +193,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
   }
 
   let browser;
+  let page = null;
   try {
     const { job, session, platformSessionId } = await resolvePuppeteerSessionForScrapeJob(jobId, leaseOptions);
     if (!session?.session_data?.cookies?.length) {
@@ -222,7 +223,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       headless: HEADLESS,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     });
-    const page = await browser.newPage();
+    page = await browser.newPage();
     const useMobile = process.env.SCRAPER_USE_MOBILE === '1' || process.env.SCRAPER_USE_MOBILE === 'true';
     if (useMobile) {
       await applyMobileEmulation(page);
@@ -1045,6 +1046,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     }
   } catch (err) {
     logger.error(`[Scraper] ${listKind === 'following' ? 'Following' : 'Follower'} scrape failed`, err);
+    await saveScraperFailureScreenshot(page, jobId, listKind + '_scrape');
     try {
       const { updateScrapeJob: updateJob } = require('./database/supabase');
       await updateJob(jobId, {
@@ -1127,6 +1129,33 @@ function buildInstagramPostCommentsUrl(postUrl) {
 function scraperDebugEnabled() {
   const v = String(process.env.SCRAPER_DEBUG || '').trim().toLowerCase();
   return v === '1' || v === 'true' || v === 'yes';
+}
+
+/** Full-page PNG on scrape exception (comment / follower / following). On if SCRAPER_FAILURE_SCREENSHOT=1 or SCRAPER_DEBUG=1. */
+function scraperFailureScreenshotEnabled() {
+  const v = String(process.env.SCRAPER_FAILURE_SCREENSHOT || '').trim().toLowerCase();
+  if (v === '1' || v === 'true' || v === 'yes') return true;
+  return scraperDebugEnabled();
+}
+
+async function saveScraperFailureScreenshot(page, jobId, tag) {
+  if (!scraperFailureScreenshotEnabled() || !page) return;
+  try {
+    if (typeof page.isClosed === 'function' && page.isClosed()) return;
+  } catch {
+    return;
+  }
+  try {
+    const dir = path.join(__dirname, 'logs', 'scrape-failure-debug');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const safeTag = String(tag || 'fail').replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 56);
+    const jid = String(jobId || 'unknown').replace(/[^a-zA-Z0-9.-]/g, '_').slice(0, 40);
+    const out = path.join(dir, `${jid}_${safeTag}_${Date.now()}.png`);
+    await page.screenshot({ path: out, type: 'png', fullPage: true });
+    logger.log('[Scraper] failure screenshot -> ' + out);
+  } catch (e) {
+    logger.warn('[Scraper] failure screenshot failed: ' + (e.message || e));
+  }
 }
 
 /**
@@ -1395,6 +1424,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
   ]);
 
   let browser;
+  let page = null;
   let platformSessionId = null;
   try {
     const { session, platformSessionId: resolvedPlatformId } = await resolvePuppeteerSessionForScrapeJob(
@@ -1429,7 +1459,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       headless: HEADLESS,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
     });
-    const page = await browser.newPage();
+    page = await browser.newPage();
     await applyMobileEmulation(page);
     await page.setCookie(...session.session_data.cookies);
 
@@ -1798,6 +1828,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     logger.log('[Scraper] Comment job ' + jobId + ' completed. Scraped ' + leadsInsertedTotal + ' leads.');
   } catch (err) {
     logger.error('[Scraper] Comment scrape failed', err);
+    await saveScraperFailureScreenshot(page, jobId, 'comment_scrape');
     try {
       const { updateScrapeJob: updateJob } = require('./database/supabase');
       await updateJob(jobId, {

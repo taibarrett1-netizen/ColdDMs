@@ -18,11 +18,18 @@
  *   SCRAPE_FAILURE_COOLDOWN_SEC    — seconds to cool a session after any job
  *                                    failure (default: 300 = 5 min)
  *   SCRAPER_WORKER_POLL_MS         — idle poll when no jobs queued (default: 2000 ms)
+ *   SCRAPER_SLOT_POLL_MS           — when jobs are running but a slot is still free, how often to
+ *                                    retry claim + race running jobs (default: 400 ms).  Use this
+ *                                    instead of the long idle poll so a second pending job starts
+ *                                    almost immediately; the long poll only applies when nothing
+ *                                    is running (true idle).
  *   SCRAPER_SESSION_LEASE_SEC      — session lease duration (default: 240 s)
  *   SCRAPER_DEBUG=1                — verbose scrape logs; comment jobs also log DOM snapshots
  *                                    (href samples, igAbsProfileHints, dialogs, view-all text)
  *                                    and write viewport PNGs under logs/comment-scrape-debug/
  *                                    (after-home-session-check, warm-scroll-start / -end per post)
+ *   SCRAPER_FAILURE_SCREENSHOT=1   — full-page PNG on any scrape job exception (comment/followers/following)
+ *                                    under logs/scrape-failure-debug/ (also on when SCRAPER_DEBUG=1)
  *   SCRAPER_SESSION_DEBUG=1        — like SCRAPER_DEBUG but only extra session-ensure logs/PNGs
  *                                    if you want session diagnostics without full comment DOM debug
  *   SCRAPER_SESSION_FULL_SCREENSHOTS=1 — with session debug: capture every session_ensure PNG (default: round 0+4 only)
@@ -38,6 +45,7 @@ const sb = require('../database/supabase');
 const { runFollowerScrape, runCommentScrape } = require('../scraper');
 
 const SCRAPER_POLL_MS = Math.max(1000, parseInt(process.env.SCRAPER_WORKER_POLL_MS || '2000', 10) || 2000);
+const SCRAPER_SLOT_POLL_MS = Math.max(50, parseInt(process.env.SCRAPER_SLOT_POLL_MS || '400', 10) || 400);
 const LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 const FAILURE_COOLDOWN_SEC = Math.max(0, parseInt(process.env.SCRAPE_FAILURE_COOLDOWN_SEC || '300', 10) || 300);
 // Rate-limit (429) gets a much longer cooldown so the session can recover.
@@ -233,8 +241,9 @@ async function main() {
 
   await refreshPoolConcurrency();
   logger.log(
-    `[scrape-worker] started id=${workerId} poll=${SCRAPER_POLL_MS}ms ` +
-    `concurrency=${effectiveConcurrent} failure_cooldown=${FAILURE_COOLDOWN_SEC}s`
+    `[scrape-worker] started id=${workerId} idle_poll=${SCRAPER_POLL_MS}ms ` +
+    `slot_poll=${SCRAPER_SLOT_POLL_MS}ms concurrency=${effectiveConcurrent} ` +
+    `failure_cooldown=${FAILURE_COOLDOWN_SEC}s`
   );
 
   // activeJobs: Map<jobId, Promise<boolean>>
@@ -278,8 +287,9 @@ async function main() {
       // All slots full — wait for at least one to finish before claiming more.
       await Promise.race(activeJobs.values());
     } else {
-      // Some slots free but queue is empty — short poll in case new jobs arrive.
-      await delay(SCRAPER_POLL_MS);
+      // Free capacity: retry claims often (slot poll), or unblock as soon as a running job finishes.
+      // Do not use the long idle poll here — that made a second job wait ~SCRAPER_POLL_MS per tick.
+      await Promise.race([...activeJobs.values(), delay(SCRAPER_SLOT_POLL_MS)]);
     }
   }
 }
