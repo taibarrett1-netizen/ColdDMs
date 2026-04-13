@@ -33,7 +33,7 @@ const {
 } = require('./database/supabase');
 const logger = require('./utils/logger');
 const { applyMobileEmulation } = require('./utils/mobile-viewport');
-const { dismissInstagramPopups, activateInstagramSavedSessionFromLoginPage } = require('./utils/instagram-modals');
+const { dismissInstagramPopups, ensurePoolScraperInstagramWebSession } = require('./utils/instagram-modals');
 
 /** Log + persist failure (early returns used to only update the DB, so PM2 showed nothing after "claimed job"). */
 async function failScrapeJob(jobId, errorMessage) {
@@ -1124,6 +1124,26 @@ function safeCommentDebugFilePart(s) {
 }
 
 /** Viewport PNG when SCRAPER_DEBUG is on — see logs/comment-scrape-debug/ */
+/** Mobile web guest shell: signup strip + login — real logged-in feed usually lacks this on posts. */
+async function instagramMobilePostLooksLikeLoggedOutGuest(page) {
+  try {
+    return await page.evaluate(() => {
+      const b = ((document.body && document.body.innerText) || '').toLowerCase();
+      if (b.indexOf('sign up for instagram') !== -1) return true;
+      if (
+        b.indexOf('join ') !== -1 &&
+        b.indexOf('on instagram') !== -1 &&
+        document.querySelector('a[href*="/accounts/login"]')
+      ) {
+        return true;
+      }
+      return false;
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
 async function commentScrapeDebugScreenshot(page, logger, enabled, jobId, shortcode, phase) {
   if (!enabled) return;
   try {
@@ -1220,14 +1240,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(randomDelay(1500, 3500));
 
-    await dismissInstagramPopups(page, logger).catch(() => {});
-    await activateInstagramSavedSessionFromLoginPage(page, logger, preferredIgUser).catch(() => {});
-    await dismissInstagramPopups(page, logger).catch(() => {});
-    if (page.url().includes('/accounts/login')) {
-      await delay(1800 + Math.floor(Math.random() * 1000));
-      await activateInstagramSavedSessionFromLoginPage(page, logger, preferredIgUser).catch(() => {});
-      await dismissInstagramPopups(page, logger).catch(() => {});
-    }
+    await ensurePoolScraperInstagramWebSession(page, logger, preferredIgUser);
 
     await commentScrapeDebugScreenshot(page, logger, scraperDebug, jobId, 'home', 'after-home-session-check');
 
@@ -1264,6 +1277,25 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
       await dismissInstagramPopups(page, logger).catch(() => {});
+
+      for (let guestRetry = 0; guestRetry < 2; guestRetry++) {
+        if (!(await instagramMobilePostLooksLikeLoggedOutGuest(page))) break;
+        logger.warn(
+          '[Scraper] Post page looks like logged-out guest UI; re-establishing pool session from home' +
+            (guestRetry ? ' (retry)' : '')
+        );
+        await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
+        await delay(1500 + Math.floor(Math.random() * 900));
+        await ensurePoolScraperInstagramWebSession(page, logger, scraperUsername);
+        if (page.url().includes('/accounts/login')) {
+          await failScrapeJob(jobId, 'Scraper session expired. Reconnect scraper.');
+          return;
+        }
+        await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
+        await dismissInstagramPopups(page, logger).catch(() => {});
+      }
+
       if (scraperDebug) await logCommentScrapeDomDebug(page, logger, 'post-loaded', { shortcode: shortcode || null });
 
       const candidateAuthors = await page.evaluate(function () {

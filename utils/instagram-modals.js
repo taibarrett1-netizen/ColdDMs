@@ -74,23 +74,21 @@ async function dismissInstagramCookieConsent(page) {
 // ---------------------------------------------------------------------------
 
 /**
- * Dismiss the account-switcher overlay that Instagram shows on the home page
- * or when landing on a profile — the one with a "Continue" (or "Continue as X")
- * button next to "Log in to another profile" / "Create new account".
+ * Clicks the blue **Continue** on Instagram's saved-account / one-tap screen
+ * (next to "Use another profile" / "Create new account"). This **logs the
+ * session in** — it is not a dismiss. Prefer real <button> and short label text
+ * so we do not click a parent that aggregates unrelated copy.
  *
- * Uses getBoundingClientRect() for visibility (not offsetParent) because
- * Instagram's account-switcher page uses position:fixed containers where
- * offsetParent is always null even for fully visible elements.
+ * @param {string|null} usernameHint — pool IG username; improves matching on one-tap.
  */
-async function dismissInstagramProfileContinue(page) {
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const clicked = await page.evaluate(() => {
-      // offsetParent is null for position:fixed elements — Instagram's account-
-      // switcher page uses fixed containers, so use getBoundingClientRect instead.
+async function clickInstagramProfileContinueIfPresent(page, logger, usernameHint) {
+  const hint = usernameHint ? String(usernameHint).trim().replace(/^@/, '').toLowerCase() : '';
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const clicked = await page.evaluate((h) => {
       function visible(el) {
         if (!el) return false;
         const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
+        return r.width > 2 && r.height > 2;
       }
 
       const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
@@ -100,43 +98,143 @@ async function dismissInstagramProfileContinue(page) {
         bodyText.includes('create new account') ||
         bodyText.includes('continue as') ||
         bodyText.includes('agree and continue') ||
-        bodyText.includes('continue to instagram');
+        bodyText.includes('continue to instagram') ||
+        (h &&
+          bodyText.includes(h) &&
+          /\bcontinue\b/.test(bodyText) &&
+          (bodyText.includes('create new account') ||
+            bodyText.includes('use another profile') ||
+            bodyText.includes('meta')));
 
       if (!hasContinueContext) return false;
 
-      const candidates = Array.from(
-        document.querySelectorAll('button, [role="button"], div[role="button"], a')
-      );
-      const hit = candidates.find((el) => {
-        if (!visible(el)) return false;
-        const txt = (el.textContent || '').replace(/\s+/g, ' ').trim();
-        return (
-          /^continue(\s+as\b.*)?$/i.test(txt) ||
-          /^agree and continue$/i.test(txt) ||
-          /^continue to instagram$/i.test(txt)
-        );
-      });
+      function normalizeLabel(el) {
+        return (el.textContent || '').replace(/\s+/g, ' ').trim();
+      }
 
-      if (hit) {
-        hit.click();
+      function isPrimaryContinueLabel(t) {
+        if (!t || t.length > 72) return false;
+        if (/use another profile|log in to another profile|create new account/i.test(t)) return false;
+        if (/^continue(\s+as\b.*)?$/i.test(t)) return true;
+        if (/^agree and continue$/i.test(t)) return true;
+        if (/^continue to instagram$/i.test(t)) return true;
+        return false;
+      }
+
+      const candidates = [];
+      const buttons = Array.from(document.querySelectorAll('button')).filter(visible);
+      const roles = Array.from(
+        document.querySelectorAll('div[role="button"], a[role="button"], [role="button"]:not(button)')
+      ).filter(visible);
+      for (let i = 0; i < buttons.length; i++) candidates.push(buttons[i]);
+      for (let i = 0; i < roles.length; i++) candidates.push(roles[i]);
+
+      let best = null;
+      let bestScore = -1;
+      for (let i = 0; i < candidates.length; i++) {
+        const el = candidates[i];
+        const t = normalizeLabel(el);
+        if (!isPrimaryContinueLabel(t)) continue;
+        let score = el.tagName === 'BUTTON' ? 40 : 10;
+        const tl = t.toLowerCase();
+        if (h && tl.indexOf(h) !== -1) score += 50;
+        if (/^continue$/i.test(t)) score += 20;
+        if (score > bestScore) {
+          bestScore = score;
+          best = el;
+        }
+      }
+
+      if (best) {
+        best.click();
         return true;
       }
       return false;
-    });
+    }, hint);
 
     if (clicked) {
-      // Wait for the navigation that follows the "Continue" click to settle.
+      if (logger) logger.log('[instagram-modals] Clicked Continue (saved session / one-tap login)');
       try {
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 8000 });
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 });
       } catch (_) {
-        // Navigation may not always fire (e.g. SPA route change) — that's fine.
-        await delay(1500);
+        await delay(2500);
       }
+      await delay(1500);
       return true;
     }
-    await delay(800);
+    await delay(700);
   }
   return false;
+}
+
+async function dismissInstagramProfileContinue(page, logger, usernameHint) {
+  return clickInstagramProfileContinueIfPresent(page, logger, usernameHint != null ? usernameHint : null);
+}
+
+/**
+ * Comment / pool scraper: cookie consent → Continue as pool user → modals →
+ * optional /accounts/login saved-tap. Repeats until the one-tap shell is gone
+ * or max rounds (stale cookies still fail later on /accounts/login).
+ */
+async function ensurePoolScraperInstagramWebSession(page, logger, usernameHint) {
+  const hint = (usernameHint || '').trim().replace(/^@/, '').toLowerCase();
+  for (let round = 0; round < 5; round++) {
+    try {
+      const cookieDismissed = await dismissInstagramCookieConsent(page);
+      if (cookieDismissed && logger) {
+        logger.log('[instagram-modals] Dismissed cookie consent popup');
+        await delay(1200);
+      }
+    } catch (e) {
+      if (logger) logger.log('[instagram-modals] cookie consent check error: ' + e.message);
+    }
+
+    await clickInstagramProfileContinueIfPresent(page, logger, hint || null);
+
+    try {
+      await dismissInstagramHomeModals(page, logger);
+    } catch (e) {
+      if (logger) logger.log('[instagram-modals] home modal check error: ' + e.message);
+    }
+    try {
+      await dismissInstagramReviewDialogs(page, logger);
+    } catch (e) {
+      if (logger) logger.log('[instagram-modals] review dialog check error: ' + e.message);
+    }
+    try {
+      await dismissInstagramAppWebUpsell(page, logger);
+    } catch (e) {
+      if (logger) logger.log('[instagram-modals] app web upsell check error: ' + e.message);
+    }
+    try {
+      await activateInstagramSavedSessionFromLoginPage(page, logger, hint);
+    } catch (e) {
+      if (logger) logger.log('[instagram-modals] saved-session login tap error: ' + e.message);
+    }
+
+    const url = page.url() || '';
+    if (url.indexOf('/accounts/login') !== -1) {
+      await delay(1000);
+      continue;
+    }
+
+    const stillOnOneTap = await page.evaluate((h) => {
+      const b = ((document.body && document.body.innerText) || '').toLowerCase();
+      if (!/\bcontinue\b/.test(b)) return false;
+      if (!(b.indexOf('create new account') !== -1 || b.indexOf('use another profile') !== -1)) return false;
+      if (h && b.indexOf(h) === -1) return false;
+      return true;
+    }, hint);
+
+    if (!stillOnOneTap) {
+      if (logger) logger.log('[instagram-modals] Pool scraper: left one-tap / login chooser shell');
+      return;
+    }
+    if (logger) {
+      logger.log('[instagram-modals] Pool scraper: still on Continue screen, retry ' + (round + 1) + '/5');
+    }
+    await delay(1000);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -425,7 +523,7 @@ async function dismissInstagramReviewDialogs(page, logger) {
  * after any navigation — returns quickly if nothing needs dismissing.
  *
  * Order matters: cookies first (can obscure everything else), then
- * account-switcher "Continue", then notifications, then terms.
+ * one-tap **Continue** (logs into saved session), then notifications, terms, app upsell.
  */
 async function dismissInstagramPopups(page, logger) {
   try {
@@ -441,9 +539,9 @@ async function dismissInstagramPopups(page, logger) {
   }
 
   try {
-    const continueDismissed = await dismissInstagramProfileContinue(page);
-    if (continueDismissed && logger) {
-      logger.log('[instagram-modals] Dismissed profile Continue/account-switcher popup');
+    const continueClicked = await dismissInstagramProfileContinue(page, logger, null);
+    if (continueClicked && logger) {
+      logger.log('[instagram-modals] Activated session via Continue (generic popup pass)');
     }
   } catch (e) {
     if (logger) logger.log('[instagram-modals] profile continue check error: ' + e.message);
@@ -478,11 +576,13 @@ async function closeDmComposerOverlays(page) {
 
 module.exports = {
   dismissInstagramCookieConsent,
+  clickInstagramProfileContinueIfPresent,
   dismissInstagramProfileContinue,
   dismissInstagramHomeModals,
   dismissInstagramReviewDialogs,
   dismissInstagramAppWebUpsell,
   activateInstagramSavedSessionFromLoginPage,
+  ensurePoolScraperInstagramWebSession,
   dismissInstagramPopups,
   closeDmComposerOverlays,
   delay,
