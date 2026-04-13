@@ -23,6 +23,8 @@
  *                                    (href samples, igAbsProfileHints, dialogs, view-all text)
  *                                    and write viewport PNGs under logs/comment-scrape-debug/
  *                                    (after-home-session-check, warm-scroll-start / -end per post)
+ *   SCRAPER_SESSION_DEBUG=1        — like SCRAPER_DEBUG but only extra session-ensure logs/PNGs
+ *                                    if you want session diagnostics without full comment DOM debug
  */
 require('dotenv').config();
 const os = require('os');

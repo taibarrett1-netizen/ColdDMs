@@ -1240,7 +1240,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
     await delay(randomDelay(1500, 3500));
 
-    await ensurePoolScraperInstagramWebSession(page, logger, preferredIgUser);
+    await ensurePoolScraperInstagramWebSession(page, logger, preferredIgUser, jobId);
 
     await commentScrapeDebugScreenshot(page, logger, scraperDebug, jobId, 'home', 'after-home-session-check');
 
@@ -1286,7 +1286,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
         );
         await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: 30000 });
         await delay(1500 + Math.floor(Math.random() * 900));
-        await ensurePoolScraperInstagramWebSession(page, logger, scraperUsername);
+        await ensurePoolScraperInstagramWebSession(page, logger, scraperUsername, jobId);
         if (page.url().includes('/accounts/login')) {
           await failScrapeJob(jobId, 'Scraper session expired. Reconnect scraper.');
           return;

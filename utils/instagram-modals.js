@@ -12,10 +12,38 @@
  *
  * For /accounts/login with saved cookies, call activateInstagramSavedSessionFromLoginPage
  * (used by comment scraper after home load) to tap "Continue as @user" without a password.
+ *
+ * Session establishment diagnostics: set SCRAPER_DEBUG=1 or SCRAPER_SESSION_DEBUG=1 for
+ * button samples, body snippets, and PNGs under logs/comment-scrape-debug/ (session_ensure_*).
  */
+
+const path = require('path');
+const fs = require('fs');
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function sessionEstablishmentDebugEnabled() {
+  const v = String(process.env.SCRAPER_DEBUG || process.env.SCRAPER_SESSION_DEBUG || '')
+    .trim()
+    .toLowerCase();
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+async function sessionEnsureDebugScreenshot(page, logger, jobId, suffix) {
+  if (!sessionEstablishmentDebugEnabled()) return;
+  try {
+    const dir = path.join(__dirname, '..', 'logs', 'comment-scrape-debug');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const safeJob = String(jobId || 'job').replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 48);
+    const safeSuffix = String(suffix).replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 96);
+    const out = path.join(dir, `${safeJob}_session_ensure_${safeSuffix}_${Date.now()}.png`);
+    await page.screenshot({ path: out, type: 'png', fullPage: false });
+    if (logger) logger.log('[instagram-modals] session-ensure debug PNG -> ' + out);
+  } catch (e) {
+    if (logger) logger.warn('[instagram-modals] session-ensure debug PNG failed: ' + (e.message || e));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -74,44 +102,167 @@ async function dismissInstagramCookieConsent(page) {
 // ---------------------------------------------------------------------------
 
 /**
- * Clicks the blue **Continue** on Instagram's saved-account / one-tap screen
- * (next to "Use another profile" / "Create new account"). This **logs the
- * session in** — it is not a dismiss. Prefer real <button> and short label text
- * so we do not click a parent that aggregates unrelated copy.
- *
- * @param {string|null} usernameHint — pool IG username; improves matching on one-tap.
+ * Resolve the one-tap **Continue** target and cheap diagnostics (for logs / screenshots).
+ * @returns {Promise<{url:string,found:boolean,cx:number,cy:number,label:string,buttonSamples:object[],bodySnippet:string,hasContinueContext:boolean}>}
  */
-async function clickInstagramProfileContinueIfPresent(page, logger, usernameHint) {
+async function resolveContinueButtonDiagnostics(page, usernameHint) {
   const hint = usernameHint ? String(usernameHint).trim().replace(/^@/, '').toLowerCase() : '';
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const clicked = await page.evaluate((h) => {
+  return page.evaluate((h) => {
+    function visible(el) {
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 2 && r.height > 2;
+    }
+
+    const bodyText = (document.body && document.body.innerText) || '';
+    const bodyLower = bodyText.toLowerCase();
+    const hasContinueContext =
+      bodyLower.indexOf('use another profile') !== -1 ||
+      bodyLower.indexOf('log in to another') !== -1 ||
+      bodyLower.indexOf('create new account') !== -1 ||
+      bodyLower.indexOf('continue as') !== -1 ||
+      bodyLower.indexOf('agree and continue') !== -1 ||
+      bodyLower.indexOf('continue to instagram') !== -1 ||
+      (h &&
+        bodyLower.indexOf(h) !== -1 &&
+        /\bcontinue\b/.test(bodyLower) &&
+        (bodyLower.indexOf('create new account') !== -1 ||
+          bodyLower.indexOf('use another profile') !== -1 ||
+          bodyLower.indexOf('meta') !== -1));
+
+    function normalizeLabel(el) {
+      return (el.textContent || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function isPrimaryContinueLabel(t) {
+      if (!t || t.length > 72) return false;
+      if (/use another profile|log in to another profile|create new account/i.test(t)) return false;
+      if (/^continue(\s+as\b.*)?$/i.test(t)) return true;
+      if (/^agree and continue$/i.test(t)) return true;
+      if (/^continue to instagram$/i.test(t)) return true;
+      return false;
+    }
+
+    const buttonEls = Array.from(document.querySelectorAll('button')).filter(visible);
+    const samples = buttonEls.slice(0, 20).map(function (b) {
+      return {
+        tag: b.tagName,
+        text: normalizeLabel(b).slice(0, 100),
+      };
+    });
+
+    const candidates = [];
+    const roles = Array.from(
+      document.querySelectorAll('div[role="button"], a[role="button"], [role="button"]:not(button)')
+    ).filter(visible);
+    for (let i = 0; i < buttonEls.length; i++) candidates.push(buttonEls[i]);
+    for (let i = 0; i < roles.length; i++) candidates.push(roles[i]);
+
+    let best = null;
+    let bestScore = -1;
+    for (let i = 0; i < candidates.length; i++) {
+      const el = candidates[i];
+      const t = normalizeLabel(el);
+      if (!isPrimaryContinueLabel(t)) continue;
+      let score = el.tagName === 'BUTTON' ? 40 : 10;
+      const tl = t.toLowerCase();
+      if (h && tl.indexOf(h) !== -1) score += 50;
+      if (/^continue$/i.test(t)) score += 20;
+      if (score > bestScore) {
+        bestScore = score;
+        best = el;
+      }
+    }
+
+    var cx = 0;
+    var cy = 0;
+    var label = '';
+    if (best) {
+      const r = best.getBoundingClientRect();
+      cx = r.left + r.width / 2;
+      cy = r.top + r.height / 2;
+      label = normalizeLabel(best).slice(0, 100);
+    }
+
+    return {
+      url: location.href,
+      found: !!best,
+      cx: cx,
+      cy: cy,
+      label: label,
+      buttonSamples: samples,
+      bodySnippet: bodyText.slice(0, 1800).replace(/\s+/g, ' '),
+      hasContinueContext: hasContinueContext,
+    };
+  }, hint);
+}
+
+/**
+ * Clicks **Continue** on the saved-account / one-tap screen using a **rotating**
+ * strategy (mouse center → touchscreen tap → pointer events → focus+Enter).
+ * One strategy per call; pair with ensure-pool rounds so each retry differs.
+ *
+ * @param {object} [options] — { strategyIndex: number, debugJobId: string|null }
+ */
+async function clickInstagramProfileContinueIfPresent(page, logger, usernameHint, options) {
+  const opts = options || {};
+  const strategyIndex = opts.strategyIndex != null ? Number(opts.strategyIndex) : 0;
+  const debugJobId = opts.debugJobId != null ? opts.debugJobId : null;
+
+  const hint = usernameHint ? String(usernameHint).trim().replace(/^@/, '').toLowerCase() : '';
+  const diag = await resolveContinueButtonDiagnostics(page, hint);
+
+  if (sessionEstablishmentDebugEnabled() && logger) {
+    logger.log(
+      '[instagram-modals] Continue diag url=' +
+        diag.url +
+        ' hasContext=' +
+        diag.hasContinueContext +
+        ' found=' +
+        diag.found +
+        ' cx=' +
+        diag.cx +
+        ' cy=' +
+        diag.cy +
+        ' strategyIndex=' +
+        (strategyIndex % 4)
+    );
+    logger.log('[instagram-modals] Continue label=' + JSON.stringify(diag.label));
+    try {
+      logger.log('[instagram-modals] Continue buttonSamples=' + JSON.stringify(diag.buttonSamples));
+    } catch (_) {}
+    const snip = diag.bodySnippet.length > 700 ? diag.bodySnippet.slice(0, 700) + '…' : diag.bodySnippet;
+    logger.log('[instagram-modals] Continue bodySnippet=' + JSON.stringify(snip));
+  }
+
+  await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'round' + strategyIndex + '-before-continue');
+
+  if (!diag.hasContinueContext || !diag.found) {
+    return false;
+  }
+
+  const strat = strategyIndex % 4;
+  if (strat === 0) {
+    await page.mouse.click(diag.cx, diag.cy, { delay: 90 });
+    if (logger) logger.log('[instagram-modals] Continue action=strategy_mouse_center');
+  } else if (strat === 1) {
+    try {
+      await page.touchscreen.tap(diag.cx, diag.cy);
+      if (logger) logger.log('[instagram-modals] Continue action=strategy_touchscreen_tap');
+    } catch (e) {
+      await page.mouse.click(diag.cx, diag.cy, { delay: 90 });
+      if (logger) logger.log('[instagram-modals] Continue action=strategy_touch_fallback_mouse (' + (e.message || e) + ')');
+    }
+  } else if (strat === 2) {
+    await page.evaluate((h) => {
       function visible(el) {
         if (!el) return false;
         const r = el.getBoundingClientRect();
         return r.width > 2 && r.height > 2;
       }
-
-      const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
-      const hasContinueContext =
-        bodyText.includes('use another profile') ||
-        bodyText.includes('log in to another') ||
-        bodyText.includes('create new account') ||
-        bodyText.includes('continue as') ||
-        bodyText.includes('agree and continue') ||
-        bodyText.includes('continue to instagram') ||
-        (h &&
-          bodyText.includes(h) &&
-          /\bcontinue\b/.test(bodyText) &&
-          (bodyText.includes('create new account') ||
-            bodyText.includes('use another profile') ||
-            bodyText.includes('meta')));
-
-      if (!hasContinueContext) return false;
-
       function normalizeLabel(el) {
         return (el.textContent || '').replace(/\s+/g, ' ').trim();
       }
-
       function isPrimaryContinueLabel(t) {
         if (!t || t.length > 72) return false;
         if (/use another profile|log in to another profile|create new account/i.test(t)) return false;
@@ -120,15 +271,13 @@ async function clickInstagramProfileContinueIfPresent(page, logger, usernameHint
         if (/^continue to instagram$/i.test(t)) return true;
         return false;
       }
-
       const candidates = [];
-      const buttons = Array.from(document.querySelectorAll('button')).filter(visible);
+      const buttonEls = Array.from(document.querySelectorAll('button')).filter(visible);
       const roles = Array.from(
         document.querySelectorAll('div[role="button"], a[role="button"], [role="button"]:not(button)')
       ).filter(visible);
-      for (let i = 0; i < buttons.length; i++) candidates.push(buttons[i]);
+      for (let i = 0; i < buttonEls.length; i++) candidates.push(buttonEls[i]);
       for (let i = 0; i < roles.length; i++) candidates.push(roles[i]);
-
       let best = null;
       let bestScore = -1;
       for (let i = 0; i < candidates.length; i++) {
@@ -144,31 +293,108 @@ async function clickInstagramProfileContinueIfPresent(page, logger, usernameHint
           best = el;
         }
       }
-
-      if (best) {
-        best.click();
-        return true;
-      }
-      return false;
-    }, hint);
-
-    if (clicked) {
-      if (logger) logger.log('[instagram-modals] Clicked Continue (saved session / one-tap login)');
+      if (!best) return;
+      const r = best.getBoundingClientRect();
+      const x = r.left + r.width / 2;
+      const y = r.top + r.height / 2;
       try {
-        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 });
-      } catch (_) {
-        await delay(2500);
+        best.dispatchEvent(
+          new PointerEvent('pointerdown', {
+            bubbles: true,
+            cancelable: true,
+            clientX: x,
+            clientY: y,
+            pointerId: 1,
+            pointerType: 'touch',
+            isPrimary: true,
+          })
+        );
+        best.dispatchEvent(
+          new PointerEvent('pointerup', {
+            bubbles: true,
+            cancelable: true,
+            clientX: x,
+            clientY: y,
+            pointerId: 1,
+            pointerType: 'touch',
+            isPrimary: true,
+          })
+        );
+      } catch (_) {}
+      best.click();
+    }, hint);
+    if (logger) logger.log('[instagram-modals] Continue action=strategy_pointer_dom_click');
+  } else {
+    const focused = await page.evaluate((h) => {
+      function visible(el) {
+        if (!el) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 2 && r.height > 2;
       }
-      await delay(1500);
+      function normalizeLabel(el) {
+        return (el.textContent || '').replace(/\s+/g, ' ').trim();
+      }
+      function isPrimaryContinueLabel(t) {
+        if (!t || t.length > 72) return false;
+        if (/use another profile|log in to another profile|create new account/i.test(t)) return false;
+        if (/^continue(\s+as\b.*)?$/i.test(t)) return true;
+        if (/^agree and continue$/i.test(t)) return true;
+        if (/^continue to instagram$/i.test(t)) return true;
+        return false;
+      }
+      const candidates = [];
+      const buttonEls = Array.from(document.querySelectorAll('button')).filter(visible);
+      const roles = Array.from(
+        document.querySelectorAll('div[role="button"], a[role="button"], [role="button"]:not(button)')
+      ).filter(visible);
+      for (let i = 0; i < buttonEls.length; i++) candidates.push(buttonEls[i]);
+      for (let i = 0; i < roles.length; i++) candidates.push(roles[i]);
+      let best = null;
+      let bestScore = -1;
+      for (let i = 0; i < candidates.length; i++) {
+        const el = candidates[i];
+        const t = normalizeLabel(el);
+        if (!isPrimaryContinueLabel(t)) continue;
+        let score = el.tagName === 'BUTTON' ? 40 : 10;
+        const tl = t.toLowerCase();
+        if (h && tl.indexOf(h) !== -1) score += 50;
+        if (/^continue$/i.test(t)) score += 20;
+        if (score > bestScore) {
+          bestScore = score;
+          best = el;
+        }
+      }
+      if (!best) return false;
+      best.scrollIntoView({ block: 'center', inline: 'nearest' });
+      best.focus();
       return true;
+    }, hint);
+    if (focused) {
+      await delay(200);
+      await page.keyboard.press('Enter');
+      if (logger) logger.log('[instagram-modals] Continue action=strategy_focus_enter');
+    } else if (logger) {
+      logger.warn('[instagram-modals] Continue action=strategy_focus_enter skipped (no target)');
     }
-    await delay(700);
   }
-  return false;
+
+  try {
+    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 25000 });
+  } catch (_) {
+    await delay(2500);
+  }
+  await delay(1800);
+
+  await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'round' + strategyIndex + '-after-continue');
+
+  return true;
 }
 
 async function dismissInstagramProfileContinue(page, logger, usernameHint) {
-  return clickInstagramProfileContinueIfPresent(page, logger, usernameHint != null ? usernameHint : null);
+  return clickInstagramProfileContinueIfPresent(page, logger, usernameHint != null ? usernameHint : null, {
+    strategyIndex: 0,
+    debugJobId: null,
+  });
 }
 
 /**
@@ -176,9 +402,14 @@ async function dismissInstagramProfileContinue(page, logger, usernameHint) {
  * optional /accounts/login saved-tap. Repeats until the one-tap shell is gone
  * or max rounds (stale cookies still fail later on /accounts/login).
  */
-async function ensurePoolScraperInstagramWebSession(page, logger, usernameHint) {
+async function ensurePoolScraperInstagramWebSession(page, logger, usernameHint, debugJobId) {
   const hint = (usernameHint || '').trim().replace(/^@/, '').toLowerCase();
   for (let round = 0; round < 5; round++) {
+    if (logger) {
+      logger.log('[instagram-modals] Pool scraper session ensure round ' + (round + 1) + '/5 url=' + page.url());
+    }
+    await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'round' + round + '-loop-start');
+
     try {
       const cookieDismissed = await dismissInstagramCookieConsent(page);
       if (cookieDismissed && logger) {
@@ -189,7 +420,10 @@ async function ensurePoolScraperInstagramWebSession(page, logger, usernameHint) 
       if (logger) logger.log('[instagram-modals] cookie consent check error: ' + e.message);
     }
 
-    await clickInstagramProfileContinueIfPresent(page, logger, hint || null);
+    await clickInstagramProfileContinueIfPresent(page, logger, hint || null, {
+      strategyIndex: round,
+      debugJobId: debugJobId != null ? debugJobId : null,
+    });
 
     try {
       await dismissInstagramHomeModals(page, logger);
@@ -228,13 +462,23 @@ async function ensurePoolScraperInstagramWebSession(page, logger, usernameHint) 
 
     if (!stillOnOneTap) {
       if (logger) logger.log('[instagram-modals] Pool scraper: left one-tap / login chooser shell');
+      await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'round' + round + '-success-exit');
       return;
     }
     if (logger) {
-      logger.log('[instagram-modals] Pool scraper: still on Continue screen, retry ' + (round + 1) + '/5');
+      logger.log(
+        '[instagram-modals] Pool scraper: still on Continue screen after strategy ' +
+          (round % 4) +
+          ', retry ' +
+          (round + 1) +
+          '/5 url=' +
+          page.url()
+      );
     }
+    await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'round' + round + '-still-one-tap');
     await delay(1000);
   }
+  await sessionEnsureDebugScreenshot(page, logger, debugJobId, 'exhausted-5-rounds');
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +820,7 @@ async function closeDmComposerOverlays(page) {
 
 module.exports = {
   dismissInstagramCookieConsent,
+  resolveContinueButtonDiagnostics,
   clickInstagramProfileContinueIfPresent,
   dismissInstagramProfileContinue,
   dismissInstagramHomeModals,
