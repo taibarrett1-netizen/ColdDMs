@@ -338,6 +338,34 @@ function getNextScheduleStartInTimezone(scheduleStartTime, timezone) {
   }
 }
 
+/** cold_dm_control / UI: next send window in campaign timezone. */
+function formatOutsideScheduleResumeMessage(timezone, nextStartDate, availableAtIso) {
+  const tz = normalizeTimezoneInput(timezone);
+  const tzLabel = tz || 'UTC';
+  try {
+    const d =
+      nextStartDate instanceof Date && !Number.isNaN(nextStartDate.getTime())
+        ? nextStartDate
+        : availableAtIso
+          ? new Date(availableAtIso)
+          : null;
+    if (d && !Number.isNaN(d.getTime())) {
+      const localPart = d.toLocaleString('en-US', {
+        timeZone: tzLabel,
+        weekday: 'short',
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+        hour12: true,
+      });
+      return `Outside sending schedule — resumes ${localPart} (${tzLabel}).`;
+    }
+  } catch (_) {}
+  const fallback = (availableAtIso || '').slice(0, 19).replace('T', ' ');
+  return `Outside sending schedule — resumes at ${fallback || 'next window'} UTC.`;
+}
+
 function normalizeUsername(username) {
   const u = String(username).trim();
   return u.startsWith('@') ? u.slice(1) : u;
@@ -3161,11 +3189,18 @@ async function buildSendWorkFromJob(jobId) {
   }
   if (!isWithinSchedule(campaign.schedule_start_time, campaign.schedule_end_time, campaign.timezone ?? null)) {
     const nextStart = getNextScheduleStartInTimezone(campaign.schedule_start_time, campaign.timezone ?? null);
+    const availableAt = nextStart ? nextStart.toISOString() : computeAvailableAtIso(15 * 60);
+    const statusMessage = formatOutsideScheduleResumeMessage(
+      campaign.timezone ?? null,
+      nextStart,
+      availableAt
+    );
     return {
       job,
       disposition: 'retry',
       reason: 'outside_schedule',
-      availableAt: nextStart ? nextStart.toISOString() : computeAvailableAtIso(15 * 60),
+      availableAt,
+      statusMessage,
     };
   }
   const scrapeBlocklistSet = await getScrapeBlocklistUsernames(job.client_id);

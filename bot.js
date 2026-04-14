@@ -3879,12 +3879,21 @@ async function runBotMultiTenant() {
       await delay(randomDelay(1000, 3000));
       continue;
     }
-    logger.log(
-      `[send-worker] job ${claimedJob.id} resolved disposition=${resolved.disposition} reason=${resolved.reason || 'none'} ` +
-        `client=${claimedJob.client_id || 'null'} campaign=${claimedJob.campaign_id || 'null'}`
-    );
-    if (SEND_WORKER_VERBOSE_LOGS) {
-      logger.log(`[send-worker] job ${claimedJob.id} disposition=${resolved.disposition} reason=${resolved.reason || 'none'}`);
+    if (resolved.disposition === 'retry' && resolved.reason === 'outside_schedule') {
+      const msg =
+        resolved.statusMessage ||
+        'Outside sending schedule — waiting for the next send window.';
+      await sb.setClientStatusMessage(claimedJob.client_id, msg).catch(() => {});
+      throttleSendLimitLog(`outside_schedule:${claimedJob.campaign_id || 'unknown'}`, () => {
+        logger.log(
+          `[send-worker] outside_schedule campaign=${claimedJob.campaign_id} client=${claimedJob.client_id} available_at=${resolved.availableAt || '?'}`
+        );
+      });
+    } else if (SEND_WORKER_VERBOSE_LOGS || resolved.disposition !== 'ready') {
+      logger.log(
+        `[send-worker] job ${claimedJob.id} resolved disposition=${resolved.disposition} reason=${resolved.reason || 'none'} ` +
+          `client=${claimedJob.client_id || 'null'} campaign=${claimedJob.campaign_id || 'null'}`
+      );
     }
     if (resolved.disposition === 'cancelled') {
       await sb.updateSendJob(claimedJob.id, {
@@ -3897,11 +3906,15 @@ async function runBotMultiTenant() {
       continue;
     }
     if (resolved.disposition === 'retry') {
+      const retryNote =
+        resolved.reason === 'outside_schedule' && resolved.statusMessage
+          ? String(resolved.statusMessage).slice(0, 500)
+          : resolved.reason || 'retry';
       await sb.updateSendJob(claimedJob.id, {
         status: 'retry',
         available_at: resolved.availableAt || new Date(Date.now() + 5 * 60 * 1000).toISOString(),
         last_error_class: resolved.reason || 'retry',
-        last_error_message: resolved.reason || 'retry',
+        last_error_message: retryNote,
       }, SEND_WORKER_ID).catch(() => {});
       await releaseClaimedCampaignLease(claimedJob.campaign_id);
       await delay(randomDelay(500, 1500));
