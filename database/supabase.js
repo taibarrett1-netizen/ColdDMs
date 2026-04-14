@@ -299,7 +299,38 @@ function getNextHourStartInTimezone(timezone) {
   }
 }
 
-/** Returns the UTC Date for the next time the schedule window opens (scheduleStart today or tomorrow in TZ). */
+/**
+ * UTC instant when `timezone` shows calendar `dateStr` (YYYY-MM-DD) at local wall time `hm` ("HH:mm").
+ */
+function utcAtLocalDateAndHM(dateStr, hm, tz) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  if (!Number.isFinite(y) || !Number.isFinite(m) || !Number.isFinite(d)) return new Date(NaN);
+  let low = Date.UTC(y, m - 1, d - 1, 8, 0, 0);
+  let high = Date.UTC(y, m - 1, d + 1, 16, 0, 0);
+  while (high - low > 1000) {
+    const mid = Math.floor((low + high) / 2);
+    const inst = new Date(mid);
+    const ds = inst.toLocaleDateString('en-CA', { timeZone: tz });
+    const ts = inst.toLocaleTimeString('en-CA', { timeZone: tz, hour12: false }).slice(0, 5);
+    if (ds < dateStr || (ds === dateStr && ts < hm)) low = mid + 1;
+    else high = mid;
+  }
+  return new Date(high);
+}
+
+/** Next calendar YYYY-MM-DD after `prevYmd` in `tz` (walks forward from end of previous local day). */
+function nextCalendarDateStrInTz(prevYmd, tz) {
+  const late = utcAtLocalDateAndHM(prevYmd, '23:59', tz);
+  let t = new Date(late.getTime() + 120_000);
+  for (let i = 0; i < 96; i++) {
+    const ds = t.toLocaleDateString('en-CA', { timeZone: tz });
+    if (ds !== prevYmd) return ds;
+    t = new Date(t.getTime() + 15 * 60 * 1000);
+  }
+  return null;
+}
+
+/** Returns the UTC Date for the next time the daily send window *opens* (schedule start), strictly after `now` in TZ. */
 function getNextScheduleStartInTimezone(scheduleStartTime, timezone) {
   const startStr = normalizeScheduleTime(scheduleStartTime);
   if (!startStr) return null;
@@ -315,24 +346,16 @@ function getNextScheduleStartInTimezone(scheduleStartTime, timezone) {
   try {
     const now = new Date();
     const todayStr = getTodayInTimezone(tz);
-    const tomorrowStr = new Date(now.getTime() + 24 * 60 * 60 * 1000).toLocaleDateString('en-CA', { timeZone: tz });
-    const findMoment = (dateStr) => {
-      let low = now.getTime();
-      let high = now.getTime() + 48 * 60 * 60 * 1000;
-      while (high - low > 60000) {
-        const mid = Math.floor((low + high) / 2);
-        const d = new Date(mid);
-        const dStr = d.toLocaleDateString('en-CA', { timeZone: tz });
-        const tStr = d.toLocaleTimeString('en-CA', { timeZone: tz, hour12: false }).slice(0, 5);
-        if (dStr < dateStr || (dStr === dateStr && tStr < startTime)) low = mid + 1;
-        else high = mid;
-      }
-      return new Date(high);
-    };
-    const todayStart = findMoment(todayStr);
-    const tomorrowStart = findMoment(tomorrowStr);
-    if (todayStart.getTime() > now.getTime()) return todayStart;
-    return tomorrowStart;
+    const todayOpening = utcAtLocalDateAndHM(todayStr, startTime, tz);
+    if (todayOpening.getTime() > now.getTime()) return todayOpening;
+    let ymd = todayStr;
+    for (let k = 0; k < 14; k++) {
+      ymd = nextCalendarDateStrInTz(ymd, tz);
+      if (!ymd) break;
+      const opening = utcAtLocalDateAndHM(ymd, startTime, tz);
+      if (opening.getTime() > now.getTime()) return opening;
+    }
+    return null;
   } catch (e) {
     return null;
   }
