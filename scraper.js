@@ -80,6 +80,18 @@ async function completeScrapeJobForQuota(jobId, clientId, scrapedCount) {
   });
 }
 
+/** After a normal follower/following/comment run: do not overwrite user-cancelled status. */
+async function finalizeScrapeJobNormalExit(jobId, scrapedCount) {
+  const n = Math.max(0, Number(scrapedCount) || 0);
+  const latest = await getScrapeJob(jobId);
+  if (latest?.status === 'cancelled') {
+    await updateScrapeJob(jobId, { scraped_count: n });
+    logger.log(`[Scraper] Job ${jobId} ended while cancelled; updated scraped_count=${n}`);
+    return;
+  }
+  await updateScrapeJob(jobId, { status: 'completed', scraped_count: n });
+}
+
 /**
  * Scrapes use only the shared platform pool (cold_dm_platform_scraper_sessions), not per-client cold_dm_scraper_sessions.
  * Optionally re-reserves from the pool when the job points at a row with no Puppeteer cookies.
@@ -1098,9 +1110,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
     }
 
-    await updateScrapeJob(jobId, { status: 'completed', scraped_count: newInsertsTotal });
+    await finalizeScrapeJobNormalExit(jobId, newInsertsTotal);
     logger.log(
-      `[Scraper] Job ${jobId} completed. ${newInsertsTotal} new lead row(s) (${listKind === 'following' ? 'following' : 'followers'}) from @${cleanTarget}`
+      `[Scraper] Job ${jobId} finished. ${newInsertsTotal} new lead row(s) (${listKind === 'following' ? 'following' : 'followers'}) from @${cleanTarget}`
     );
 
     try {
@@ -1908,8 +1920,8 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       await recordScraperActions(platformSessionId, leadsInsertedTotal).catch(() => {});
     }
 
-    await updateScrapeJob(jobId, { status: 'completed', scraped_count: leadsInsertedTotal });
-    logger.log('[Scraper] Comment job ' + jobId + ' completed. Scraped ' + leadsInsertedTotal + ' leads.');
+    await finalizeScrapeJobNormalExit(jobId, leadsInsertedTotal);
+    logger.log('[Scraper] Comment job ' + jobId + ' finished. Scraped ' + leadsInsertedTotal + ' leads.');
   } catch (err) {
     logger.error('[Scraper] Comment scrape failed', err);
     await saveScraperFailureScreenshot(page, jobId, 'comment_scrape');

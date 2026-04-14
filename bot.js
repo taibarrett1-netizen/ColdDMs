@@ -4113,7 +4113,6 @@ async function runBotMultiTenant() {
       });
       if (!ok) {
         logger.warn('Could not load Instagram session; re-queueing send job (lead not failed).');
-        if (session?.id) await sb.markInstagramSessionWebNeedsRefresh(session.id).catch(() => {});
         await sb.updateSendJob(
           claimedJob.id,
           {
@@ -4166,7 +4165,6 @@ async function runBotMultiTenant() {
             const okVoice = await ensurePageSession(session);
             if (!okVoice) {
               logger.warn('Could not restore session after voice browser restart.');
-              if (session?.id) await sb.markInstagramSessionWebNeedsRefresh(session.id).catch(() => {});
               skipSendAfterVoiceRestart = true;
             }
           }

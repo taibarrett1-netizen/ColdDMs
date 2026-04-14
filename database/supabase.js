@@ -192,16 +192,38 @@ function describeCampaignSendDelayConfigProblem(camp) {
 }
 
 /**
- * Normalize schedule time to HH:mm:ss. Handles DB TIME (e.g. "03:00:00") and ISO timestamps (e.g. "2026-01-01T03:00:00.000Z").
+ * Normalize schedule time to HH:mm:ss. Handles DB TIME ("03:00:00"), ISO datetimes, fractional seconds + offsets,
+ * and Date objects (some drivers map TIME to 1970-01-01 UTC wall clock).
  */
 function normalizeScheduleTime(value) {
   if (value == null || value === '') return null;
-  const s = String(value).trim();
-  if (s.includes('T')) {
-    const timePart = s.split('T')[1];
-    return timePart ? timePart.replace(/\.\d+Z?$/i, '').slice(0, 8) : null;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    const h = value.getUTCHours();
+    const m = value.getUTCMinutes();
+    const sec = value.getUTCSeconds();
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
   }
-  return s.slice(0, 8) || null;
+  const s = String(value).trim();
+  if (!s) return null;
+  if (s.includes('T')) {
+    const afterT = s.split('T')[1] || '';
+    const mch = afterT.match(/^(\d{1,2}:\d{2}(?::\d{2})?)/);
+    if (!mch) return null;
+    const parts = mch[1].split(':');
+    const hh = String(Number(parts[0])).padStart(2, '0');
+    const mm = String(Number(parts[1])).padStart(2, '0');
+    const ss = parts[2] != null ? String(Number(parts[2])).padStart(2, '0') : '00';
+    return `${hh}:${mm}:${ss}`;
+  }
+  const plain = s.match(/^(\d{1,2}:\d{2}(?::\d{2})?)/);
+  if (plain) {
+    const parts = plain[1].split(':');
+    const hh = String(Number(parts[0])).padStart(2, '0');
+    const mm = String(Number(parts[1])).padStart(2, '0');
+    const ss = parts[2] != null ? String(Number(parts[2])).padStart(2, '0') : '00';
+    return `${hh}:${mm}:${ss}`;
+  }
+  return null;
 }
 
 /**
@@ -332,8 +354,8 @@ function nextCalendarDateStrInTz(prevYmd, tz) {
 
 /** Returns the UTC Date for the next time the daily send window *opens* (schedule start), strictly after `now` in TZ. */
 function getNextScheduleStartInTimezone(scheduleStartTime, timezone) {
-  const startStr = normalizeScheduleTime(scheduleStartTime);
-  if (!startStr) return null;
+  // Match isWithinSchedule: missing start in DB still means "business morning" for cold DMs, not midnight.
+  const startStr = normalizeScheduleTime(scheduleStartTime) || '09:00:00';
   const [sh, sm] = startStr.split(':').map(Number);
   const startTime = `${String(sh).padStart(2, '0')}:${String(sm || 0).padStart(2, '0')}`;
   const tz = normalizeTimezoneInput(timezone);
@@ -3654,11 +3676,14 @@ async function getMostSpecificNoWorkHint(clientId) {
  * @param {string} [timezone] - IANA timezone from campaign row (e.g. America/New_York). If omitted/null, uses UTC.
  */
 function isWithinSchedule(scheduleStart, scheduleEnd, timezone) {
-  if (!scheduleStart && !scheduleEnd) return true;
+  const normStart = normalizeScheduleTime(scheduleStart);
+  const normEnd = normalizeScheduleTime(scheduleEnd);
+  if (!normStart && !normEnd) return true;
   const now = new Date();
   const current = getClockTimeHHMMSSInTimezone(now, timezone);
-  const start = normalizeScheduleTime(scheduleStart) || '00:00:00';
-  const end = normalizeScheduleTime(scheduleEnd) || '23:59:59';
+  // Cold DM campaigns: implicit 09:00–17:00 when one side was cleared in the UI (saved as null) but the other remains.
+  const start = normStart || '09:00:00';
+  const end = normEnd || '23:59:59';
   if (start <= end) return current >= start && current <= end;
   return current >= start || current <= end;
 }
