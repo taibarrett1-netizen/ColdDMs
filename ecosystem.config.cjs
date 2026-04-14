@@ -6,6 +6,7 @@
  *   SCRAPE_DEFER_TO_WORKER=1   — enqueue scrapes only; ig-dm-scrape runs workers/scrape-worker.js
  *   SEND_WORKER_ENTRY=workers/send-worker.js — used by dashboard "Start" to launch the sender
  *   SEND_WORKER_MIN / SEND_WORKER_MAX — bounds for getRecommendedSendWorkerInstanceCount + scripts/scale-send-workers.js
+ *   PM2 cluster: NODE_APP_INSTANCE pins each ig-dm-send process to one active campaign’s queue (see SEND_WORKER_PIN_CAMPAIGNS in .env.example).
  *   npm run scale:send-workers — optional; ig-dm-dashboard auto-scales by default when Supabase is set (SCALE_SEND_WORKERS_AUTO=0 to disable)
  */
 module.exports = {

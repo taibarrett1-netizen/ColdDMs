@@ -1317,8 +1317,47 @@ async function getClientIdsWithPauseZero() {
 }
 
 /**
- * Suggested PM2 cluster size for `ig-dm-send`: max of (clients with sending on) and
- * (Instagram automation sessions belonging to those clients), clamped to SEND_WORKER_MIN / SEND_WORKER_MAX.
+ * Distinct active campaigns (pause=0 clients only) that have at least one send job ready to claim now.
+ * Sorted by campaign id for stable PM2 slot → campaign assignment.
+ */
+async function getDistinctActiveCampaignIdsWithReadySendJobs() {
+  const sb = getSupabase();
+  if (!sb) return [];
+  const clientIds = await getClientIdsWithPauseZero();
+  if (!clientIds.length) return [];
+  const nowIso = new Date().toISOString();
+  const { data: jobRows, error: jobErr } = await sb
+    .from('cold_dm_send_jobs')
+    .select('campaign_id, client_id')
+    .in('status', ['pending', 'retry'])
+    .lte('available_at', nowIso);
+  if (jobErr) throw jobErr;
+  const byCampaign = new Map();
+  for (const row of jobRows || []) {
+    if (!row.campaign_id || !row.client_id) continue;
+    if (!clientIds.includes(row.client_id)) continue;
+    byCampaign.set(row.campaign_id, row.client_id);
+  }
+  if (byCampaign.size === 0) return [];
+  const campaignIds = [...byCampaign.keys()];
+  const { data: camps, error: campErr } = await sb
+    .from('cold_dm_campaigns')
+    .select('id, client_id, status')
+    .in('id', campaignIds)
+    .eq('status', 'active');
+  if (campErr) throw campErr;
+  const clientSet = new Set(clientIds);
+  const active = (camps || [])
+    .filter((c) => c.id && c.client_id && clientSet.has(c.client_id))
+    .map((c) => c.id);
+  active.sort();
+  return active;
+}
+
+/**
+ * Suggested PM2 cluster size for `ig-dm-send`: max of (clients with sending on),
+ * (Instagram sessions on those clients), and (distinct active campaigns with ready send jobs),
+ * clamped to SEND_WORKER_MIN / SEND_WORKER_MAX.
  * When every client is paused, returns 1 so one worker can still claim jobs if state changes.
  */
 async function getRecommendedSendWorkerInstanceCount() {
@@ -1330,6 +1369,7 @@ async function getRecommendedSendWorkerInstanceCount() {
       recommended: minN,
       pauseZeroClients: 0,
       instagramSessionsForActiveClients: 0,
+      campaignsWithReadyJobs: 0,
       minN,
       maxN,
       reason: 'no_supabase',
@@ -1346,13 +1386,21 @@ async function getRecommendedSendWorkerInstanceCount() {
     if (error) throw error;
     instagramSessionsForActiveClients = count ?? 0;
   }
+  let campaignsWithReadyJobs = 0;
+  try {
+    const cids = await getDistinctActiveCampaignIdsWithReadySendJobs();
+    campaignsWithReadyJobs = cids.length;
+  } catch (e) {
+    console.warn('[getRecommendedSendWorkerInstanceCount] campaign ready count failed:', e?.message || e);
+  }
   const raw =
-    pauseZero === 0 ? 1 : Math.max(1, pauseZero, instagramSessionsForActiveClients);
+    pauseZero === 0 ? 1 : Math.max(1, pauseZero, instagramSessionsForActiveClients, campaignsWithReadyJobs);
   const recommended = Math.max(minN, Math.min(maxN, raw));
   return {
     recommended,
     pauseZeroClients: pauseZero,
     instagramSessionsForActiveClients,
+    campaignsWithReadyJobs,
     minN,
     maxN,
   };
@@ -2604,19 +2652,23 @@ async function getSendJob(jobId) {
   return data;
 }
 
-async function claimColdDmSendJob(workerId, leaseSeconds = 240) {
+async function claimColdDmSendJob(workerId, leaseSeconds = 240, campaignIds = null) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
   const rpcTimeoutMs = Math.max(3000, parseInt(process.env.CLAIM_SEND_JOB_RPC_TIMEOUT_MS || '12000', 10) || 12000);
+  const rpcPayload = {
+    p_worker_id: workerId,
+    p_lease_seconds: leaseSeconds,
+  };
+  if (Array.isArray(campaignIds) && campaignIds.length > 0) {
+    rpcPayload.p_campaign_ids = campaignIds;
+  }
   for (let attempt = 0; attempt < 8; attempt++) {
     let data;
     let error;
     try {
       const rpcResult = await withTimeout(
-        sb.rpc('claim_cold_dm_send_job', {
-          p_worker_id: workerId,
-          p_lease_seconds: leaseSeconds,
-        }),
+        sb.rpc('claim_cold_dm_send_job', rpcPayload),
         rpcTimeoutMs,
         `claim_cold_dm_send_job timed out after ${rpcTimeoutMs}ms`
       );
@@ -2631,11 +2683,11 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240) {
         timeoutMs: rpcTimeoutMs,
         error: String(rpcTimeoutErr?.message || rpcTimeoutErr || 'timeout'),
       });
-      return claimColdDmSendJobFallback(workerId, leaseSeconds);
+      return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds);
     }
     if (error) {
       console.error('[claimColdDmSendJob] RPC error, using fallback:', error.message || error);
-      return claimColdDmSendJobFallback(workerId, leaseSeconds);
+      return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds);
     }
     const rows = Array.isArray(data) ? data : data != null ? [data] : [];
     const claimed = rows.length > 0 ? rows[0] : null;
@@ -2662,7 +2714,7 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240) {
           firstJobAvailableAt: pendingCheck[0]?.available_at || null,
           nowIso,
         });
-        return claimColdDmSendJobFallback(workerId, leaseSeconds);
+        return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds);
       }
       return null;
     }
@@ -2684,15 +2736,19 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240) {
   return null;
 }
 
-async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240) {
+async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240, campaignIds = null) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
   const nowIso = new Date().toISOString();
-  const { data: pendingRows } = await sb
+  let pendingQuery = sb
     .from('cold_dm_send_jobs')
     .select('id, client_id, campaign_id, campaign_lead_id, username, attempt_count')
     .in('status', ['pending', 'retry'])
-    .lte('available_at', nowIso)
+    .lte('available_at', nowIso);
+  if (Array.isArray(campaignIds) && campaignIds.length > 0) {
+    pendingQuery = pendingQuery.in('campaign_id', campaignIds);
+  }
+  const { data: pendingRows } = await pendingQuery
     .order('available_at', { ascending: true })
     .order('priority', { ascending: true })
     .order('created_at', { ascending: true })
@@ -4297,6 +4353,7 @@ module.exports = {
   getNextPendingCampaignLead,
   updateCampaignLeadStatus,
   getClientIdsWithPauseZero,
+  getDistinctActiveCampaignIdsWithReadySendJobs,
   getRecommendedSendWorkerInstanceCount,
   getNextPendingWorkAnyClient,
   getOrResolveColdDmProxyUrl,

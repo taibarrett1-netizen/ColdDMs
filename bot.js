@@ -273,9 +273,18 @@ function wantsDmSearchDebugScreenshot() {
   );
 }
 
+/** Full-page PNG before DM search-result click + on failure (pair). Enable with DM_SEARCH_PAIR_SCREENSHOTS=1 or any DM_SEARCH_DEBUG_SCREENSHOTS / LOGIN_DEBUG. */
+function wantsDmSearchPairScreenshots() {
+  return (
+    wantsDmSearchDebugScreenshot() ||
+    process.env.DM_SEARCH_PAIR_SCREENSHOTS === '1' ||
+    process.env.DM_SEARCH_PAIR_SCREENSHOTS === 'true'
+  );
+}
+
 /** Full-page PNG when DM /direct/new search result click fails (same folder as login-debug). */
 async function saveDmSearchDebugScreenshot(page, label) {
-  if (!wantsDmSearchDebugScreenshot() || !page) return null;
+  if (!(wantsDmSearchDebugScreenshot() || wantsDmSearchPairScreenshots()) || !page) return null;
   try {
     fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
     const safe = String(label || 'dm_search')
@@ -1685,6 +1694,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   await delay(2800);
   await dismissInstagramHomeModals(page, logger).catch(() => {});
   await delay(300);
+
+  if (wantsDmSearchPairScreenshots()) {
+    await saveDmSearchDebugScreenshot(page, `dm_search_before_pick_${u.replace(/[^a-z0-9_-]/gi, '_').slice(0, 40)}`);
+  }
 
   let searchPick = await clickInstagramDmSearchResult(page, u).catch((e) => ({
     ok: false,
@@ -3590,6 +3603,35 @@ async function buildAdapterForClient(clientId) {
 }
 
 /**
+ * PM2 cluster: pin this process to one active campaign's send queue (see NODE_APP_INSTANCE).
+ * Off: SEND_WORKER_PIN_CAMPAIGNS=0. On without cluster: SEND_WORKER_PIN_CAMPAIGNS=1 and SEND_WORKER_CAMPAIGN_SLOT=0.
+ * Manual override: COLD_DM_SEND_CAMPAIGN_IDS=id1,id2 (this process only claims those campaigns).
+ */
+function shouldPinSendWorkerToCampaignPool() {
+  if (process.env.SEND_WORKER_PIN_CAMPAIGNS === '0' || process.env.SEND_WORKER_PIN_CAMPAIGNS === 'false') return false;
+  if (process.env.SEND_WORKER_PIN_CAMPAIGNS === '1' || process.env.SEND_WORKER_PIN_CAMPAIGNS === 'true') return true;
+  return process.env.NODE_APP_INSTANCE != null && String(process.env.NODE_APP_INSTANCE).trim() !== '';
+}
+
+function resolveSendWorkerCampaignSlot() {
+  if (process.env.SEND_WORKER_CAMPAIGN_SLOT != null && String(process.env.SEND_WORKER_CAMPAIGN_SLOT).trim() !== '') {
+    return parseInt(process.env.SEND_WORKER_CAMPAIGN_SLOT, 10);
+  }
+  if (process.env.NODE_APP_INSTANCE != null && String(process.env.NODE_APP_INSTANCE).trim() !== '') {
+    return parseInt(process.env.NODE_APP_INSTANCE, 10);
+  }
+  return null;
+}
+
+let sendWorkerPinIdleLogLast = 0;
+function throttlePinIdleLog(msg) {
+  const now = Date.now();
+  if (now - sendWorkerPinIdleLogLast < 5 * 60 * 1000) return;
+  sendWorkerPinIdleLogLast = now;
+  logger.log(msg);
+}
+
+/**
  * Multi-tenant loop: one worker serves all clients with pause=0 and pending work.
  * Exits when there is no work; start again from the dashboard when you have a campaign to run.
  */
@@ -3743,7 +3785,35 @@ async function runBotMultiTenant() {
 
   for (;;) {
     await sb.workerHeartbeat(SEND_WORKER_ID, 'send', { pid: process.pid }).catch(() => {});
-    let claimedJob = await sb.claimColdDmSendJob(SEND_WORKER_ID, SEND_LEASE_SECONDS);
+
+    let pinnedCampaignIdsForClaim = null;
+    let pinExcessSlotIdle = false;
+    if (shouldPinSendWorkerToCampaignPool()) {
+      const manualIds = (process.env.COLD_DM_SEND_CAMPAIGN_IDS || '').trim();
+      if (manualIds) {
+        pinnedCampaignIdsForClaim = manualIds.split(',').map((s) => s.trim()).filter(Boolean);
+      } else {
+        const slot = resolveSendWorkerCampaignSlot();
+        if (slot != null && !Number.isNaN(slot)) {
+          const ordered = await sb.getDistinctActiveCampaignIdsWithReadySendJobs().catch(() => []);
+          if (ordered.length && slot >= ordered.length) {
+            pinExcessSlotIdle = true;
+          } else if (ordered.length) {
+            pinnedCampaignIdsForClaim = [ordered[slot]];
+          }
+        }
+      }
+    }
+
+    if (pinExcessSlotIdle) {
+      throttlePinIdleLog(
+        `[send-worker] PIN_CAMPAIGNS: slot ${process.env.NODE_APP_INSTANCE ?? process.env.SEND_WORKER_CAMPAIGN_SLOT} has no matching active campaign with ready send jobs — idling (no cross-campaign claims).`
+      );
+      await delay(randomDelay(20000, 40000));
+      continue;
+    }
+
+    let claimedJob = await sb.claimColdDmSendJob(SEND_WORKER_ID, SEND_LEASE_SECONDS, pinnedCampaignIdsForClaim);
     if (!claimedJob) {
       const clientIds = await sb.getClientIdsWithPauseZero();
       logColdDmConcurrencyDebug('claim_miss_syncing_clients', {
@@ -3765,7 +3835,7 @@ async function runBotMultiTenant() {
           });
         }
       }
-      claimedJob = await sb.claimColdDmSendJob(SEND_WORKER_ID, SEND_LEASE_SECONDS);
+      claimedJob = await sb.claimColdDmSendJob(SEND_WORKER_ID, SEND_LEASE_SECONDS, pinnedCampaignIdsForClaim);
     }
     if (!claimedJob) {
       const clientIds = await sb.getClientIdsWithPauseZero();

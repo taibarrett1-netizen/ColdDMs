@@ -3,6 +3,10 @@
  * Injected into the page via page.evaluate (must stay self-contained).
  */
 
+function delay(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 /**
  * @returns {Promise<{
  *   ok: boolean,
@@ -17,10 +21,10 @@ async function clickInstagramDmSearchResult(page, username) {
   if (!u) {
     return { ok: false, reason: 'search_result_select_failed', detail: 'empty_username', logLine: 'empty username' };
   }
-  return page.evaluate((needleRaw) => {
+
+  const pick = await page.evaluate((needleRaw) => {
     const needle = needleRaw.toLowerCase();
     const needleEsc = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // Word-boundary token match — checks visible text only (NOT hrefs).
     const needleTokenRe = new RegExp(`(^|[^a-z0-9._])@?${needleEsc}([^a-z0-9._]|$)`, 'i');
     const body = document.body && document.body.innerText ? document.body.innerText : '';
     const lowerBody = body.toLowerCase();
@@ -43,10 +47,6 @@ async function clickInstagramDmSearchResult(page, username) {
       }
     }
 
-    // Text-only combined match — deliberately excludes href to avoid false positives from
-    // URL query params like utm_source=<username> appearing in thread items.
-    // Uses innerText (layout-aware, preserves newlines between display-name/username/bio)
-    // rather than textContent (which collapses "BRYGHTbryght.social" into one token with no boundary).
     function combinedMatchText(el) {
       const text = el.innerText || el.textContent || '';
       const bits = [text, el.getAttribute('aria-label') || '', el.getAttribute('title') || ''];
@@ -92,29 +92,13 @@ async function clickInstagramDmSearchResult(page, username) {
       return false;
     }
 
-    /**
-     * Returns true if the element's visible text contains the target username as a word-boundary token.
-     * Deliberately does NOT check the href — that was the root cause of false positives against
-     * existing thread rows that had utm_source=<username> in their URL.
-     */
     function rowLooksLikeSearchHit(el) {
       if (isChromeOnlyRow(el)) return false;
       const c = combinedMatchText(el);
       if (c.includes('more accounts')) return false;
-      // Must contain the username as a standalone token in visible text.
       return needleTokenRe.test(c);
     }
 
-    /**
-     * Extract the display name from a search result row.
-     * The sidebar row text structure is typically:
-     *   Line 1: Display Name  (e.g. "Tai - SkeduleMore")
-     *   Line 2: username      (e.g. "skedulemore")
-     *   Line 3: bio/tagline   (e.g. "Scale Without Setters")
-     *
-     * We find the line that equals the username and take the line immediately above it.
-     * Returns null if display name equals the username or cannot be determined.
-     */
     function extractDisplayNameFromRow(el) {
       const rawText = (el.innerText || el.textContent || '').replace(/\r/g, '').trim();
       const lines = rawText
@@ -125,26 +109,63 @@ async function clickInstagramDmSearchResult(page, username) {
       const userIdx = lines.findIndex((l) => l.toLowerCase().replace(/^@/, '') === needle);
       if (userIdx > 0) {
         const candidate = lines[userIdx - 1];
-        // Sanity: not a chrome label, not too long
         if (
           candidate &&
           candidate.toLowerCase() !== 'more accounts' &&
           candidate.length >= 1 &&
           candidate.length <= 120
         ) {
-          return candidate; // e.g. "Tai - SkeduleMore"
+          return candidate;
         }
       }
-      // Username might be first line — display name may differ by capitalisation or be the same.
-      // In this case return null; the caller can fall back to the username.
       return null;
     }
 
-    /**
-     * Broad candidate collection.
-     * Includes bare div[role="button"] so that "More accounts" result rows (which Instagram
-     * renders without a listbox wrapper on /direct/new) are also considered.
-     */
+    function rowCenterY(el) {
+      try {
+        const r = el.getBoundingClientRect();
+        return r.top + r.height / 2;
+      } catch {
+        return Number.POSITIVE_INFINITY;
+      }
+    }
+
+    function inSearchUiShell(el) {
+      let n = el;
+      for (let i = 0; i < 20 && n; i++) {
+        if (n.matches) {
+          if (n.matches('[role="dialog"]')) return true;
+          if (n.matches('[role="listbox"]')) return true;
+          if (n.matches('[role="presentation"]')) return true;
+          if (n.getAttribute && n.getAttribute('role') === 'combobox') return true;
+          if (n.getAttribute && n.getAttribute('aria-modal') === 'true') return true;
+        }
+        n = n.parentElement;
+      }
+      return false;
+    }
+
+    function nearestMoreAccountsHeadingY() {
+      const headings = Array.from(document.querySelectorAll('*')).filter((el) => {
+        if (!visible(el)) return false;
+        const t = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        return t === 'more accounts';
+      });
+      if (!headings.length) return null;
+      let best = null;
+      for (const h of headings) {
+        const y = rowCenterY(h);
+        if (!Number.isFinite(y)) continue;
+        if (best == null || y < best) best = y;
+      }
+      return best;
+    }
+
+    const moreAccountsY = nearestMoreAccountsHeadingY();
+
+    const allProfileAnchorsForDiag = Array.from(document.querySelectorAll('a[href*="instagram.com"]')).filter(visible);
+    const profileHrefHits = allProfileAnchorsForDiag.filter((a) => hrefMatches(a.href));
+
     function collectCandidates() {
       const selectors = [
         '[role="listbox"] [role="option"]',
@@ -154,7 +175,7 @@ async function clickInstagramDmSearchResult(page, username) {
         'div[role="dialog"] [role="option"]',
         'div[role="dialog"] a[href*="instagram.com/"]',
         'div[role="dialog"] div[role="button"]',
-        // Broad fallback — catches IG layouts where search results sit outside listbox/dialog.
+        '[role="listitem"] a[href*="instagram.com"]',
         'div[role="button"]',
         'button',
       ];
@@ -178,35 +199,6 @@ async function clickInstagramDmSearchResult(page, username) {
       return out;
     }
 
-    function rowCenterY(el) {
-      try {
-        const r = el.getBoundingClientRect();
-        return r.top + r.height / 2;
-      } catch {
-        return Number.POSITIVE_INFINITY;
-      }
-    }
-
-    function nearestMoreAccountsHeadingY() {
-      const headings = Array.from(document.querySelectorAll('*')).filter((el) => {
-        if (!visible(el)) return false;
-        const t = (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
-        return t === 'more accounts';
-      });
-      if (!headings.length) return null;
-      let best = null;
-      for (const h of headings) {
-        const y = rowCenterY(h);
-        if (!Number.isFinite(y)) continue;
-        if (best == null || y < best) best = y;
-      }
-      return best;
-    }
-
-    const moreAccountsY = nearestMoreAccountsHeadingY();
-
-    // Sort helper: prioritise rows visually below "More accounts" heading (those are the
-    // search-result accounts, not existing thread rows), then by vertical position.
     function sortByMoreAccounts(arr) {
       return [...arr].sort((a, b) => {
         const ay = rowCenterY(a);
@@ -220,10 +212,33 @@ async function clickInstagramDmSearchResult(page, username) {
       });
     }
 
+    // ── Pass 0: any visible profile <a> whose path matches (IG often omits [role=listbox]) ──
+    if (profileHrefHits.length) {
+      let ranked = [...profileHrefHits];
+      const inOverlay = ranked.filter(inSearchUiShell);
+      if (inOverlay.length) ranked = inOverlay.sort((a, b) => rowCenterY(a) - rowCenterY(b));
+      else if (moreAccountsY != null) {
+        const below = ranked.filter((a) => rowCenterY(a) > moreAccountsY + 6);
+        if (below.length) ranked = below.sort((a, b) => rowCenterY(a) - rowCenterY(b));
+        else ranked = ranked.sort((a, b) => a.getBoundingClientRect().height - b.getBoundingClientRect().height);
+      } else {
+        ranked = ranked.sort((a, b) => {
+          const ao = inSearchUiShell(a) ? 0 : 1;
+          const bo = inSearchUiShell(b) ? 0 : 1;
+          if (ao !== bo) return ao - bo;
+          return rowCenterY(a) - rowCenterY(b);
+        });
+      }
+      const pickA = ranked[0];
+      const rowEl = pickA.closest && (pickA.closest('[role="option"]') || pickA.closest('[role="listitem"]') || pickA.closest('li'));
+      const displayName = extractDisplayNameFromRow(rowEl || pickA);
+      pickA.click();
+      return { ok: true, detail: 'global_profile_href', displayName: displayName || null };
+    }
+
     const candidates = collectCandidates();
     const sorted = sortByMoreAccounts(candidates);
 
-    // ── Pass 1: exact href match (safest — no text ambiguity) ──
     const byHref = sorted.find((el) => {
       const h = resolveInstagramHref(el);
       return h && hrefMatches(h);
@@ -240,7 +255,6 @@ async function clickInstagramDmSearchResult(page, username) {
       return { ok: true, detail: 'href_match', displayName: displayName || null };
     }
 
-    // ── Pass 2: username token in visible text (word-boundary, no href, "More accounts" first) ──
     const byText = sorted.find((el) => rowLooksLikeSearchHit(el));
     if (byText) {
       const displayName = extractDisplayNameFromRow(byText);
@@ -248,7 +262,6 @@ async function clickInstagramDmSearchResult(page, username) {
       return { ok: true, detail: 'text_token_match', displayName: displayName || null };
     }
 
-    // ── Diagnostics ──
     const listbox = document.querySelector('[role="listbox"]');
     const optionSample = listbox
       ? Array.from(listbox.querySelectorAll('[role="option"], a, div[role="button"]'))
@@ -271,14 +284,33 @@ async function clickInstagramDmSearchResult(page, username) {
       return { ok: false, reason: 'rate_limited', detail: 'page_text_during_search', logLine: `handle=${needleRaw}; rate_limit_hint_in_body=true` };
     }
 
+    function needleInSearchFields() {
+      let found = false;
+      try {
+        document.querySelectorAll('input, textarea, [contenteditable="true"]').forEach((el) => {
+          const v = (el.value != null ? String(el.value) : el.innerText != null ? el.innerText : '').toLowerCase();
+          if (v.includes(needle)) found = true;
+        });
+      } catch {
+        /* ignore */
+      }
+      return found;
+    }
+
     const needleInBody = lowerBody.includes(needle);
+    const needleInInputs = needleInSearchFields();
+    const modalHints = [];
+    if (/turn on notifications/i.test(body)) modalHints.push('notifications_prompt');
+    if (/\bnot now\b/i.test(body)) modalHints.push('not_now_visible');
+    if (/new message/i.test(lowerBody)) modalHints.push('new_message_chrome');
+
     let reason = 'search_result_select_failed';
     let detail = 'no_clickable_match';
 
-    if (igExplicitEmpty && !needleInBody) {
+    if (igExplicitEmpty && !needleInBody && !needleInInputs) {
       reason = 'user_not_found';
       detail = 'instagram_empty_state';
-    } else if (igExplicitEmpty && needleInBody) {
+    } else if (igExplicitEmpty && (needleInBody || needleInInputs)) {
       reason = 'user_not_found';
       detail = 'instagram_says_empty_but_handle_appears_in_page_text';
     }
@@ -289,11 +321,49 @@ async function clickInstagramDmSearchResult(page, username) {
       `detail=${detail}`,
       `igSaysNoResults=${igExplicitEmpty}`,
       `handleInBody=${needleInBody}`,
+      `handleInSearchFields=${needleInInputs}`,
       listbox ? `listboxSample=${optionSample.join(' | ') || '(none)'}` : 'listbox=absent',
       `divRoleButtonSample=${btnSample.join(' | ') || '(none)'}`,
+      modalHints.length ? `modalHints=${modalHints.join(',')}` : 'modalHints=(none)',
+      `profileAnchorsMatchingHref=${profileHrefHits.length}`,
     ];
     return { ok: false, reason, detail, logLine: parts.join('; ') };
   }, u);
+
+  if (pick && pick.ok) return pick;
+  if (pick && pick.reason && ['user_not_found', 'account_private', 'rate_limited'].includes(pick.reason)) {
+    return pick;
+  }
+
+  const stillOnNew = await page.evaluate(() => {
+    try {
+      return /\/direct\/new\/?$/i.test(window.location.pathname || '');
+    } catch {
+      return false;
+    }
+  });
+  if (!stillOnNew) return pick;
+
+  for (let steps = 1; steps <= 5; steps++) {
+    for (let s = 0; s < steps; s++) {
+      await page.keyboard.press('ArrowDown').catch(() => {});
+      await delay(110);
+    }
+    await page.keyboard.press('Enter').catch(() => {});
+    await delay(950);
+    const navigated = await page.evaluate(() => {
+      try {
+        return /\/direct\/t\//.test(window.location.pathname || '');
+      } catch {
+        return false;
+      }
+    });
+    if (navigated) {
+      return { ok: true, detail: `keyboard_${steps}_arrows_enter`, displayName: null };
+    }
+  }
+
+  return pick;
 }
 
 /**
