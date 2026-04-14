@@ -3787,28 +3787,42 @@ async function runBotMultiTenant() {
     await sb.workerHeartbeat(SEND_WORKER_ID, 'send', { pid: process.pid }).catch(() => {});
 
     let pinnedCampaignIdsForClaim = null;
-    let pinExcessSlotIdle = false;
+    /** When true, pinning is on but we must not claim without p_campaign_ids (avoids duplicate workers on one campaign/session). */
+    let pinForcedIdle = false;
+    let pinForcedIdleDetail = '';
     if (shouldPinSendWorkerToCampaignPool()) {
       const manualIds = (process.env.COLD_DM_SEND_CAMPAIGN_IDS || '').trim();
       if (manualIds) {
         pinnedCampaignIdsForClaim = manualIds.split(',').map((s) => s.trim()).filter(Boolean);
+        if (!pinnedCampaignIdsForClaim.length) {
+          pinForcedIdle = true;
+          pinForcedIdleDetail =
+            'COLD_DM_SEND_CAMPAIGN_IDS is empty after parse — idling (no unpinned claims).';
+        }
       } else {
         const slot = resolveSendWorkerCampaignSlot();
-        if (slot != null && !Number.isNaN(slot)) {
+        if (slot == null || Number.isNaN(slot)) {
+          pinForcedIdle = true;
+          pinForcedIdleDetail =
+            'PIN_CAMPAIGNS on but no slot: set PM2 cluster (NODE_APP_INSTANCE) or SEND_WORKER_CAMPAIGN_SLOT — idling (no unpinned claims).';
+        } else {
           const ordered = await sb.getDistinctActiveCampaignIdsWithReadySendJobs().catch(() => []);
-          if (ordered.length && slot >= ordered.length) {
-            pinExcessSlotIdle = true;
-          } else if (ordered.length) {
+          if (!ordered.length) {
+            pinForcedIdle = true;
+            pinForcedIdleDetail =
+              'PIN_CAMPAIGNS: no active campaigns with ready send jobs at this moment — idling (no cross-campaign claims).';
+          } else if (slot >= ordered.length) {
+            pinForcedIdle = true;
+            pinForcedIdleDetail = `PIN_CAMPAIGNS: slot ${process.env.NODE_APP_INSTANCE ?? process.env.SEND_WORKER_CAMPAIGN_SLOT} has no matching active campaign with ready send jobs — idling (no cross-campaign claims).`;
+          } else {
             pinnedCampaignIdsForClaim = [ordered[slot]];
           }
         }
       }
     }
 
-    if (pinExcessSlotIdle) {
-      throttlePinIdleLog(
-        `[send-worker] PIN_CAMPAIGNS: slot ${process.env.NODE_APP_INSTANCE ?? process.env.SEND_WORKER_CAMPAIGN_SLOT} has no matching active campaign with ready send jobs — idling (no cross-campaign claims).`
-      );
+    if (pinForcedIdle) {
+      throttlePinIdleLog(`[send-worker] ${pinForcedIdleDetail}`);
       await delay(randomDelay(20000, 40000));
       continue;
     }
