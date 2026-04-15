@@ -2913,7 +2913,13 @@ async function previewDmLeadNamesFromSession(body) {
     await dismissInstagramHomeModals(page, logger);
     await delay(500);
     if (page.url().includes('/accounts/login')) {
-      return { ok: false, error: 'Instagram session expired' };
+      let screenshotPath = null;
+      try {
+        fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+        screenshotPath = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_preview_session_expired.png`);
+        await page.screenshot({ path: screenshotPath, fullPage: true });
+      } catch (_) {}
+      return { ok: false, error: 'Instagram session expired', screenshotPath };
     }
 
     const result = await sendDMOnce(page, targetUsername, '{{first_name}}', nameFallback, {
@@ -2942,7 +2948,19 @@ async function previewDmLeadNamesFromSession(body) {
     return { ok: false, error: 'Unexpected send path (preview only)' };
   } catch (e) {
     logger.warn(`[preview-dm-names] ${e && e.message ? e.message : String(e)}`);
-    return { ok: false, error: e.message || 'Preview failed' };
+    let screenshotPath = null;
+    try {
+      if (browser) {
+        const pages = await browser.pages().catch(() => []);
+        const page = pages && pages.length > 0 ? pages[pages.length - 1] : null;
+        if (page) {
+          fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
+          screenshotPath = path.join(LOGIN_DEBUG_SCREENSHOT_DIR, `${Date.now()}_preview_exception.png`);
+          await page.screenshot({ path: screenshotPath, fullPage: true });
+        }
+      }
+    } catch (_) {}
+    return { ok: false, error: e.message || 'Preview failed', screenshotPath };
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
