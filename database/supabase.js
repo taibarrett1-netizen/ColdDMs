@@ -571,7 +571,7 @@ async function getSessions(clientId) {
   try {
     const { data, error } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh')
       .eq('client_id', clientId)
       .order('id', { ascending: true });
     if (error) throw error;
@@ -579,7 +579,7 @@ async function getSessions(clientId) {
   } catch (e) {
     const { data, error } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh')
       .eq('client_id', clientId)
       .order('id', { ascending: true });
     if (error) throw error;
@@ -593,7 +593,8 @@ async function getSessions(clientId) {
  */
 async function getSessionsForCampaign(clientId, campaignId) {
   const sb = getSupabase();
-  if (!sb || !clientId || !campaignId) return [];
+  if (!sb || !clientId) return [];
+  if (!campaignId) return getSessions(clientId);
   try {
     const { data: assigned, error } = await sb
       .from('cold_dm_campaign_instagram_sessions')
@@ -607,7 +608,7 @@ async function getSessionsForCampaign(clientId, campaignId) {
     try {
       const { data: sessions, error: sessErr } = await sb
         .from('cold_dm_instagram_sessions')
-        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at')
+        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh')
         .eq('client_id', clientId)
         .in('id', ids)
         .order('id', { ascending: true });
@@ -616,7 +617,7 @@ async function getSessionsForCampaign(clientId, campaignId) {
     } catch (e) {
       const { data: sessions, error: sessErr } = await sb
         .from('cold_dm_instagram_sessions')
-        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id')
+        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh')
         .eq('client_id', clientId)
         .in('id', ids)
         .order('id', { ascending: true });
@@ -740,6 +741,7 @@ async function claimInstagramSessionForCampaign(clientId, campaignId, workerId, 
     return new Date(s.lease_heartbeat_at).getTime() < now - staleMs;
   };
   const eligible = sessions.filter((s) => {
+    if (s?.web_session_needs_refresh === true) return false;
     if (!s.leased_until || new Date(s.leased_until).getTime() <= now) return true;
     return heartbeatStale(s);
   });
@@ -761,6 +763,9 @@ async function getWaitingInstagramSessionReason(clientId, campaignId) {
   if (!sb || !clientId || !campaignId) return null;
   const sessions = await getSessionsForCampaign(clientId, campaignId);
   if (!sessions?.length) return null;
+  if (sessions.some((s) => s?.web_session_needs_refresh === true)) {
+    return 'Please reconnect your account in Settings > Integrations > Automation session (outbound).';
+  }
   const now = Date.now();
   const leased = sessions
     .filter((s) => s?.leased_until && new Date(s.leased_until).getTime() > now)
@@ -1352,6 +1357,49 @@ async function getDistinctActiveCampaignIdsWithReadySendJobs() {
     .map((c) => c.id);
   active.sort();
   return active;
+}
+
+/**
+ * Enforce single active send campaign per client by selecting the first active
+ * campaign (ordered by oldest ready job) that currently has claimable work.
+ */
+async function getClientSendCampaignTurn(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return null;
+  const nowIso = new Date().toISOString();
+  const { data: jobs, error: jobsErr } = await sb
+    .from('cold_dm_send_jobs')
+    .select('campaign_id, available_at, priority, created_at')
+    .eq('client_id', clientId)
+    .in('status', ['pending', 'retry'])
+    .not('campaign_id', 'is', null)
+    .lte('available_at', nowIso)
+    .order('available_at', { ascending: true })
+    .order('priority', { ascending: true })
+    .order('created_at', { ascending: true })
+    .limit(200);
+  if (jobsErr || !jobs?.length) return null;
+  const orderedCampaignIds = [];
+  const seen = new Set();
+  for (const row of jobs) {
+    const id = row?.campaign_id || null;
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    orderedCampaignIds.push(id);
+  }
+  if (!orderedCampaignIds.length) return null;
+  const { data: campaigns, error: campErr } = await sb
+    .from('cold_dm_campaigns')
+    .select('id, name, status')
+    .in('id', orderedCampaignIds);
+  if (campErr || !campaigns?.length) return null;
+  const campaignById = new Map(campaigns.map((c) => [c.id, c]));
+  for (const id of orderedCampaignIds) {
+    const c = campaignById.get(id);
+    if (!c || c.status !== 'active') continue;
+    return { campaignId: id, campaignName: c.name || id };
+  }
+  return null;
 }
 
 /**
@@ -4344,6 +4392,7 @@ module.exports = {
   updateCampaignLeadStatus,
   getClientIdsWithPauseZero,
   getDistinctActiveCampaignIdsWithReadySendJobs,
+  getClientSendCampaignTurn,
   getRecommendedSendWorkerInstanceCount,
   getNextPendingWorkAnyClient,
   getOrResolveColdDmProxyUrl,

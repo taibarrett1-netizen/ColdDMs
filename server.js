@@ -36,6 +36,7 @@ const {
   syncSendJobsForClient,
   getNoWorkHint,
   getCampaignsMissingSendDelays,
+  getSessionsForCampaign,
   reactivateCampaignsWithPendingLeads,
   tryVpsIdempotencyOnce,
   getOrResolveColdDmProxyUrl,
@@ -1131,6 +1132,18 @@ app.post('/api/control/start', async (req, res) => {
           `Campaign ${labels}${extra} missing min/max send delay settings. Set those in campaign settings before pressing Start.`;
         await setClientStatusMessage(clientId, errorMessage).catch(() => {});
         return res.status(400).json({ ok: false, error: errorMessage, problems: delayProblems });
+      }
+      const sessionsForCampaign = await getSessionsForCampaign(clientId, campaignId).catch(() => []);
+      const staleSessions = (sessionsForCampaign || []).filter((s) => s?.web_session_needs_refresh === true);
+      if (staleSessions.length > 0) {
+        const reconnectMessage =
+          'Please reconnect your account in Settings > Integrations > Automation session (outbound).';
+        await setClientStatusMessage(clientId, reconnectMessage).catch(() => {});
+        return res.status(400).json({
+          ok: false,
+          code: 'session_reconnect_required',
+          error: reconnectMessage,
+        });
       }
       const noWorkHint = await getNoWorkHint(clientId).catch(() => '');
       if (noWorkHint) {

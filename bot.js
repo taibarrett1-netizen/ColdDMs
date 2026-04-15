@@ -4018,6 +4018,27 @@ async function runBotMultiTenant() {
       });
       lastClaimedClientIdForDebug = claimedClientId;
     }
+    if (claimedJob.client_id && claimedJob.campaign_id && typeof sb.getClientSendCampaignTurn === 'function') {
+      const campaignTurn = await sb.getClientSendCampaignTurn(claimedJob.client_id).catch(() => null);
+      if (campaignTurn?.campaignId && campaignTurn.campaignId !== claimedJob.campaign_id) {
+        const turnLabel = campaignTurn.campaignName || campaignTurn.campaignId;
+        const turnMessage = `Waiting for "${turnLabel}" to finish sending before this campaign can start.`;
+        await sb.updateSendJob(
+          claimedJob.id,
+          {
+            status: 'retry',
+            available_at: new Date(Date.now() + randomDelay(30, 60) * 1000).toISOString(),
+            last_error_class: 'campaign_turn_locked',
+            last_error_message: turnMessage,
+          },
+          SEND_WORKER_ID
+        ).catch(() => {});
+        await sb.setClientStatusMessage(claimedJob.client_id, turnMessage).catch(() => {});
+        await releaseClaimedCampaignLease(claimedJob.campaign_id);
+        await delay(randomDelay(500, 1500));
+        continue;
+      }
+    }
     leasedCampaignIdForSignal = claimedJob.campaign_id || null;
     const resolved = await withTimeout(
       sb.buildSendWorkFromJob(claimedJob.id),
