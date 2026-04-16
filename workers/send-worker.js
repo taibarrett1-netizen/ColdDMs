@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Dedicated send worker: same behavior as `node cli.js --start` / multi-tenant runBot().
- * Run under PM2 as `ig-dm-send` or `ig-dm-bot` so the dashboard API stays responsive.
+ * Run under PM2 as `ig-dm-send` (see ecosystem.config.cjs). Do not use deprecated `ig-dm-bot`.
  */
 require('dotenv').config();
 const path = require('path');

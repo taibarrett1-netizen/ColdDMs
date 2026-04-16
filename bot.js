@@ -4847,6 +4847,15 @@ async function runBot() {
   const useSupabase = sb.isSupabaseConfigured();
 
   if (useSupabase) {
+    const pm2Name = String(process.env.name || '').trim();
+    if (pm2Name === 'ig-dm-bot') {
+      logger.error(
+        '[send-worker] PM2 app name "ig-dm-bot" is deprecated: it duplicates ig-dm-send and causes Chrome ' +
+          '"browser is already running" on the same profile. Run: pm2 delete ig-dm-bot && pm2 save — then use ' +
+          'ecosystem.config.cjs (ig-dm-send only). See README.md.'
+      );
+      process.exit(1);
+    }
     await runBotMultiTenant();
     return;
   }
