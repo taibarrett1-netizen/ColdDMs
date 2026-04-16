@@ -268,17 +268,34 @@ app.post('/api/internal/scale-send-workers', async (req, res) => {
   }
 });
 
+const PM2_JLIST_TIMEOUT_MS = 5000;
+
 function getBotProcessRunning(cb) {
-  exec('pm2 jlist', { maxBuffer: 1024 * 1024 }, (err, stdout) => {
-    if (err) return cb(false);
-    try {
-      const list = JSON.parse(stdout);
-      const proc = list.find((p) => p.name === BOT_PM2_NAME);
-      cb(proc && proc.pm2_env && proc.pm2_env.status === 'online');
-    } catch (e) {
-      cb(false);
+  exec(
+    'pm2 jlist',
+    { maxBuffer: 1024 * 1024, timeout: PM2_JLIST_TIMEOUT_MS },
+    (err, stdout) => {
+      if (err) {
+        const timedOut =
+          err.killed === true || err.signal === 'SIGKILL' || /timed out|TIMEOUT/i.test(String(err.message || ''));
+        if (timedOut) {
+          console.warn(
+            `[API] pm2 jlist exceeded ${PM2_JLIST_TIMEOUT_MS}ms (PM2 daemon busy). Treating send worker as online so /api/status still returns.`
+          );
+          // Optimistic: avoids 503 spam and false "stopped" when ig-dm-send is actually running.
+          return cb(true);
+        }
+        return cb(false);
+      }
+      try {
+        const list = JSON.parse(stdout);
+        const proc = list.find((p) => p.name === BOT_PM2_NAME);
+        cb(proc && proc.pm2_env && proc.pm2_env.status === 'online');
+      } catch (e) {
+        cb(false);
+      }
     }
-  });
+  );
 }
 
 function execPm2(command) {
@@ -365,7 +382,8 @@ async function ensureSendWorkerProcess() {
   return { ok: false, action: 'create_missing_failed', out: create.out, err: create.err };
 }
 
-const STATUS_TIMEOUT_MS = 8000; // respond before typical Edge Function timeouts (~10–15s); status uses fast queries
+// Status must return before dashboard / edge proxies time out. `pm2 jlist` can stall when PM2 RPC is slow — cap it separately (getBotProcessRunning).
+const STATUS_TIMEOUT_MS = 12000;
 
 // --- API: health (for proxy/dashboard connectivity check; no DB or pm2) ---
 app.get('/api/health', (req, res) => {

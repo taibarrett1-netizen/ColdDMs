@@ -66,6 +66,19 @@ If Supabase is **not** configured and `leads.csv` exists, `node cli.js --start` 
 
 Set `HEADLESS_MODE=false`, run Xvfb (e.g. `DISPLAY=:99`), point Puppeteer at that display, optionally run `x11vnc` and SSH-tunnel to watch the browser. Use `PUPPETEER_SLOW_MO_MS` to slow actions.
 
+## DM search / login debug screenshots (VPS)
+
+Logs print paths like `logs/login-debug/1776338959233_dm_search_before_pick_rossmann.png` (repo root on the server, e.g. `~/ColdDMs/`).
+
+**View on your Mac** (replace host and path):
+
+```bash
+scp 'root@YOUR_DROPLET_IP:/root/ColdDMs/logs/login-debug/1776338959233_dm_search_before_pick_rossmann.png' ~/Downloads/
+open ~/Downloads/1776338959233_dm_search_before_pick_rossmann.png
+```
+
+Or from the repo on the server: `cd ~/ColdDMs && python3 -m http.server 8080` then browse `http://YOUR_IP:8080/logs/login-debug/` (open port 8080 in the firewall if needed).
+
 ## Admin lab
 
 Experimental routes live under `admin_lab/http.js` (`/api/admin-lab/*`). Require API key + `X-Admin-Lab-Secret` (`ADMIN_LAB_SECRET`).

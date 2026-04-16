@@ -4789,7 +4789,10 @@ async function runBotMultiTenant() {
         const minSec = Math.max(0, Number(work.minDelaySec) || 0);
         const maxSec = Math.max(0, Number(work.maxDelaySec) || 0);
         logger.log(`Campaign cooldown from settings ${minSec}-${maxSec}s. Next send in ${delaySec} sec.`);
-        sb.setClientStatusMessage(clientId, `Waiting. Campaign cooldown ${delaySec} sec (settings ${minSec}-${maxSec}s).`).catch(() => {});
+        const cooldownStatus = sendResult.ok
+          ? `Campaign cooldown: last DM sent. Next send in ~${delaySec}s (random delay between ${minSec}s and ${maxSec}s from campaign settings).`
+          : `Campaign cooldown: spacing sends ~${delaySec}s (${minSec}s–${maxSec}s from campaign settings) before retry.`;
+        sb.setClientStatusMessage(clientId, cooldownStatus).catch(() => {});
         if (!sendResult.ok) {
           sendJobStatus = 'failed';
           sendJobUpdates = {
