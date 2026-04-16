@@ -35,6 +35,7 @@ const {
   addCampaignLeadsFromGroups,
   syncSendJobsForClient,
   getNoWorkHint,
+  getClientNoWorkResumeAt,
   getCampaignsMissingSendDelays,
   getSessionsForCampaign,
   reactivateCampaignsWithPendingLeads,
@@ -1166,12 +1167,6 @@ app.post('/api/control/start', async (req, res) => {
           error: reconnectMessage,
         });
       }
-      const noWorkHint = await getNoWorkHint(clientId).catch(() => '');
-      if (noWorkHint) {
-        await setClientStatusMessage(clientId, noWorkHint).catch(() => {});
-      } else {
-        await setClientStatusMessage(clientId, 'Starting…').catch(() => {});
-      }
     } catch (e) {
       console.error('[API] reactivateCampaignsWithPendingLeads', e);
     }
@@ -1187,6 +1182,33 @@ app.post('/api/control/start', async (req, res) => {
         })
       );
     });
+    try {
+      const noWorkHint = await getNoWorkHint(clientId).catch(() => '');
+      let statusToSet = '';
+      if (noWorkHint) {
+        statusToSet = noWorkHint;
+      } else {
+        const resume = await getClientNoWorkResumeAt(clientId).catch(() => ({
+          message: null,
+          reason: 'pending_ready',
+          resumeAt: null,
+        }));
+        const rMsg = resume?.message != null ? String(resume.message).trim() : '';
+        const reason = resume?.reason || 'pending_ready';
+        if (reason === 'no_pending' && !rMsg) {
+          statusToSet = 'No pending leads to send.';
+        } else if (reason === 'pending_ready' && !rMsg) {
+          statusToSet = 'Send enabled — jobs will run when a send worker picks them up.';
+        } else if (rMsg) {
+          statusToSet = rMsg.slice(0, 500);
+        } else {
+          statusToSet = `Nothing to send right now (${reason}).`;
+        }
+      }
+      await setClientStatusMessage(clientId, statusToSet).catch(() => {});
+    } catch (e) {
+      console.error('[API] control/start status message', e);
+    }
     console.log('[API] Start (pause=0) for clientId=', clientId);
     res.json({ ok: true, processRunning: true });
     ensureSendWorkerProcess()

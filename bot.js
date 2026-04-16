@@ -4691,23 +4691,32 @@ async function runBotMultiTenant() {
       startCampaignLeaseHeartbeat();
       let skipSendAfterVoiceRestart = false;
       logger.log(`[send-worker] restoring Instagram session for @${work.username}`);
+      let ensurePageSessionErr = '';
       const ok = await withTimeout(
         ensurePageSession(session),
         SEND_STAGE_TIMEOUT_MS,
         `ensurePageSession timeout after ${SEND_STAGE_TIMEOUT_MS}ms`
       ).catch((e) => {
-        logger.error(`[send-worker] ensurePageSession failed: ${e?.message || e}`);
+        ensurePageSessionErr = String((e && e.message) || e || '');
+        logger.error(`[send-worker] ensurePageSession failed: ${ensurePageSessionErr}`);
         return false;
       });
       if (!ok) {
         logger.warn('Could not load Instagram session; re-queueing send job (lead not failed).');
+        const timedOut = /timeout after|ensurePageSession timeout/i.test(ensurePageSessionErr);
+        const statusMsg = timedOut
+          ? 'Instagram browser did not become ready in time — often another send worker is waiting on the same Chrome profile. Retrying automatically. If this repeats, reduce concurrent send workers or restart ig-dm-send.'
+          : 'Could not load Instagram for this send; retrying. Reconnect the sender in Cold Outreach if this keeps happening.';
+        await sb.setClientStatusMessage(clientId, statusMsg).catch(() => {});
         await sb.updateSendJob(
           claimedJob.id,
           {
             status: 'retry',
             available_at: new Date(Date.now() + randomDelay(30, 90) * 1000).toISOString(),
-            last_error_class: 'session_load_failed',
-            last_error_message: 'Instagram session expired. Reconnect this sender in Cold Outreach.',
+            last_error_class: timedOut ? 'session_load_timeout' : 'session_load_failed',
+            last_error_message: timedOut
+              ? ensurePageSessionErr.slice(0, 400) || 'session_load_timeout'
+              : 'Instagram session expired. Reconnect this sender in Cold Outreach.',
           },
           SEND_WORKER_ID
         ).catch(() => {});
