@@ -1536,36 +1536,69 @@ async function passInstagramDirectNewCoigLoginGate(page, tag = 'direct_new_gate'
     logger.warn('[ig-direct-gate] before-Continue screenshot failed: ' + (e.message || e));
   }
 
-  const clicked = await page
+  /**
+   * React/IG often ignores synthetic DOM .click() from page.evaluate. Pick the largest visible
+   * primary "Continue" (exact label) and hit it with real pointer events via CDP.
+   */
+  const pickCenter = await page
     .evaluate(() => {
       const visible = (el) => {
         try {
-          return !!el && el.offsetParent !== null;
+          if (!el || el.offsetParent === null) return false;
+          const r = el.getBoundingClientRect();
+          return r.width >= 4 && r.height >= 4;
         } catch {
           return false;
         }
       };
-      const textOf = (el) => ((el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase());
-      const ctas = Array.from(document.querySelectorAll('button, [role="button"], a')).filter(visible);
-      const pick = ctas.find((el) => {
-        const t = textOf(el);
-        if (t === 'continue') return true;
-        if (t.includes('continue') && !t.includes('agree')) return true;
-        return false;
+      const label = (el) => (el.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const scored = [];
+      document.querySelectorAll('button, [role="button"]').forEach((el) => {
+        if (!visible(el)) return;
+        const t = label(el);
+        if (t !== 'continue') return;
+        const r = el.getBoundingClientRect();
+        const area = r.width * r.height;
+        if (area < 1200) return;
+        scored.push({ el, area });
       });
-      if (!pick) return false;
-      const btn = pick.closest('button') || pick.closest('[role="button"]') || pick;
-      try {
-        btn.scrollIntoView({ block: 'center' });
-      } catch {}
-      try {
-        btn.click();
-        return true;
-      } catch {
-        return false;
+      if (!scored.length) {
+        document.querySelectorAll('button, [role="button"]').forEach((el) => {
+          if (!visible(el)) return;
+          const t = label(el);
+          if (!t.includes('continue') || t.includes('agree')) return;
+          const r = el.getBoundingClientRect();
+          const area = r.width * r.height;
+          if (area < 800) return;
+          scored.push({ el, area });
+        });
       }
+      if (!scored.length) return null;
+      scored.sort((a, b) => b.area - a.area);
+      const best = scored[0].el;
+      try {
+        best.scrollIntoView({ block: 'center', inline: 'nearest' });
+      } catch {}
+      const r = best.getBoundingClientRect();
+      return { cx: r.left + r.width / 2, cy: r.top + r.height / 2, area: r.width * r.height };
     })
-    .catch(() => false);
+    .catch(() => null);
+
+  let clicked = false;
+  if (pickCenter && Number.isFinite(pickCenter.cx) && Number.isFinite(pickCenter.cy)) {
+    try {
+      await page.mouse.move(pickCenter.cx, pickCenter.cy, { steps: 8 }).catch(() => {});
+      await delay(120);
+      await page.mouse.click(pickCenter.cx, pickCenter.cy, { delay: 120, clickCount: 1 });
+      clicked = true;
+      logger.log(
+        `[ig-direct-gate] pointer-click Continue at (${Math.round(pickCenter.cx)},${Math.round(pickCenter.cy)}) area≈${Math.round(pickCenter.area)}`
+      );
+      await delay(900);
+    } catch (e) {
+      logger.warn('[ig-direct-gate] pointer-click Continue failed: ' + (e.message || e));
+    }
+  }
 
   if (!clicked) {
     logger.warn('[ig-direct-gate] Continue button not found or click failed');
