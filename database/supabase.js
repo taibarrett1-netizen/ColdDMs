@@ -175,19 +175,46 @@ function getToday() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function hasValidCampaignSendDelayConfig(camp) {
-  const min = Number(camp?.min_delay_sec);
-  const max = Number(camp?.max_delay_sec);
-  return Number.isFinite(min) && Number.isFinite(max) && min >= 0 && max >= min;
+/**
+ * Merge campaign seconds with client cold_dm_settings minute defaults (see migrations on min_delay_minutes).
+ * @param {Record<string, unknown>} campaign - cold_dm_campaigns row
+ * @param {Record<string, unknown> | null} settings - cold_dm_settings row or null
+ */
+function computeEffectiveSendDelaySeconds(campaign, settings) {
+  let minS = campaign?.min_delay_sec;
+  let maxS = campaign?.max_delay_sec;
+  if (minS == null && settings && settings.min_delay_minutes != null) {
+    const mm = Number(settings.min_delay_minutes);
+    if (Number.isFinite(mm) && mm >= 0) minS = Math.round(mm * 60);
+  }
+  if (maxS == null && settings && settings.max_delay_minutes != null) {
+    const mm = Number(settings.max_delay_minutes);
+    if (Number.isFinite(mm) && mm >= 0) maxS = Math.round(mm * 60);
+  }
+  return { minDelaySec: minS, maxDelaySec: maxS };
 }
 
-function describeCampaignSendDelayConfigProblem(camp) {
-  const min = camp?.min_delay_sec;
-  const max = camp?.max_delay_sec;
-  if (min == null && max == null) return 'missing min_delay_sec and max_delay_sec';
-  if (min == null) return 'missing min_delay_sec';
-  if (max == null) return 'missing max_delay_sec';
-  if (Number(max) < Number(min)) return `max_delay_sec (${max}) is lower than min_delay_sec (${min})`;
+function hasValidResolvedSendDelays(minS, maxS) {
+  if (minS == null || maxS == null) return false;
+  const min = Number(minS);
+  const max = Number(maxS);
+  return Number.isFinite(min) && Number.isFinite(max) && min >= 1 && max >= min;
+}
+
+function hasValidCampaignSendDelayConfig(campaign, settings = null) {
+  if (!campaign) return false;
+  const { minDelaySec, maxDelaySec } = computeEffectiveSendDelaySeconds(campaign, settings);
+  return hasValidResolvedSendDelays(minDelaySec, maxDelaySec);
+}
+
+function describeCampaignSendDelayConfigProblem(campaign, settings = null) {
+  const { minDelaySec: min, maxDelaySec: max } = computeEffectiveSendDelaySeconds(campaign, settings);
+  if (min == null && max == null) {
+    return 'missing min/max send delay (set seconds on the campaign or min/max delay minutes in Cold DM client settings)';
+  }
+  if (min == null) return 'missing min send delay (campaign min_delay_sec or client min_delay_minutes)';
+  if (max == null) return 'missing max send delay (campaign max_delay_sec or client max_delay_minutes)';
+  if (Number(max) < Number(min)) return `max_delay (${max}) is lower than min_delay (${min})`;
   return 'invalid send delay settings';
 }
 
@@ -1531,7 +1558,7 @@ async function getClientNoWorkResumeAt(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return { message: null, reason: 'no_pending', resumeAt: null };
 
-  const settings = await getSettings(clientId);
+  const settings = await getSettings(clientId).catch(() => null);
   const { data: allCampaigns } = await sb
     .from('cold_dm_campaigns')
     .select('id, name, status')
@@ -1591,7 +1618,7 @@ async function getClientNoWorkResumeAt(clientId) {
   let tzLabel = 'UTC';
   let allOutside = true;
   for (const camp of campaigns) {
-    if (!hasValidCampaignSendDelayConfig(camp)) continue;
+    if (!hasValidCampaignSendDelayConfig(camp, settings)) continue;
     const { count: campPending } = await sb
       .from('cold_dm_campaign_leads')
       .select('*', { count: 'exact', head: true })
@@ -3224,6 +3251,45 @@ async function syncSendJobsForClient(clientId, campaignId = null) {
   return total;
 }
 
+/**
+ * Pause one campaign and cancel all queued/running send jobs for it (stops hammering every lead).
+ * IG sessions stay connected; user fixes delays and sets campaign active again.
+ */
+async function pauseCampaignMissingSendDelayConfig(clientId, campaignId, message) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !campaignId) return;
+  const nowIso = new Date().toISOString();
+  const msg = String(message || 'missing_delay_config').slice(0, 500);
+  try {
+    await sb
+      .from('cold_dm_campaigns')
+      .update({ status: 'paused', updated_at: nowIso })
+      .eq('id', campaignId)
+      .eq('client_id', clientId);
+  } catch (e) {
+    console.error('[pauseCampaignMissingSendDelayConfig] campaign update failed', e);
+  }
+  try {
+    await sb
+      .from('cold_dm_send_jobs')
+      .update({
+        status: 'cancelled',
+        finished_at: nowIso,
+        leased_until: null,
+        leased_by_worker: null,
+        last_error_class: 'missing_delay_config',
+        last_error_message: msg,
+        updated_at: nowIso,
+      })
+      .eq('campaign_id', campaignId)
+      .eq('client_id', clientId)
+      .in('status', ['pending', 'retry', 'running']);
+  } catch (e) {
+    console.error('[pauseCampaignMissingSendDelayConfig] send_jobs cancel failed', e);
+  }
+  await setClientStatusMessage(clientId, msg).catch(() => {});
+}
+
 async function buildSendWorkFromJob(jobId) {
   const sb = getSupabase();
   if (!sb || !jobId) return null;
@@ -3403,9 +3469,24 @@ async function buildSendWorkFromJob(jobId) {
   if (!messageText) {
     return { job, disposition: 'failed', reason: 'no_message_text' };
   }
-  if (!hasValidCampaignSendDelayConfig(campaign)) {
-    return { job, disposition: 'retry', reason: 'missing_delay_config', availableAt: computeAvailableAtIso(10 * 60) };
+  const settingsForDelays =
+    campaign.min_delay_sec == null || campaign.max_delay_sec == null
+      ? await getSettings(job.client_id).catch(() => null)
+      : null;
+  if (!hasValidCampaignSendDelayConfig(campaign, settingsForDelays)) {
+    const detail = describeCampaignSendDelayConfigProblem(campaign, settingsForDelays);
+    const statusMessage = `Campaign "${campaign.name || campaign.id}" paused: ${detail}. Fix delays, then set the campaign to Active again.`;
+    await pauseCampaignMissingSendDelayConfig(job.client_id, campaign.id, statusMessage).catch((e) =>
+      console.error('[buildSendWorkFromJob] pauseCampaignMissingSendDelayConfig failed', e)
+    );
+    return {
+      job,
+      disposition: 'cancelled',
+      reason: 'missing_delay_config',
+      statusMessage,
+    };
   }
+  const effectiveDelays = computeEffectiveSendDelaySeconds(campaign, settingsForDelays);
   if (!isWithinSchedule(campaign.schedule_start_time, campaign.schedule_end_time, campaign.timezone ?? null)) {
     const nextStart = getNextScheduleStartInTimezone(campaign.schedule_start_time, campaign.timezone ?? null);
     const availableAt = nextStart ? nextStart.toISOString() : computeAvailableAtIso(15 * 60);
@@ -3444,8 +3525,8 @@ async function buildSendWorkFromJob(jobId) {
       messageGroupMessageId: messageGroupMessageId || null,
       dailySendLimit: campaign.daily_send_limit,
       hourlySendLimit: campaign.hourly_send_limit,
-      minDelaySec: campaign.min_delay_sec,
-      maxDelaySec: campaign.max_delay_sec,
+      minDelaySec: effectiveDelays.minDelaySec,
+      maxDelaySec: effectiveDelays.maxDelaySec,
       voiceNotePath,
       voiceNoteMode,
     },
@@ -3705,6 +3786,7 @@ async function getActiveCampaigns(clientId) {
 async function getCampaignsMissingSendDelays(clientId, campaignId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) return [];
+  const settings = await getSettings(clientId).catch(() => null);
   let q = sb
     .from('cold_dm_campaigns')
     .select('id, name, status, min_delay_sec, max_delay_sec')
@@ -3716,7 +3798,7 @@ async function getCampaignsMissingSendDelays(clientId, campaignId = null) {
 
   const problems = [];
   for (const camp of campaigns) {
-    if (hasValidCampaignSendDelayConfig(camp)) continue;
+    if (hasValidCampaignSendDelayConfig(camp, settings)) continue;
 
     let shouldBlock = camp.status === 'active';
     if (!shouldBlock) {
@@ -3764,7 +3846,7 @@ async function getCampaignsMissingSendDelays(clientId, campaignId = null) {
         id: camp.id,
         name: camp.name || null,
         status: camp.status,
-        reason: describeCampaignSendDelayConfigProblem(camp),
+        reason: describeCampaignSendDelayConfigProblem(camp, settings),
       });
     }
   }
@@ -3785,6 +3867,7 @@ async function getMostSpecificNoWorkHint(clientId) {
 
   const campaigns = await getActiveCampaigns(clientId);
   if (!campaigns?.length) return '';
+  const settings = await getSettings(clientId).catch(() => null);
 
   let anyWithPending = false;
 
@@ -3798,8 +3881,8 @@ async function getMostSpecificNoWorkHint(clientId) {
 
     anyWithPending = true;
 
-    if (!hasValidCampaignSendDelayConfig(camp)) {
-      return `Campaign "${camp.name || camp.id}" is missing send delay settings (${describeCampaignSendDelayConfigProblem(camp)}). Set min/max delay in campaign settings before starting.`;
+    if (!hasValidCampaignSendDelayConfig(camp, settings)) {
+      return `Campaign "${camp.name || camp.id}" is missing send delay settings (${describeCampaignSendDelayConfigProblem(camp, settings)}). Set min/max delay on the campaign or client Cold DM defaults before starting.`;
     }
 
     let messageText = null;
@@ -3931,6 +4014,7 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
   if (!sb || !clientId) return null;
   const campaigns = await getActiveCampaigns(clientId);
   const scrapeBlocklistSet = await getScrapeBlocklistUsernames(clientId);
+  const clientSettings = await getSettings(clientId).catch(() => null);
   const campaignDebug = [];
   for (const camp of campaigns) {
     const dbg = {
@@ -3954,7 +4038,7 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
       campaignDebug.push(dbg);
       continue;
     }
-    if (!hasValidCampaignSendDelayConfig(camp)) {
+    if (!hasValidCampaignSendDelayConfig(camp, clientSettings)) {
       dbg.reason = 'missing_delay_config';
       dbg.blockedBy = 'missing_delay_config';
       campaignDebug.push(dbg);
@@ -4119,6 +4203,7 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
       campaignLeadId: clRow.id,
       username: normalizeUsername(leadRow.username),
     });
+    const effDelays = computeEffectiveSendDelaySeconds(camp, clientSettings);
     return {
       campaignLeadId: clRow.id,
       campaignId: camp.id,
@@ -4132,8 +4217,8 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
       messageGroupMessageId: messageGroupMessageId || null,
       dailySendLimit: camp.daily_send_limit,
       hourlySendLimit: camp.hourly_send_limit,
-      minDelaySec: camp.min_delay_sec,
-      maxDelaySec: camp.max_delay_sec,
+      minDelaySec: effDelays.minDelaySec,
+      maxDelaySec: effDelays.maxDelaySec,
       voiceNotePath,
       voiceNoteMode,
     };
@@ -4251,9 +4336,10 @@ async function addCampaignLeadsFromGroups(clientId, campaignId) {
 async function reactivateCampaignsWithPendingLeads(clientId, campaignId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) return 0;
+  const settings = await getSettings(clientId).catch(() => null);
   let q = sb
     .from('cold_dm_campaigns')
-    .select('id, status')
+    .select('id, status, min_delay_sec, max_delay_sec')
     .eq('client_id', clientId);
   if (campaignId) q = q.eq('id', campaignId);
   const { data: campaigns } = await q;
@@ -4262,7 +4348,7 @@ async function reactivateCampaignsWithPendingLeads(clientId, campaignId = null) 
   let reactivated = 0;
   for (const camp of campaigns) {
     if (camp.status === 'active') continue;
-    if (!hasValidCampaignSendDelayConfig(camp)) continue;
+    if (!hasValidCampaignSendDelayConfig(camp, settings)) continue;
     const { count: pendingCount } = await sb
       .from('cold_dm_campaign_leads')
       .select('*', { count: 'exact', head: true })
@@ -4446,6 +4532,7 @@ module.exports = {
   getClientNoWorkResumeAt,
   getNoWorkHint,
   getCampaignsMissingSendDelays,
+  pauseCampaignMissingSendDelayConfig,
   getFirstNameBlocklist,
   getUserAccountName,
   addCampaignLeadsFromGroups,

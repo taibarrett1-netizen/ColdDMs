@@ -4798,15 +4798,16 @@ async function runBotMultiTenant() {
           last_error_message: msg,
         };
       } else if (!sendResult.ok && sendResult.reason === 'missing_delay_config') {
-        delayMs = 10 * 60 * 1000;
-        const msg = sendResult.statusMessage || 'campaign missing delay settings';
+        const msg = sendResult.statusMessage || 'Campaign missing min/max send delay settings.';
         logger.warn(msg);
-        sb.setClientStatusMessage(clientId, msg).catch(() => {});
-        sendJobStatus = 'retry';
+        if (typeof sb.pauseCampaignMissingSendDelayConfig === 'function') {
+          await sb.pauseCampaignMissingSendDelayConfig(clientId, work.campaignId, msg).catch(() => {});
+        }
+        sendJobStatus = 'cancelled';
         sendJobUpdates = {
-          available_at: new Date(Date.now() + delayMs).toISOString(),
+          finished_at: new Date().toISOString(),
           last_error_class: 'missing_delay_config',
-          last_error_message: msg,
+          last_error_message: msg.slice(0, 500),
         };
       } else if (!sendResult.ok && sendResult.reason === 'already_sent') {
         // Duplicate lead for this client was already messaged earlier; do not consume campaign cooldown.
