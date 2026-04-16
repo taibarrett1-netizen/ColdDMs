@@ -178,9 +178,90 @@ function isChromeProfileSingletonLockError(err) {
   );
 }
 
+const SINGLETON_NAMES = new Set(['SingletonLock', 'SingletonSocket', 'SingletonCookie']);
+
+function listProfileSubdirsForSingleton(profileDir) {
+  const out = ['Default'];
+  try {
+    for (const ent of fs.readdirSync(profileDir, { withFileTypes: true })) {
+      if (ent.isDirectory() && /^Profile \d+$/i.test(ent.name)) out.push(ent.name);
+    }
+  } catch (_) {}
+  return out;
+}
+
+/** Remove Chromium singleton files (root + Default + Profile N). */
+function unlinkSingletonArtifactsUnderProfile(profileDir) {
+  const dirs = [profileDir, ...listProfileSubdirsForSingleton(profileDir).map((sd) => path.join(profileDir, sd))];
+  for (const d of dirs) {
+    for (const name of SINGLETON_NAMES) {
+      const p = path.join(d, name);
+      try {
+        if (fs.existsSync(p)) fs.unlinkSync(p);
+      } catch (_) {}
+    }
+  }
+}
+
+/**
+ * Kill Linux Chromium/Chrome processes whose argv references this user-data-dir (stray after PM2 restart).
+ * Child GPU/renderer processes often omit --user-data-dir; killing the browser parent is enough when we match it.
+ */
+function killLinuxChromiumProcessesUsingProfileDir(profileDir, log) {
+  if (process.platform !== 'linux') return;
+  const resolved = path.resolve(profileDir);
+  let entries;
+  try {
+    entries = fs.readdirSync('/proc', { withFileTypes: true });
+  } catch (_) {
+    return;
+  }
+  const prefix = '--user-data-dir=';
+  for (const ent of entries) {
+    if (!ent.isDirectory() || !/^\d+$/.test(ent.name)) continue;
+    const pidStr = ent.name;
+    const pid = Number(pidStr);
+    if (pid === process.pid) continue;
+    let raw;
+    try {
+      raw = fs.readFileSync(`/proc/${pidStr}/cmdline`);
+    } catch (_) {
+      continue;
+    }
+    if (!raw || raw.length === 0) continue;
+    const argv = String(raw).split('\0').filter(Boolean);
+    const joined = argv.join(' ');
+    let matches = joined.includes(resolved);
+    if (!matches) {
+      for (const a of argv) {
+        if (a.startsWith(prefix)) {
+          try {
+            if (path.resolve(a.slice(prefix.length)) === resolved) {
+              matches = true;
+              break;
+            }
+          } catch (_) {}
+        }
+      }
+    }
+    if (!matches) continue;
+    const exe = String(argv[0] || '');
+    const exeBase = path.basename(exe);
+    const looksLikeChrome =
+      /^(chrome|chromium|chromium-browser|google-chrome|google-chrome-stable|google-chrome-beta)$/i.test(exeBase) ||
+      /[\\/]chrome-linux[\\/]chrome$/i.test(exe) ||
+      /[\\/]\.cache[\\/]puppeteer[\\/].+[\\/]chrome$/i.test(exe);
+    if (!looksLikeChrome) continue;
+    try {
+      process.kill(pid, 'SIGTERM');
+      if (log) log(`[send-worker] Sent SIGTERM to Chromium pid ${pidStr} holding ${path.basename(profileDir)}`);
+    } catch (_) {}
+  }
+}
+
 /**
  * After PM2 restart or OOM, orphan Chromium can leave SingletonLock/Socket. Kill processes using the
- * profile dir (Linux fuser) and remove stale lock files, then relaunch can succeed.
+ * profile (fuser + /proc scan), remove stale lock files, then relaunch can succeed.
  * @param {(msg: string) => void} [log]
  */
 function tryRecoverStaleChromeProfileLocks(profileDir, log) {
@@ -191,25 +272,17 @@ function tryRecoverStaleChromeProfileLocks(profileDir, log) {
   }
   if (log) log(`[send-worker] Recovering stale Chromium profile locks for ${path.basename(profileDir)}…`);
   if (process.platform === 'linux') {
+    killLinuxChromiumProcessesUsingProfileDir(profileDir, log);
     try {
       spawnSync('fuser', ['-TERM', profileDir], { stdio: 'ignore', timeout: 8000 });
     } catch (_) {
-      /* fuser missing or no PIDs — continue to unlink */
+      /* fuser missing or no PIDs */
     }
-  }
-  const candidates = [
-    path.join(profileDir, 'SingletonLock'),
-    path.join(profileDir, 'SingletonSocket'),
-    path.join(profileDir, 'SingletonCookie'),
-    path.join(profileDir, 'Default', 'SingletonLock'),
-    path.join(profileDir, 'Default', 'SingletonSocket'),
-    path.join(profileDir, 'Default', 'SingletonCookie'),
-  ];
-  for (const p of candidates) {
     try {
-      if (fs.existsSync(p)) fs.unlinkSync(p);
+      spawnSync('fuser', ['-k', '-9', profileDir], { stdio: 'ignore', timeout: 8000 });
     } catch (_) {}
   }
+  unlinkSingletonArtifactsUnderProfile(profileDir);
 }
 
 module.exports = {

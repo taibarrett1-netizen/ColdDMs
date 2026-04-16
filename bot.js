@@ -4106,29 +4106,17 @@ async function runBotMultiTenant() {
       try {
         browser = await puppeteer.launch(launchOpts);
       } catch (e) {
-        if (chromeProfileDirLock && typeof chromeProfileDirLock.release === 'function') {
-          try {
-            chromeProfileDirLock.release();
-          } catch {}
-          chromeProfileDirLock = null;
-        }
         const profileDir = launchOpts.userDataDir;
         if (profileDir && isChromeProfileSingletonLockError(e)) {
+          // Keep chromeProfileDirLock: releasing here lets another PM2 worker open the same profile and races singleton recovery.
           logger.warn(
-            '[send-worker] Chromium profile singleton locked (often orphan Chrome after PM2 restart). Cleaning and retrying launch once…'
+            '[send-worker] Chromium profile singleton locked (often orphan Chrome after PM2 restart). Cleaning while holding Node profile lock, retrying launch once…'
           );
           tryRecoverStaleChromeProfileLocks(profileDir, (m) => logger.warn(m));
           await delay(2000);
           try {
-            chromeProfileDirLock = await acquireChromeUserDataDirLock(profileDir, {
-              log: (msg) => logger.warn(`[send-worker] ${msg}`),
-            });
-          } catch (lockErr) {
-            logger.error('Chrome profile lock failed (after singleton recovery)', lockErr);
-            throw lockErr;
-          }
-          try {
             browser = await puppeteer.launch(launchOpts);
+            logger.warn('[send-worker] Chrome launched after singleton recovery');
           } catch (e2) {
             if (chromeProfileDirLock && typeof chromeProfileDirLock.release === 'function') {
               try {
@@ -4140,6 +4128,12 @@ async function runBotMultiTenant() {
             throw e2;
           }
         } else {
+          if (chromeProfileDirLock && typeof chromeProfileDirLock.release === 'function') {
+            try {
+              chromeProfileDirLock.release();
+            } catch {}
+            chromeProfileDirLock = null;
+          }
           logger.error('Browser launch failed', e);
           throw e;
         }
