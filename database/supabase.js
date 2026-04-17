@@ -254,6 +254,60 @@ function normalizeScheduleTime(value) {
 }
 
 /**
+ * Parse "HH:mm" or "HH:mm:ss" into seconds since midnight.
+ * Returns null if invalid.
+ */
+function parseClockTimeToSeconds(hhmmss) {
+  if (!hhmmss) return null;
+  const raw = String(hhmmss).trim();
+  if (!raw) return null;
+  const mch = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!mch) return null;
+  const h = Number(mch[1]);
+  const m = Number(mch[2]);
+  const s = mch[3] != null ? Number(mch[3]) : 0;
+  if (!Number.isFinite(h) || !Number.isFinite(m) || !Number.isFinite(s)) return null;
+  if (h < 0 || h > 23) return null;
+  if (m < 0 || m > 59) return null;
+  if (s < 0 || s > 59) return null;
+  return h * 3600 + m * 60 + s;
+}
+
+/**
+ * Current local time in `timezone` as seconds since midnight (0..86399).
+ * Uses Intl.formatToParts to avoid locale formatting edge cases.
+ * Falls back to UTC wall clock if tz is missing/invalid.
+ */
+function getClockSecondsInTimezone(now, timezone) {
+  const tz = normalizeTimezoneInput(timezone);
+  if (!tz) {
+    return now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds();
+  }
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+      hourCycle: 'h23',
+    }).formatToParts(now);
+    const hour = Number(parts.find((p) => p.type === 'hour')?.value);
+    const minute = Number(parts.find((p) => p.type === 'minute')?.value);
+    const second = Number(parts.find((p) => p.type === 'second')?.value);
+    if (!Number.isFinite(hour) || !Number.isFinite(minute) || !Number.isFinite(second)) {
+      // Fallback: try parsing the formatted string.
+      const str = getClockTimeHHMMSSInTimezone(now, tz);
+      const sec = parseClockTimeToSeconds(str);
+      return sec == null ? now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds() : sec;
+    }
+    return hour * 3600 + minute * 60 + second;
+  } catch {
+    return now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds();
+  }
+}
+
+/**
  * Current local time in `timezone` as "HH:mm:ss" (24h). Trims IANA ids (trailing spaces break Intl).
  * Falls back to UTC wall clock if tz is missing/invalid.
  */
@@ -1745,6 +1799,29 @@ async function getClientNoWorkResumeAt(clientId) {
   const earliestQueuedAtRaw = earliestQueuedJob?.available_at || null;
   const earliestQueuedAtMs = earliestQueuedAtRaw ? Date.parse(earliestQueuedAtRaw) : NaN;
   if (Number.isFinite(earliestQueuedAtMs) && earliestQueuedAtMs > nowMs + 1000) {
+    // Self-heal: if we have pending work that is *currently* in schedule, but the queue is deferred
+    // due to outside_schedule, pull those jobs forward so we don't "wait until tomorrow" incorrectly.
+    // This also recovers from any past schedule math bugs that stamped a too-far-future available_at.
+    if (
+      pendingCampaignsInSchedule.length > 0 &&
+      String(earliestQueuedJob?.last_error_class || '').trim() === 'outside_schedule'
+    ) {
+      try {
+        const nowIso = new Date().toISOString();
+        const inScheduleCampaignIds = pendingCampaignsInSchedule.map((c) => c.id).filter(Boolean);
+        if (inScheduleCampaignIds.length > 0) {
+          await sb
+            .from('cold_dm_send_jobs')
+            .update({ available_at: nowIso, updated_at: nowIso })
+            .eq('client_id', clientId)
+            .in('campaign_id', inScheduleCampaignIds)
+            .in('status', ['pending', 'retry'])
+            .eq('last_error_class', 'outside_schedule')
+            .gt('available_at', nowIso);
+          return { message: null, reason: 'pending_ready', resumeAt: new Date(Date.now() + 15_000) };
+        }
+      } catch {}
+    }
     const resumeAt = new Date(earliestQueuedAtMs);
     const jobMeta = {
       lastErrorClass: earliestQueuedJob?.last_error_class || '',
@@ -2227,6 +2304,25 @@ async function markInstagramSessionWebNeedsRefresh(sessionId) {
     .from('cold_dm_instagram_sessions')
     .update({ web_session_needs_refresh: true, updated_at: nowIso })
     .eq('id', sessionId);
+}
+
+/**
+ * Save refreshed Puppeteer session_data captured from a live browser (cookies + local/session storage).
+ * Also clears web_session_needs_refresh because we just verified the session is currently usable.
+ */
+async function updateInstagramSessionSessionData(sessionId, sessionData) {
+  const sb = getSupabase();
+  if (!sb || !sessionId || !sessionData) return false;
+  const nowIso = new Date().toISOString();
+  const { error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .update({
+      session_data: sessionData,
+      web_session_needs_refresh: false,
+      updated_at: nowIso,
+    })
+    .eq('id', sessionId);
+  return !error;
 }
 
 /**
@@ -3992,12 +4088,14 @@ function isWithinSchedule(scheduleStart, scheduleEnd, timezone) {
   const normEnd = normalizeScheduleTime(scheduleEnd);
   if (!normStart && !normEnd) return true;
   const now = new Date();
-  const current = getClockTimeHHMMSSInTimezone(now, timezone);
+  const currentSec = getClockSecondsInTimezone(now, timezone);
   // Cold DM campaigns: implicit 09:00–17:00 when one side was cleared in the UI (saved as null) but the other remains.
   const start = normStart || '09:00:00';
   const end = normEnd || '23:59:59';
-  if (start <= end) return current >= start && current <= end;
-  return current >= start || current <= end;
+  const startSec = parseClockTimeToSeconds(start) ?? 9 * 3600;
+  const endSec = parseClockTimeToSeconds(end) ?? 23 * 3600 + 59 * 60 + 59;
+  if (startSec <= endSec) return currentSec >= startSec && currentSec <= endSec;
+  return currentSec >= startSec || currentSec <= endSec;
 }
 
 async function getRandomMessageFromGroup(messageGroupId) {
@@ -4543,6 +4641,7 @@ module.exports = {
   heartbeatPlatformScraperSessionLease,
   releasePlatformScraperSessionLease,
   markInstagramSessionWebNeedsRefresh,
+  updateInstagramSessionSessionData,
   pauseActiveCampaignsForInstagramSession,
   handleInstagramPasswordReauthDisruption,
   markPlatformScraperWebNeedsRefresh,
