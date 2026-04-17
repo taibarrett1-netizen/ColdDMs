@@ -254,6 +254,60 @@ function normalizeScheduleTime(value) {
 }
 
 /**
+ * Parse "HH:mm" or "HH:mm:ss" into seconds since midnight.
+ * Returns null if invalid.
+ */
+function parseClockTimeToSeconds(hhmmss) {
+  if (!hhmmss) return null;
+  const raw = String(hhmmss).trim();
+  if (!raw) return null;
+  const mch = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!mch) return null;
+  const h = Number(mch[1]);
+  const m = Number(mch[2]);
+  const s = mch[3] != null ? Number(mch[3]) : 0;
+  if (!Number.isFinite(h) || !Number.isFinite(m) || !Number.isFinite(s)) return null;
+  if (h < 0 || h > 23) return null;
+  if (m < 0 || m > 59) return null;
+  if (s < 0 || s > 59) return null;
+  return h * 3600 + m * 60 + s;
+}
+
+/**
+ * Current local time in `timezone` as seconds since midnight (0..86399).
+ * Uses Intl.formatToParts to avoid locale formatting edge cases.
+ * Falls back to UTC wall clock if tz is missing/invalid.
+ */
+function getClockSecondsInTimezone(now, timezone) {
+  const tz = normalizeTimezoneInput(timezone);
+  if (!tz) {
+    return now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds();
+  }
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+      hourCycle: 'h23',
+    }).formatToParts(now);
+    const hour = Number(parts.find((p) => p.type === 'hour')?.value);
+    const minute = Number(parts.find((p) => p.type === 'minute')?.value);
+    const second = Number(parts.find((p) => p.type === 'second')?.value);
+    if (!Number.isFinite(hour) || !Number.isFinite(minute) || !Number.isFinite(second)) {
+      // Fallback: try parsing the formatted string.
+      const str = getClockTimeHHMMSSInTimezone(now, tz);
+      const sec = parseClockTimeToSeconds(str);
+      return sec == null ? now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds() : sec;
+    }
+    return hour * 3600 + minute * 60 + second;
+  } catch {
+    return now.getUTCHours() * 3600 + now.getUTCMinutes() * 60 + now.getUTCSeconds();
+  }
+}
+
+/**
  * Current local time in `timezone` as "HH:mm:ss" (24h). Trims IANA ids (trailing spaces break Intl).
  * Falls back to UTC wall clock if tz is missing/invalid.
  */
@@ -3992,12 +4046,14 @@ function isWithinSchedule(scheduleStart, scheduleEnd, timezone) {
   const normEnd = normalizeScheduleTime(scheduleEnd);
   if (!normStart && !normEnd) return true;
   const now = new Date();
-  const current = getClockTimeHHMMSSInTimezone(now, timezone);
+  const currentSec = getClockSecondsInTimezone(now, timezone);
   // Cold DM campaigns: implicit 09:00–17:00 when one side was cleared in the UI (saved as null) but the other remains.
   const start = normStart || '09:00:00';
   const end = normEnd || '23:59:59';
-  if (start <= end) return current >= start && current <= end;
-  return current >= start || current <= end;
+  const startSec = parseClockTimeToSeconds(start) ?? 9 * 3600;
+  const endSec = parseClockTimeToSeconds(end) ?? 23 * 3600 + 59 * 60 + 59;
+  if (startSec <= endSec) return currentSec >= startSec && currentSec <= endSec;
+  return currentSec >= startSec || currentSec <= endSec;
 }
 
 async function getRandomMessageFromGroup(messageGroupId) {
