@@ -159,6 +159,11 @@ function requireScopedClientId(req, res) {
     res.status(400).json({ ok: false, error: 'clientId is required' });
     return null;
   }
+  const pinnedClientId = (process.env.COLD_DM_CLIENT_ID || '').trim();
+  if (pinnedClientId && pinnedClientId !== clientId) {
+    res.status(403).json({ ok: false, error: 'Forbidden: this worker is pinned to a different clientId' });
+    return null;
+  }
   if (req.authClientId && req.authClientId !== clientId) {
     res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
     return null;
@@ -184,6 +189,28 @@ app.use('/api', (req, res, next) => {
     return next();
   }
   return res.status(401).json({ error: 'Unauthorized' });
+});
+
+// --- API: admin maintenance (fixed actions only; no arbitrary command execution) ---
+app.post('/api/admin/update', (req, res) => {
+  // Safe "pull + restart" endpoint for per-client droplets so Edge can deploy updates without SSH.
+  // Protected by the same Bearer COLD_DM_API_KEY middleware above.
+  const cmd = `cd ${projectRoot} && git pull origin main && npm install && pm2 restart all`;
+  exec(cmd, { maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+    if (err) {
+      return res.status(500).json({
+        ok: false,
+        error: String(err.message || err),
+        stdout: String(stdout || '').slice(0, 8000),
+        stderr: String(stderr || '').slice(0, 8000),
+      });
+    }
+    return res.json({
+      ok: true,
+      stdout: String(stdout || '').slice(0, 8000),
+      stderr: String(stderr || '').slice(0, 8000),
+    });
+  });
 });
 
 const { registerAdminLabRoutes } = require('./admin_lab/http');

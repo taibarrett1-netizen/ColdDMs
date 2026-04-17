@@ -2038,6 +2038,25 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   await dismissInstagramHomeModals(page, logger);
   await delay(600);
 
+  // Hard stop: Instagram sometimes shows a persistent right-pane error ("Something isn't working").
+  // When this happens, continuing to click/type tends to make things worse and can cascade across sends.
+  const igTechnicalError = await page
+    .evaluate(() => {
+      const raw = (document.body && document.body.innerText) ? document.body.innerText : '';
+      const t = raw.toLowerCase();
+      return t.includes("something isn't working") && t.includes('technical error');
+    })
+    .catch(() => false);
+  if (igTechnicalError) {
+    await saveComposeFailureDebugScreenshot(page, u, 'instagram_technical_error').catch(() => {});
+    return {
+      ok: false,
+      reason: 'instagram_technical_error',
+      pageSnippet:
+        "Instagram shows \"Something isn't working\" (technical error) in the DM thread pane. Pausing for support.",
+    };
+  }
+
   const composeSelector = 'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]';
   logger.log('Waiting for compose area...');
   let composeFound = false;
@@ -3680,7 +3699,14 @@ async function sendDM(page, username, adapter, options = {}) {
     campaignId && typeof sb.getCampaignLimitsById === 'function'
       ? await sb.getCampaignLimitsById(campaignId).catch(() => null)
       : null;
-  const effectiveDailyLimit = freshCampaignLimits ? freshCampaignLimits.daily_send_limit : dailySendLimit;
+  const hardDailyMax = Math.max(0, parseInt(process.env.COLD_DM_MAX_SENDS_PER_DAY || '0', 10) || 0);
+  let effectiveDailyLimit = freshCampaignLimits ? freshCampaignLimits.daily_send_limit : dailySendLimit;
+  if (hardDailyMax > 0) {
+    effectiveDailyLimit =
+      effectiveDailyLimit != null
+        ? Math.min(Number(effectiveDailyLimit) || hardDailyMax, hardDailyMax)
+        : hardDailyMax;
+  }
   const effectiveHourlyLimit = freshCampaignLimits ? freshCampaignLimits.hourly_send_limit : hourlySendLimit;
   const stats = await Promise.resolve(adapter.getDailyStats(campaignId, effectiveDailyLimit));
   const hourlySent = await Promise.resolve(adapter.getHourlySent());
@@ -3729,9 +3755,15 @@ async function sendDM(page, username, adapter, options = {}) {
     logger.warn(statusMessage);
     return { ok: false, reason: 'missing_delay_config', statusMessage };
   }
+  const hardMinSecBetweenSends = Math.max(
+    0,
+    parseInt(process.env.COLD_DM_MIN_SECONDS_BETWEEN_SENDS || '0', 10) || 0
+  );
+  const minDelaySec = Math.max(0, Number(options.minDelaySec), hardMinSecBetweenSends);
+  const maxDelaySec = Math.max(minDelaySec, Math.max(0, Number(options.maxDelaySec)));
   const sendCooldownMs = randomDelay(
-    Math.max(0, Number(options.minDelaySec)) * 1000,
-    Math.max(0, Number(options.maxDelaySec)) * 1000
+    minDelaySec * 1000,
+    maxDelaySec * 1000
   );
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
@@ -3809,6 +3841,7 @@ async function sendDM(page, username, adapter, options = {}) {
         'account_private',
         'rate_limited',
         'messages_restricted',
+        'instagram_technical_error',
         'voice_note_failed',
         'voice_mic_not_found',
         'voice_permission_denied',
@@ -3818,6 +3851,19 @@ async function sendDM(page, username, adapter, options = {}) {
         'ffmpeg_missing',
       ];
       if (terminalReasons.includes(result.reason)) {
+        if (result.reason === 'instagram_technical_error' && options.clientId && sb.pauseClientAndAlert) {
+          const statusMsg =
+            "Sending paused: Instagram DM thread shows \"Something isn't working\" (technical error). Support required to restore sending.";
+          await sb
+            .pauseClientAndAlert(options.clientId, statusMsg, 'cold_dm_instagram_technical_error', {
+              username: u,
+              campaignId: campaignId || null,
+              campaignLeadId: campaignLeadId || null,
+              instagramSessionId: instagramSessionId || null,
+              pageSnippet: result.pageSnippet || null,
+            })
+            .catch(() => {});
+        }
         await Promise.resolve(logSent('failed', result.finalMessage, result.reason));
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', result.reason, sendWorkerId).catch(() => {});
         const detail = result.pageSnippet ? ` ${result.pageSnippet}` : '';

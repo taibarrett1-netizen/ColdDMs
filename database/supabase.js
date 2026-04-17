@@ -1290,6 +1290,63 @@ async function setClientStatusMessage(clientId, message) {
     .eq('client_id', clientId);
 }
 
+async function insertErrorEvent(clientId, eventType, message, details = {}, opts = {}) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !eventType) return false;
+  const severity = (opts.severity || 'high').toString().slice(0, 24);
+  const source = (opts.source || 'cold_dm_worker').toString().slice(0, 80);
+  const fingerprint = opts.fingerprint != null ? String(opts.fingerprint).slice(0, 240) : null;
+  try {
+    const payload = {
+      client_id: clientId,
+      event_type: String(eventType).slice(0, 120),
+      severity,
+      source,
+      message: message != null ? String(message).slice(0, 2000) : null,
+      fingerprint,
+      details: details && typeof details === 'object' ? details : { detail: String(details || '') },
+      first_seen_at: new Date().toISOString(),
+      last_seen_at: new Date().toISOString(),
+      occurrences: 1,
+    };
+    await sb.from('error_events').insert(payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function pauseClientAndAlert(clientId, statusMessage, eventType, details = {}) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return;
+  const now = new Date().toISOString();
+  try {
+    await sb
+      .from('cold_dm_control')
+      .upsert(
+        {
+          client_id: clientId,
+          pause: 1,
+          status_message: statusMessage != null ? String(statusMessage).slice(0, 500) : null,
+          status_updated_at: now,
+          updated_at: now,
+        },
+        { onConflict: 'client_id' }
+      );
+  } catch {}
+  await insertErrorEvent(
+    clientId,
+    eventType || 'cold_dm_support_required',
+    statusMessage || 'Cold DM paused; support required',
+    details || {},
+    {
+      severity: 'critical',
+      source: 'cold_dm_worker',
+      fingerprint: `cold_dm:${clientId}:${String(eventType || 'support_required')}`.slice(0, 240),
+    }
+  ).catch(() => false);
+}
+
 /**
  * Get the current status message for a client (set by the bot).
  */
@@ -2516,6 +2573,11 @@ async function cancelScrapeJob(clientId, jobId) {
 async function claimColdDmScrapeJob(workerId, leaseSeconds = 240) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
+  const onlyClientId = getClientId();
+  if (onlyClientId) {
+    // Dedicated per-client worker: never claim scrape jobs for other clients.
+    return claimColdDmScrapeJobFallback(workerId, leaseSeconds, onlyClientId);
+  }
   const { data, error } = await sb.rpc('claim_cold_dm_scrape_job', {
     p_worker_id: workerId,
     p_lease_seconds: leaseSeconds,
@@ -2547,16 +2609,16 @@ async function retryScrapeJob(jobId, errorMessage = null, delaySeconds = 60, wor
 }
 
 /** Best-effort claim when RPC is missing or races (no SKIP LOCKED). */
-async function claimColdDmScrapeJobFallback(workerId, leaseSeconds = 240) {
+async function claimColdDmScrapeJobFallback(workerId, leaseSeconds = 240, clientIdFilter = null) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
-  const { data: pending } = await sb
+  let q = sb
     .from('cold_dm_scrape_jobs')
     .select('id, attempt_count')
     .eq('status', 'pending')
-    .order('started_at', { ascending: true })
-    .limit(1)
-    .maybeSingle();
+    .order('started_at', { ascending: true });
+  if (clientIdFilter) q = q.eq('client_id', clientIdFilter);
+  const { data: pending } = await q.limit(1).maybeSingle();
   if (!pending?.id) return null;
   const leaseUntil = new Date(Date.now() + Math.max(30, leaseSeconds) * 1000).toISOString();
   const nowIso = new Date().toISOString();
@@ -2736,6 +2798,11 @@ async function getSendJob(jobId) {
 async function claimColdDmSendJob(workerId, leaseSeconds = 240, campaignIds = null) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
+  const onlyClientId = getClientId();
+  if (onlyClientId) {
+    // Dedicated per-client worker: never claim send jobs for other clients.
+    return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds, onlyClientId);
+  }
   const rpcTimeoutMs = Math.max(3000, parseInt(process.env.CLAIM_SEND_JOB_RPC_TIMEOUT_MS || '12000', 10) || 12000);
   const rpcPayload = {
     p_worker_id: workerId,
@@ -2817,7 +2884,7 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240, campaignIds = nu
   return null;
 }
 
-async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240, campaignIds = null) {
+async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240, campaignIds = null, clientIdFilter = null) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
   const nowIso = new Date().toISOString();
@@ -2826,6 +2893,9 @@ async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240, campaign
     .select('id, client_id, campaign_id, campaign_lead_id, username, attempt_count')
     .in('status', ['pending', 'retry'])
     .lte('available_at', nowIso);
+  if (clientIdFilter) {
+    pendingQuery = pendingQuery.eq('client_id', clientIdFilter);
+  }
   if (Array.isArray(campaignIds) && campaignIds.length > 0) {
     pendingQuery = pendingQuery.in('campaign_id', campaignIds);
   }
@@ -4384,6 +4454,8 @@ module.exports = {
   getControl,
   setControl,
   setClientStatusMessage,
+  insertErrorEvent,
+  pauseClientAndAlert,
   getClientStatusMessage,
   getRecentSent,
   getSentUsernames,

@@ -88,6 +88,16 @@ async function processOneJob(workerId, job) {
   let jobFailed = false;
   let finalErrorClass = null;
   try {
+    // Respect global pause: when sending is paused for support, do not continue scraping for this client.
+    const pause = await sb.getControl(String(job.client_id)).catch(() => null);
+    if (pause === '1' || pause === 1) {
+      await sb
+        .retryScrapeJob(job.id, 'client_paused', 3600, workerId)
+        .catch(() => {});
+      logger.warn(`[scrape-worker] client paused; deferring scrape job=${job.id} client=${job.client_id}`);
+      return false;
+    }
+
     if (!job.platform_scraper_session_id) {
       const reserved = await sb.reservePlatformScraperSessionForWorker(workerId, LEASE_SEC);
       if (reserved?.id) {
