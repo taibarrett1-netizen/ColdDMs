@@ -1064,7 +1064,7 @@ async function getMostRecentInstagramSessionForClient(clientId) {
   const { data, error } = await sb
     .from('cold_dm_instagram_sessions')
     .select(
-      'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
+      'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
     )
     .eq('client_id', clientId)
     .order('updated_at', { ascending: false })
@@ -1082,7 +1082,7 @@ async function getInstagramSessionForClientAndUsername(clientId, instagramUserna
   const { data, error } = await sb
     .from('cold_dm_instagram_sessions')
     .select(
-      'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
+      'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
     )
     .eq('client_id', clientId)
     .eq('instagram_username', u)

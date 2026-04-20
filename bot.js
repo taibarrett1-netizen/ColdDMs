@@ -81,6 +81,10 @@ const SEND_DAILY_LIMIT_DEFER_MS = Math.max(
   5 * 60 * 1000,
   parseInt(process.env.SEND_DAILY_LIMIT_DEFER_MS || String(60 * 60 * 1000), 10) || 60 * 60 * 1000
 );
+const FOLLOW_UP_SESSION_LEASE_SECONDS = Math.max(
+  300,
+  parseInt(process.env.FOLLOW_UP_SESSION_LEASE_SECONDS || '600', 10) || 600
+);
 /** Min interval between identical send-limit logs per campaign (default 10m). */
 const SEND_LIMIT_LOG_THROTTLE_MS = Math.max(
   30_000,
@@ -3486,6 +3490,15 @@ async function sendFollowUp(body) {
     return fail('Session has no cookies; reconnect Instagram', 400);
   }
 
+  const followUpLeaseWorkerId =
+    correlationId || `follow-up-${clientId}-${instagramSessionId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const leaseOk = await sb
+    .claimInstagramSessionLease(session.id, followUpLeaseWorkerId, FOLLOW_UP_SESSION_LEASE_SECONDS)
+    .catch(() => false);
+  if (!leaseOk) {
+    return fail('Instagram session is busy; try again in a few minutes', 409);
+  }
+
   const modeLabel = hasAudio ? (hasCaption ? 'voice+caption' : 'voice') : hasMessages ? `messages(${messageLines.length})` : 'text';
   logger.log(
     `[follow-up] start clientId=${clientId} sessionId=${instagramSessionId} recipient=@${recipientUsername} mode=${modeLabel} sessionUser=${session.instagram_username || 'n/a'}${cLog}`
@@ -3644,6 +3657,7 @@ async function sendFollowUp(body) {
     logger.warn(`[follow-up] exception clientId=${clientId} recipient=@${recipientUsername} error=${e.message}${cLog}`);
     return { ok: false, error: e.message || 'Send failed', statusCode: 500 };
   } finally {
+    await sb.releaseInstagramSessionLease(session.id, followUpLeaseWorkerId).catch(() => {});
     if (idCapture && typeof idCapture.dispose === 'function') {
       try {
         idCapture.dispose();

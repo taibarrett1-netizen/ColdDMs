@@ -1415,6 +1415,18 @@ app.post('/api/scraper/start', async (req, res) => {
         });
       }
     }
+    if (sessionRow.leased_until) {
+      const leaseUntilMs = new Date(sessionRow.leased_until).getTime();
+      if (Number.isFinite(leaseUntilMs) && leaseUntilMs > Date.now()) {
+        return res.status(409).json({
+          ok: false,
+          code: 'instagram_session_busy',
+          error:
+            'This Instagram session is busy sending follow-ups or messages right now. Try the scrape again in a few minutes.',
+          leasedUntil: sessionRow.leased_until,
+        });
+      }
+    }
 
     const quota = await getScrapeQuotaStatus(clientId);
     if (quota.remaining <= 0) {
