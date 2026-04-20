@@ -1,24 +1,16 @@
 #!/usr/bin/env node
 /**
- * Per-client scrape worker (instagrapi).
+ * Per-client scrape worker using the legacy Puppeteer scraper.
  *
- * This worker drains cold_dm_scrape_jobs via the service-role claim RPC and runs a
- * conservative Python scraper per job. Execution is intentionally NOT on Vercel.
- *
- * Concurrency:
- *   SCRAPE_MAX_CONCURRENT (default 1). We do not auto-scale from any shared pool.
- *
- * Lease heartbeat:
- *   Keeps cold_dm_scrape_jobs leased_until fresh while Python is running so the job
- *   is not re-claimed mid-scrape.
+ * This drains cold_dm_scrape_jobs and runs the older browser-based follower/following
+ * scraper against the per-client Instagram session row.
  */
 require('dotenv').config();
 
 const os = require('os');
-const path = require('path');
-const { spawn } = require('child_process');
 const logger = require('../utils/logger');
 const sb = require('../database/supabase');
+const legacyScraper = require('../scraper');
 
 const SCRAPER_POLL_MS = Math.max(1000, parseInt(process.env.SCRAPER_WORKER_POLL_MS || '2000', 10) || 2000);
 const SCRAPER_SLOT_POLL_MS = Math.max(50, parseInt(process.env.SCRAPER_SLOT_POLL_MS || '400', 10) || 400);
@@ -27,29 +19,6 @@ const MAX_CONCURRENT = Math.max(1, parseInt(process.env.SCRAPE_MAX_CONCURRENT ||
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-function pythonCmd() {
-  return process.env.SCRAPER_PYTHON || process.env.ADMIN_LAB_PYTHON || 'python3';
-}
-
-function safeFollowersScriptPath() {
-  return path.join(__dirname, '..', 'scraper_worker', 'safe_followers_scrape.py');
-}
-
-async function runPythonFollowerScrape(jobId) {
-  const py = pythonCmd();
-  const script = safeFollowersScriptPath();
-  const args = [script, '--job_id', String(jobId)];
-
-  return await new Promise((resolve) => {
-    const child = spawn(py, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '';
-    let err = '';
-    child.stdout.on('data', (d) => (out += d.toString('utf8')));
-    child.stderr.on('data', (d) => (err += d.toString('utf8')));
-    child.on('close', (code) => resolve({ code: code ?? 0, out, err }));
-  });
 }
 
 async function processOneJob(workerId, job) {
@@ -61,48 +30,40 @@ async function processOneJob(workerId, job) {
   }, hbIntervalMs);
 
   try {
-    // Respect global pause: when sending is paused for support, do not continue scraping for this client.
     const pause = await sb.getControl(String(job.client_id)).catch(() => null);
     if (pause === '1' || pause === 1) {
-      await sb
-        .retryScrapeJob(job.id, 'client_paused', 3600, workerId)
-        .catch(() => {});
+      await sb.retryScrapeJob(job.id, 'client_paused', 3600, workerId).catch(() => {});
       logger.warn(`[scrape-worker] client paused; deferring scrape job=${job.id} client=${job.client_id}`);
       return false;
     }
-    if ((job.scrape_type || 'followers') !== 'followers') {
+
+    const scrapeType = (job.scrape_type || 'followers').toLowerCase();
+    if (scrapeType !== 'followers' && scrapeType !== 'following') {
       await sb
         .updateScrapeJob(jobId, {
           status: 'failed',
           last_error_class: 'unsupported_scrape_type',
-          error_message: 'Only follower scraping is supported right now.',
+          error_message: 'Only follower and following scraping are supported right now.',
         })
         .catch(() => {});
       return false;
     }
 
-    logger.log(`[scrape-worker] run job=${jobId} client=${job.client_id} target=@${job.target_username || '—'} max_leads=${job.max_leads ?? '—'}`);
+    logger.log(
+      `[scrape-worker] run job=${jobId} client=${job.client_id} type=${scrapeType} ` +
+        `target=@${job.target_username || '—'} max_leads=${job.max_leads ?? '—'}`
+    );
 
-    const r = await runPythonFollowerScrape(jobId);
-    if (r && r.err && String(r.err).trim()) {
-      // Avoid spamming logs with huge traces.
-      logger.warn(`[scrape-worker] python stderr job=${jobId}: ${String(r.err).slice(-1200)}`);
-    }
-
-    // The Python runner updates the job row. Treat non-zero exit as an infrastructure error.
-    if (r && Number(r.code) !== 0) {
-      const finalJob = await sb.getScrapeJob(jobId).catch(() => null);
-      if (!finalJob || (finalJob.status !== 'failed' && finalJob.status !== 'cancelled' && finalJob.status !== 'completed')) {
-        await sb
-          .updateScrapeJob(jobId, {
-            status: 'failed',
-            last_error_class: 'worker_exit',
-            error_message: `Scrape worker exited with code ${r.code}. Check VPS logs.`,
-          })
-          .catch(() => {});
-      }
-      return false;
-    }
+    const runner = scrapeType === 'following' ? legacyScraper.runFollowingScrape : legacyScraper.runFollowerScrape;
+    await runner(job.client_id, job.id, job.target_username || '', {
+      maxLeads: job.max_leads,
+      leadGroupId: job.lead_group_id,
+      leaseOptions: {
+        jobId,
+        workerId,
+        leaseSec: LEASE_SEC,
+      },
+    });
 
     const finalJob = await sb.getScrapeJob(jobId).catch(() => null);
     if (finalJob?.status === 'failed') return false;

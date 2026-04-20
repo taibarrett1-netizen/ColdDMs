@@ -25,8 +25,6 @@ const {
   countActiveVpsInstagramSessions,
   countActiveGraphInstagramAccounts,
   updateSettingsInstagramUsername,
-  getScraperSession,
-  saveScraperSession,
   getLatestScrapeJob,
   getScrapeQuotaStatus,
   createScrapeJob,
@@ -41,9 +39,6 @@ const {
   tryVpsIdempotencyOnce,
   getOrResolveColdDmProxyUrl,
   getMostRecentInstagramSessionForClient,
-  getInstagramSessionForClientAndUsername,
-  serviceSetInstagrapiSettings,
-  serviceSetInstagrapiState,
   updateInstagramSessionProxy,
   releaseAllInstagramSessionLeases,
   releaseAllCampaignSendLeases,
@@ -58,7 +53,6 @@ const {
   scheduleDebugFollowUpBrowser,
   previewDmLeadNamesFromSession,
 } = require('./bot');
-const { connectScraper } = require('./scraper');
 const { MESSAGES } = require('./config/messages');
 const logger = require('./utils/logger');
 const { mergeInstagramSessionData } = require('./utils/instagram-web-storage');
@@ -947,9 +941,7 @@ function cleanupExpiredScraper2FA() {
 // { ok: false, code: 'two_factor_required', pending2FAId } for POST /api/instagram/connect/2fa.
 // If it does not reach 2FA (e.g. straight login or email-code checkpoint), connect is rejected.
 app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
-  const { username, password, clientId, platformScraperPool, platformScraperBackup } = req.body || {};
-  const isPlatformPool = platformScraperPool === true || platformScraperPool === 'true' || platformScraperPool === 1;
-  const isPlatformBackup = platformScraperBackup === true || platformScraperBackup === 'true' || platformScraperBackup === 1;
+  const { username, password, clientId } = req.body || {};
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
@@ -961,9 +953,7 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
   }
   try {
     const isAdmin = await isAdminUser(clientId).catch(() => false);
-    // Platform pool uses a shared client_id with many cold_dm_instagram_sessions + platform rows (primary + backup).
-    // isAdminUser(clientId) is keyed by user id, not client id — do not block pool connects after the first session.
-    if (!isAdmin && !isPlatformPool) {
+    if (!isAdmin) {
       const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
       if (activeCount > 0) {
         return res.status(400).json({
@@ -997,8 +987,6 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
         createdAt: Date.now(),
         proxyUrl: proxyMeta.proxyUrl,
         proxyAssignmentId: proxyMeta.proxyAssignmentId,
-        platformScraperPool: isPlatformPool,
-        platformScraperBackup: isPlatformBackup,
       });
       return res.status(200).json({
         ok: false,
@@ -1025,14 +1013,6 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
       proxyUrl: proxyMeta.proxyUrl,
       proxyAssignmentId: proxyMeta.proxyAssignmentId,
     });
-    if (isPlatformPool) {
-      await savePlatformScraperSession(
-        mergeInstagramSessionData(result.cookies, result.web_storage),
-        result.username,
-        req.body?.daily_actions_limit != null ? req.body.daily_actions_limit : 500,
-        { forceInsert: isPlatformBackup }
-      );
-    }
     return res.status(200).json({
       ok: true,
       username: result.username,
@@ -1056,9 +1036,7 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
 });
 
 app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
-  const { pending2FAId, twoFactorCode, clientId, platformScraperPool, platformScraperBackup, daily_actions_limit } = req.body || {};
-  const isPlatformPool = platformScraperPool === true || platformScraperPool === 'true' || platformScraperPool === 1;
-  const isPlatformBackup = platformScraperBackup === true || platformScraperBackup === 'true' || platformScraperBackup === 1;
+  const { pending2FAId, twoFactorCode, clientId } = req.body || {};
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
@@ -1081,8 +1059,7 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
   try {
     const result = await completeInstagram2FA(pending.page, pending.browser, twoFactorCode, pending.username);
     const isAdmin = await isAdminUser(clientId).catch(() => false);
-    const poolConnect = isPlatformPool || pending.platformScraperPool === true;
-    if (!isAdmin && !poolConnect) {
+    if (!isAdmin) {
       const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
       if (activeCount > 0) {
         if (pending.browser) pending.browser.close().catch(() => {});
@@ -1096,16 +1073,6 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
       proxyUrl: pending.proxyUrl,
       proxyAssignmentId: pending.proxyAssignmentId,
     });
-    if (isPlatformPool || pending.platformScraperPool) {
-      await savePlatformScraperSession(
-        mergeInstagramSessionData(result.cookies, result.web_storage),
-        result.username,
-        daily_actions_limit != null ? daily_actions_limit : 500,
-        { forceInsert: isPlatformBackup || pending.platformScraperBackup === true }
-      ).catch(() => {});
-      res.json({ ok: true, cookies: result.cookies, username: result.username, instagram_username: result.username });
-      return;
-    }
     await updateSettingsInstagramUsername(clientId, result.username);
     res.json({ ok: true });
   } catch (e) {
@@ -1116,9 +1083,7 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
 });
 
 app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) => {
-  const { pendingEmailId, emailCode, clientId, platformScraperPool, platformScraperBackup, daily_actions_limit } = req.body || {};
-  const isPlatformPool = platformScraperPool === true || platformScraperPool === 'true' || platformScraperPool === 1;
-  const isPlatformBackup = platformScraperBackup === true || platformScraperBackup === 'true' || platformScraperBackup === 1;
+  const { pendingEmailId, emailCode, clientId } = req.body || {};
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
@@ -1132,9 +1097,6 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
   if (String(pending.clientId) !== String(clientId)) {
     return res.status(403).json({ ok: false, error: 'Forbidden: pending verification session does not belong to this clientId' });
   }
-  if (!!pending.platformScraperPool !== !!isPlatformPool) {
-    return res.status(403).json({ ok: false, error: 'Forbidden: pending verification session type mismatch' });
-  }
   if (Date.now() - pending.createdAt > PENDING_2FA_TTL_MS) {
     pendingEmailVerifyMap.delete(pendingEmailId);
     if (pending.browser) pending.browser.close().catch(() => {});
@@ -1144,8 +1106,7 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
   try {
     const result = await completeInstagramEmailVerification(pending.page, pending.browser, emailCode, pending.username);
     const isAdmin = await isAdminUser(clientId).catch(() => false);
-    const poolConnectEmail = isPlatformPool || pending.platformScraperPool === true;
-    if (!isAdmin && !poolConnectEmail) {
+    if (!isAdmin) {
       const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
       if (activeCount > 0) {
         if (pending.browser) pending.browser.close().catch(() => {});
@@ -1159,15 +1120,6 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
       proxyUrl: pending.proxyUrl,
       proxyAssignmentId: pending.proxyAssignmentId,
     });
-    if (isPlatformPool) {
-      await savePlatformScraperSession(
-        mergeInstagramSessionData(result.cookies, result.web_storage),
-        result.username,
-        daily_actions_limit || 500,
-        { forceInsert: isPlatformBackup || pending.platformScraperBackup === true }
-      ).catch(() => {});
-      return res.json({ ok: true, cookies: result.cookies, username: result.username, instagram_username: result.username });
-    }
     await updateSettingsInstagramUsername(clientId, result.username);
     res.json({ ok: true });
   } catch (e) {
@@ -1177,140 +1129,11 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
   }
 });
 
-/**
- * Per-client scraping bootstrap: instagrapi mobile private API login.
- * Password is never stored; we store encrypted instagrapi settings on cold_dm_instagram_sessions.
- *
- * Flow:
- * - First attempt: submit username/password (through the client's proxy).
- * - If Instagram requires TOTP 2FA: return { code: 'two_factor_required' } and re-submit with verificationCode.
- */
-app.post('/api/instagram/instagrapi/connect', connectLimiter, async (req, res) => {
-  const { username, password, verificationCode, clientId } = req.body || {};
-  if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
-    return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
-  }
-  if (!username || !password || !clientId) {
-    return res.status(400).json({ ok: false, error: 'username, password, and clientId are required' });
-  }
-  if (!isSupabaseConfigured()) {
-    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
-  }
-
-  const igKey = String(username).trim().replace(/^@/, '').toLowerCase();
-  try {
-    // Prefer the session row for this username (sender connect creates it). Fall back to "most recent" for safety.
-    let sessionRow = await getInstagramSessionForClientAndUsername(clientId, igKey).catch(() => null);
-    if (!sessionRow) {
-      sessionRow = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
-    }
-    if (!sessionRow?.id) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Connect your Instagram automation session first (Settings → Integrations), then enable scraping.',
-      });
-    }
-
-    // Use the same proxy URL as the sender session (denormalized on cold_dm_instagram_sessions).
-    // If missing, allocate/resolve from cold_dm_proxy_assignments.
-    let proxyMeta = { proxyUrl: null, proxyAssignmentId: null };
-    try {
-      proxyMeta = await getOrResolveColdDmProxyUrl(clientId, igKey);
-    } catch (pe) {
-      return res.status(503).json({
-        ok: false,
-        error: pe instanceof Error ? pe.message : String(pe) || 'Could not allocate proxy (check provider)',
-      });
-    }
-    const proxyUrl = normalizeProxyUrl(sessionRow.proxy_url || proxyMeta.proxyUrl || '');
-    if (!proxyUrl) {
-      return res.status(503).json({ ok: false, error: 'Proxy URL missing for this Instagram account' });
-    }
-    await updateInstagramSessionProxy(sessionRow.id, {
-      proxyUrl,
-      proxyAssignmentId: proxyMeta.proxyAssignmentId,
-    }).catch(() => {});
-
-    const py = process.env.SCRAPER_PYTHON || process.env.ADMIN_LAB_PYTHON || 'python3';
-    const scriptPath = path.join(__dirname, 'scraper_worker', 'instagrapi_login.py');
-    const args = [
-      scriptPath,
-      '--username',
-      String(username).trim(),
-      '--password',
-      String(password),
-      '--proxy',
-      proxyUrl,
-    ];
-    if (verificationCode != null && String(verificationCode).trim()) {
-      args.push('--verification_code', String(verificationCode).trim());
-    }
-
-    const child = spawn(py, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-    let out = '';
-    let err = '';
-    child.stdout.on('data', (d) => (out += d.toString('utf8')));
-    child.stderr.on('data', (d) => (err += d.toString('utf8')));
-
-    const code = await new Promise((resolve) => child.on('close', resolve));
-    void code;
-
-    const lines = out
-      .split('\n')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const last = lines.length > 0 ? lines[lines.length - 1] : '';
-    let payload = null;
-    try {
-      payload = last ? JSON.parse(last) : null;
-    } catch (_) {
-      payload = null;
-    }
-    if (!payload || typeof payload !== 'object') {
-      console.error('[API] instagrapi connect invalid response', { outPreview: out.slice(-1200), errPreview: err.slice(-1200) });
-      return res.status(500).json({ ok: false, error: 'instagrapi connect failed (invalid response). Check VPS logs.' });
-    }
-
-    if (payload.ok === true && typeof payload.settings_json === 'string' && payload.settings_json.trim()) {
-      await serviceSetInstagrapiSettings(sessionRow.id, payload.settings_json, proxyUrl);
-      return res.json({ ok: true });
-    }
-
-    const pcode = typeof payload.code === 'string' ? payload.code : '';
-    const perr = typeof payload.error === 'string' ? payload.error : '';
-    if (pcode === 'two_factor_required') {
-      return res.status(200).json({
-        ok: false,
-        code: 'two_factor_required',
-        message: 'Enter the 6-digit code from your authenticator app, then submit again.',
-      });
-    }
-    if (pcode === 'challenge_required') {
-      await serviceSetInstagrapiState(sessionRow.id, 'challenge_required', pcode, perr).catch(() => {});
-      return res.status(400).json({
-        ok: false,
-        code: 'challenge_required',
-        error:
-          'Instagram security challenge required. Open Instagram on your phone or browser to approve/clear the checkpoint, then retry.',
-      });
-    }
-    if (pcode === 'rate_limited') {
-      await serviceSetInstagrapiState(sessionRow.id, 'cooldown', pcode, perr).catch(() => {});
-      return res.status(429).json({
-        ok: false,
-        code: 'rate_limited',
-        error: 'Instagram rate limit. Wait 15–60 minutes and try again.',
-      });
-    }
-    if (pcode === 'bad_credentials') {
-      return res.status(400).json({ ok: false, code: 'bad_credentials', error: 'Invalid Instagram credentials' });
-    }
-
-    return res.status(400).json({ ok: false, error: perr || 'instagrapi connect failed' });
-  } catch (e) {
-    console.error('[API] instagrapi connect failed', e);
-    return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
-  }
+app.post('/api/instagram/instagrapi/connect', (_req, res) => {
+  return res.status(410).json({
+    ok: false,
+    error: 'Instagrapi scraping has been removed. Use the legacy Puppeteer connect and scrape flow.',
+  });
 });
 
 // --- API: bot control (PM2 start/stop) ---
@@ -1452,18 +1275,18 @@ app.post('/api/campaigns/add-leads-from-groups', async (req, res) => {
   }
 });
 
-// --- Scraper account connect has moved to Admin Scraper Pool (platform accounts only). ---
+// --- Scraper connect is deprecated; scraping now uses the same sender session. ---
 app.post('/api/scraper/connect', connectLimiter, async (_req, res) => {
   return res.status(410).json({
     ok: false,
-    error: 'Deprecated endpoint. Scraper accounts are now managed from Admin Panel -> Scraper Pool.',
+    error: 'Deprecated endpoint. Scraping now uses the same Instagram session as sending. Reconnect it in Settings > Integrations.',
   });
 });
 
 app.post('/api/scraper/connect/2fa', connectLimiter, async (_req, res) => {
   return res.status(410).json({
     ok: false,
-    error: 'Deprecated endpoint. Scraper accounts are now managed from Admin Panel -> Scraper Pool.',
+    error: 'Deprecated endpoint. Scraping now uses the same Instagram session as sending. Reconnect it in Settings > Integrations.',
   });
 });
 
@@ -1479,7 +1302,7 @@ app.get('/api/scraper/status', async (req, res) => {
     return res.status(503).json({ error: 'Supabase not configured' });
   }
   try {
-    const session = await getScraperSession(clientId);
+    const session = await getMostRecentInstagramSessionForClient(clientId);
     const connected = !!(session?.session_data?.cookies?.length);
     const response = {
       connected,
@@ -1513,7 +1336,7 @@ app.post('/api/scraper/status', async (req, res) => {
     return res.status(503).json({ error: 'Supabase not configured' });
   }
   try {
-    const session = await getScraperSession(clientId);
+    const session = await getMostRecentInstagramSessionForClient(clientId);
     const connected = !!(session?.session_data?.cookies?.length);
     const response = {
       connected,
@@ -1548,10 +1371,10 @@ app.post('/api/scraper/start', async (req, res) => {
   if (!clientId) {
     return res.status(400).json({ ok: false, error: 'clientId is required' });
   }
-  if (scrapeType !== 'followers') {
+  if (scrapeType !== 'followers' && scrapeType !== 'following') {
     return res.status(400).json({
       ok: false,
-      error: 'Only follower scraping is supported right now. Following/comments will be added incrementally.',
+      error: 'Only follower and following scraping are supported right now.',
       code: 'scrape_type_not_supported',
     });
   }
@@ -1562,13 +1385,13 @@ app.post('/api/scraper/start', async (req, res) => {
   }
 
   try {
-    // Hard safety gate: no scraping while any campaign is active.
-    const activeCampaigns = await getActiveCampaigns(clientId).catch(() => []);
-    if (Array.isArray(activeCampaigns) && activeCampaigns.some((c) => String(c?.status || '') === 'active')) {
+    // Scraping may run only when no campaign is actively sendable right now.
+    const activeSendHint = await getNoWorkHint(clientId).catch(() => '');
+    if (!activeSendHint) {
       return res.status(400).json({
         ok: false,
-        code: 'campaigns_not_paused',
-        error: 'Pause all campaigns before scraping. Scraping is blocked while any campaign is Active.',
+        code: 'campaigns_active',
+        error: 'Scraping is blocked while a campaign can actively send right now. Pause it or wait until it is out of schedule / capped.',
       });
     }
 
@@ -1579,13 +1402,6 @@ app.post('/api/scraper/start', async (req, res) => {
         ok: false,
         code: 'missing_instagram_session',
         error: 'Connect your Instagram automation session first (Settings → Integrations).',
-      });
-    }
-    if (String(sessionRow.instagrapi_state || '').toLowerCase() !== 'ready') {
-      return res.status(400).json({
-        ok: false,
-        code: 'scraping_login_required',
-        error: 'Scraping login not enabled yet. Connect (sending + scraping) or enable scraping login, then retry.',
       });
     }
     if (sessionRow.scrape_cooldown_until) {
@@ -1618,10 +1434,10 @@ app.post('/api/scraper/start', async (req, res) => {
       lead_group_id || null,
       scrapeType,
       null,
-      null, // legacy platformScraperSessionId (unused for per-client instagrapi)
+      null, // legacy platformScraperSessionId (unused for per-client puppeteer scrape)
       sessionRow.id,
       effectiveMaxLeads != null && effectiveMaxLeads > 0 ? effectiveMaxLeads : null,
-      'instagrapi'
+      'puppeteer'
     );
     res.json({
       ok: true,
@@ -1658,31 +1474,6 @@ app.post('/api/scraper/stop', async (req, res) => {
   } catch (e) {
     console.error('[API] Scraper stop error', e);
     res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.post('/api/scraper/connect-platform', connectLimiter, async (req, res) => {
-  const { username, password, daily_actions_limit, platformScraperBackup } = req.body || {};
-  const isPlatformBackup = platformScraperBackup === true || platformScraperBackup === 'true' || platformScraperBackup === 1;
-  if (!username || !password) {
-    return res.status(400).json({ ok: false, error: 'username and password are required' });
-  }
-  if (!isSupabaseConfigured()) {
-    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
-  }
-  try {
-    const { connectScraper } = require('./scraper');
-    const { cookies, username: instagramUsername } = await connectScraper(username, password);
-    await savePlatformScraperSession(
-      { cookies },
-      instagramUsername,
-      daily_actions_limit != null ? daily_actions_limit : 500,
-      { forceInsert: isPlatformBackup }
-    );
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[API] Platform scraper connect error', e);
-    res.status(500).json({ ok: false, error: e.message || 'Login failed' });
   }
 });
 

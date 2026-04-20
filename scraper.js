@@ -1,13 +1,8 @@
 /**
  * Instagram scraper module – legacy Puppeteer implementation.
  *
- * NOTE: The preferred path for high-volume, stable scraping is now the Python
- * instagrapi worker (spawned from /api/scraper/start). This file remains as
- * an optional fallback and for platform scraper login.
- *
- * If you re-enable JS scraping, avoid UI scrolling and use the GraphQL/private
- * APIs below. ALWAYS verify the latest query_hash/doc_id values via DevTools:
- *   // CHECK NETWORK TAB FOR LATEST DOC_ID / query_hash
+ * This is the browser-based follower/following scraper used for the per-client
+ * flow. Keep it conservative and keep the session/proxy tied to the client row.
  */
 require('dotenv').config();
 const puppeteer = require('puppeteer-extra');
@@ -15,8 +10,6 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const path = require('path');
 const fs = require('fs');
 const {
-  saveScraperSession,
-  createScrapeJob,
   updateScrapeJob,
   retryScrapeJob,
   getScrapeJob,
@@ -25,12 +18,10 @@ const {
   getConversationParticipantUsernames,
   getSentUsernames,
   getScrapeBlocklistUsernames,
-  getPlatformScraperSessionById,
-  reservePlatformScraperSessionForWorker,
-  describePlatformScraperPoolForLogs,
-  normalizePlatformSessionRowForPuppeteer,
+  getMostRecentInstagramSessionForClient,
+  normalizeSessionDataForPuppeteer,
   recordScraperActions,
-  markPlatformScraperWebNeedsRefresh,
+  markInstagramSessionWebNeedsRefresh,
 } = require('./database/supabase');
 const logger = require('./utils/logger');
 const { applyInstagramWebStorageFromSessionData } = require('./utils/instagram-web-storage');
@@ -43,9 +34,7 @@ const {
 } = require('./utils/puppeteer-chrome-launch');
 const {
   dismissInstagramPopups,
-  ensurePoolScraperInstagramWebSession,
   detectInstagramPasswordReauthScreen,
-  instagramPoolOneTapLoginChooserVisible,
 } = require('./utils/instagram-modals');
 
 /** Log + persist failure (early returns used to only update the DB, so PM2 showed nothing after "claimed job"). */
@@ -54,25 +43,24 @@ async function failScrapeJob(jobId, errorMessage) {
   await updateScrapeJob(jobId, { status: 'failed', error_message: errorMessage });
 }
 
-async function poolScraperPageLooksLoggedOut(page) {
+async function scraperPageLooksLoggedOut(page) {
   if (!page) return false;
   const u = page.url() || '';
   if (u.includes('/accounts/login')) return true;
   return detectInstagramPasswordReauthScreen(page);
 }
 
-/** Clear pinned pool session so the next claim can use another scraper; flag row for admin toast. */
-async function requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, logPrefix) {
-  const msg =
-    'Pool scraper Instagram web session logged out. Job re-queued for another scraper — reconnect this account in Platform scrapers.';
+/** Mark the per-client Instagram session as needing refresh and requeue the scrape job. */
+async function requeueScrapeJobForLoggedOutInstagramSession(jobId, instagramSessionId, logPrefix) {
+  const msg = 'Instagram web session logged out. Reconnect the sender session and retry scraping.';
   logger.warn(`[Scraper] ${logPrefix} ${msg}`);
-  if (platformSessionId) await markPlatformScraperWebNeedsRefresh(platformSessionId).catch(() => {});
+  if (instagramSessionId) await markInstagramSessionWebNeedsRefresh(instagramSessionId).catch(() => {});
   await updateScrapeJob(jobId, {
     status: 'retry',
     available_at: new Date().toISOString(),
     error_message: msg,
     last_error_class: 'session_logged_out',
-    platform_scraper_session_id: null,
+    instagram_session_id: null,
   });
 }
 
@@ -100,45 +88,26 @@ async function finalizeScrapeJobNormalExit(jobId, scrapedCount) {
 }
 
 /**
- * Scrapes use only the shared platform pool (cold_dm_platform_scraper_sessions), not per-client cold_dm_scraper_sessions.
- * Optionally re-reserves from the pool when the job points at a row with no Puppeteer cookies.
+ * Use the client's current Instagram session row. This is the same session the sender uses.
  */
-async function resolvePuppeteerSessionForScrapeJob(jobId, leaseOptions) {
+async function resolvePuppeteerSessionForScrapeJob(clientId, jobId) {
   const job = await getScrapeJob(jobId);
+  const igSession = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+  const normalized = normalizeSessionDataForPuppeteer(igSession?.session_data);
   let session = null;
-  let platformSessionId = null;
-
-  if (job?.platform_scraper_session_id) {
-    const platformSession = await getPlatformScraperSessionById(job.platform_scraper_session_id);
-    const normalized = normalizePlatformSessionRowForPuppeteer(platformSession);
-    if (normalized) {
-      session = normalized;
-      platformSessionId = job.platform_scraper_session_id;
-    }
+  if (igSession && normalized) {
+    session = {
+      id: igSession.id,
+      client_id: igSession.client_id,
+      instagram_username: igSession.instagram_username,
+      proxy_url: igSession.proxy_url || null,
+      proxy_assignment_id: igSession.proxy_assignment_id || null,
+      web_session_needs_refresh: igSession.web_session_needs_refresh ?? null,
+      session_data: normalized,
+    };
   }
 
-  if (!session && leaseOptions?.workerId) {
-    const sec = Math.max(60, parseInt(leaseOptions.leaseSec || process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
-    const reserved = await reservePlatformScraperSessionForWorker(leaseOptions.workerId, sec);
-    const normalizedReserved = normalizePlatformSessionRowForPuppeteer({
-      session_data: reserved?.session_data,
-      instagram_username: reserved?.instagram_username,
-    });
-    if (reserved && normalizedReserved) {
-      session = {
-        session_data: normalizedReserved.session_data,
-        instagram_username: normalizedReserved.instagram_username,
-      };
-      platformSessionId = reserved.id;
-      await updateScrapeJob(jobId, { platform_scraper_session_id: reserved.id });
-    }
-  }
-
-  if (leaseOptions && platformSessionId) {
-    leaseOptions.platformSessionId = platformSessionId;
-  }
-
-  return { job, session, platformSessionId };
+  return { job, session, instagramSessionId: session?.id || null };
 }
 
 puppeteer.use(StealthPlugin());
@@ -159,14 +128,14 @@ const SCRAPER_PERSIST_PROFILES =
   (String(process.env.PUPPETEER_PERSIST_SCRAPER_PROFILES).toLowerCase() !== '0' &&
     String(process.env.PUPPETEER_PERSIST_SCRAPER_PROFILES).toLowerCase() !== 'false');
 
-function buildScraperBrowserLaunchOptions(platformSessionId, proxyUrl) {
+function buildScraperBrowserLaunchOptions(instagramSessionId, proxyUrl) {
   const launchOpts = {
     headless: HEADLESS,
     args: [...baseChromeArgs()],
   };
-  if (SCRAPER_PERSIST_PROFILES && platformSessionId) {
-    assignPersistentUserDataDir(launchOpts, `scrape-pool-${platformSessionId}`);
-    logger.log(`[Scraper] Persistent Chrome profile: scrape-pool-${platformSessionId}`);
+  if (SCRAPER_PERSIST_PROFILES && instagramSessionId) {
+    assignPersistentUserDataDir(launchOpts, `scrape-client-${instagramSessionId}`);
+    logger.log(`[Scraper] Persistent Chrome profile: scrape-client-${instagramSessionId}`);
   }
   applyProxyToLaunchOptions(launchOpts, proxyUrl || null);
   return launchOpts;
@@ -276,32 +245,27 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     const sec = Math.max(60, parseInt(leaseOptions.leaseSec || process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
     leaseHbTimer = setInterval(() => {
       sbMod.heartbeatScrapeJobLease(leaseOptions.jobId, leaseOptions.workerId, sec).catch(() => {});
-      if (leaseOptions.platformSessionId) {
-        sbMod.heartbeatPlatformScraperSessionLease(leaseOptions.platformSessionId, leaseOptions.workerId, sec).catch(() => {});
-      }
     }, Math.min(120000, Math.max(30000, sec * 250)));
   }
 
   let browser;
   let page = null;
   try {
-    const { job, session, platformSessionId } = await resolvePuppeteerSessionForScrapeJob(jobId, leaseOptions);
+    const { job, session, instagramSessionId } = await resolvePuppeteerSessionForScrapeJob(clientId, jobId);
     if (!session?.session_data?.cookies?.length) {
       const n = Array.isArray(session?.session_data?.cookies) ? session.session_data.cookies.length : 0;
-      const poolHint = await describePlatformScraperPoolForLogs().catch(() => '');
       logger.error(
-        `[Scraper] Job ${jobId} no Puppeteer cookies: clientId=${clientId} ` +
-          `job.platform_scraper_session_id=${job?.platform_scraper_session_id ?? 'null'} ` +
-          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}. ${poolHint}`
+        `[Scraper] Job ${jobId} no Puppeteer cookies on current Instagram session: clientId=${clientId} ` +
+          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}`
       );
       await retryScrapeJob(
         jobId,
-        'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.',
+        'No current Instagram session with usable Puppeteer cookies.',
         60
       ).catch(async () => {
         await failScrapeJob(
           jobId,
-          'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.'
+          'No current Instagram session with usable Puppeteer cookies.'
         );
       });
       return;
@@ -309,7 +273,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     logger.log(`[Scraper] Job ${jobId} session OK; launching browser for ${listKind} scrape`);
 
-    browser = await puppeteer.launch(buildScraperBrowserLaunchOptions(platformSessionId, session.proxy_url));
+    browser = await puppeteer.launch(buildScraperBrowserLaunchOptions(instagramSessionId, session.proxy_url));
     page = await browser.newPage();
     await authenticatePageForProxy(page, session.proxy_url || null);
     const useMobile = process.env.SCRAPER_USE_MOBILE === '1' || process.env.SCRAPER_USE_MOBILE === 'true';
@@ -328,8 +292,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     await applyInstagramWebStorageFromSessionData(page, session.session_data, logger);
     await delay(randomDelay(1500, 3500));
 
-    if (await poolScraperPageLooksLoggedOut(page)) {
-      await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'follower scrape home');
+    if (await scraperPageLooksLoggedOut(page)) {
+      await requeueScrapeJobForLoggedOutInstagramSession(jobId, instagramSessionId, 'follower scrape home');
       return;
     }
 
@@ -1152,8 +1116,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     } catch (e) {
       logger.warn('[Scraper] Post-scrape warm skipped: ' + e.message);
     }
-    if (platformSessionId && newInsertsTotal > 0) {
-      await recordScraperActions(platformSessionId, newInsertsTotal).catch(() => {});
+    if (instagramSessionId && newInsertsTotal > 0) {
+      await recordScraperActions(instagramSessionId, newInsertsTotal).catch(() => {});
     }
   } catch (err) {
     logger.error(`[Scraper] ${listKind === 'following' ? 'Following' : 'Follower'} scrape failed`, err);
@@ -1468,11 +1432,10 @@ async function instagramMobilePostLooksLikeLoggedOutGuest(page) {
   }
 }
 
-/** Pool scraper cannot scrape until this is false (login path, password, one-tap chooser, or guest signup shell). */
-async function poolScraperWebSessionBlocksWork(page, usernameHint) {
+/** Comment scrape cannot run until the page is a real logged-in post/profile view. */
+async function scraperWebSessionBlocksWork(page, usernameHint) {
   if (!page) return true;
-  if (await poolScraperPageLooksLoggedOut(page)) return true;
-  if (await instagramPoolOneTapLoginChooserVisible(page, usernameHint)) return true;
+  if (await scraperPageLooksLoggedOut(page)) return true;
   if (await instagramMobilePostLooksLikeLoggedOutGuest(page)) return true;
   return false;
 }
@@ -1523,9 +1486,6 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     const sec = Math.max(60, parseInt(leaseOptions.leaseSec || process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
     leaseHbTimer = setInterval(() => {
       sbMod.heartbeatScrapeJobLease(leaseOptions.jobId, leaseOptions.workerId, sec).catch(() => {});
-      if (leaseOptions.platformSessionId) {
-        sbMod.heartbeatPlatformScraperSessionLease(leaseOptions.platformSessionId, leaseOptions.workerId, sec).catch(() => {});
-      }
     }, Math.min(120000, Math.max(30000, sec * 250)));
   }
 
@@ -1536,29 +1496,22 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
   let browser;
   let page = null;
-  let platformSessionId = null;
   try {
-    const { session, platformSessionId: resolvedPlatformId } = await resolvePuppeteerSessionForScrapeJob(
-      jobId,
-      leaseOptions
-    );
-    platformSessionId = resolvedPlatformId;
+    const { session, instagramSessionId } = await resolvePuppeteerSessionForScrapeJob(clientId, jobId);
     if (!session?.session_data?.cookies?.length) {
       const n = Array.isArray(session?.session_data?.cookies) ? session.session_data.cookies.length : 0;
-      const poolHint = await describePlatformScraperPoolForLogs().catch(() => '');
       logger.error(
-        `[Scraper] Job ${jobId} no Puppeteer cookies: clientId=${clientId} ` +
-          `job.platform_scraper_session_id=${job?.platform_scraper_session_id ?? 'null'} ` +
-          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}. ${poolHint}`
+        `[Scraper] Job ${jobId} no Puppeteer cookies on current Instagram session: clientId=${clientId} ` +
+          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}`
       );
       await retryScrapeJob(
         jobId,
-        'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.',
+        'No current Instagram session with usable Puppeteer cookies.',
         60
       ).catch(async () => {
         await failScrapeJob(
           jobId,
-          'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.'
+          'No current Instagram session with usable Puppeteer cookies.'
         );
       });
       return;
@@ -1566,7 +1519,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
     logger.log(`[Scraper] Job ${jobId} session OK; launching browser for comment scrape`);
 
-    browser = await puppeteer.launch(buildScraperBrowserLaunchOptions(platformSessionId, session.proxy_url));
+    browser = await puppeteer.launch(buildScraperBrowserLaunchOptions(instagramSessionId, session.proxy_url));
     page = await browser.newPage();
     await authenticatePageForProxy(page, session.proxy_url || null);
     await applyMobileEmulation(page);
@@ -1579,7 +1532,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     await applyInstagramWebStorageFromSessionData(page, session.session_data, logger);
     await delay(randomDelay(1500, 3500));
 
-    const poolEstablishedHome = await ensurePoolScraperInstagramWebSession(page, logger, preferredIgUser, jobId);
+    const sessionEstablishedHome = await ensurePoolScraperInstagramWebSession(page, logger, preferredIgUser, jobId);
 
     await commentScrapeDebugScreenshot(
       page,
@@ -1590,8 +1543,8 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       'after-home-session-check'
     );
 
-    if (!poolEstablishedHome || (await poolScraperWebSessionBlocksWork(page, preferredIgUser))) {
-      await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape home');
+    if (!sessionEstablishedHome || (await scraperWebSessionBlocksWork(page, preferredIgUser))) {
+      await requeueScrapeJobForLoggedOutInstagramSession(jobId, instagramSessionId, 'comment scrape home');
       return;
     }
 
@@ -1641,14 +1594,14 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       for (let guestRetry = 0; guestRetry < 2; guestRetry++) {
         if (!(await instagramMobilePostLooksLikeLoggedOutGuest(page))) break;
         logger.warn(
-          '[Scraper] Post page looks like logged-out guest UI; re-establishing pool session from home' +
+          '[Scraper] Post page looks like logged-out guest UI; re-establishing session from home' +
             (guestRetry ? ' (retry)' : '')
         );
         await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: SCRAPER_NAV_TIMEOUT_MS });
         await delay(1500 + Math.floor(Math.random() * 900));
-        const poolOkGuest = await ensurePoolScraperInstagramWebSession(page, logger, scraperUsername, jobId);
-        if (!poolOkGuest || (await poolScraperWebSessionBlocksWork(page, scraperUsername))) {
-          await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape after guest retry');
+        const sessionOkGuest = await ensurePoolScraperInstagramWebSession(page, logger, scraperUsername, jobId);
+        if (!sessionOkGuest || (await scraperWebSessionBlocksWork(page, scraperUsername))) {
+          await requeueScrapeJobForLoggedOutInstagramSession(jobId, instagramSessionId, 'comment scrape after guest retry');
           return;
         }
         await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: SCRAPER_NAV_TIMEOUT_MS });
@@ -1657,7 +1610,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       }
 
       if (await instagramMobilePostLooksLikeLoggedOutGuest(page)) {
-        await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape post still guest');
+        await requeueScrapeJobForLoggedOutInstagramSession(jobId, instagramSessionId, 'comment scrape post still guest');
         return;
       }
 
@@ -1940,8 +1893,8 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       logger.warn('[Scraper] Post-scrape warm skipped: ' + e.message);
     }
 
-    if (platformSessionId && leadsInsertedTotal > 0) {
-      await recordScraperActions(platformSessionId, leadsInsertedTotal).catch(() => {});
+    if (instagramSessionId && leadsInsertedTotal > 0) {
+      await recordScraperActions(instagramSessionId, leadsInsertedTotal).catch(() => {});
     }
 
     await finalizeScrapeJobNormalExit(jobId, leadsInsertedTotal);

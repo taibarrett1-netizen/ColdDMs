@@ -1064,7 +1064,7 @@ async function getMostRecentInstagramSessionForClient(clientId) {
   const { data, error } = await sb
     .from('cold_dm_instagram_sessions')
     .select(
-      'id, client_id, instagram_username, proxy_url, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
+      'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
     )
     .eq('client_id', clientId)
     .order('updated_at', { ascending: false })
@@ -1082,12 +1082,26 @@ async function getInstagramSessionForClientAndUsername(clientId, instagramUserna
   const { data, error } = await sb
     .from('cold_dm_instagram_sessions')
     .select(
-      'id, client_id, instagram_username, proxy_url, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
+      'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
     )
     .eq('client_id', clientId)
     .eq('instagram_username', u)
     .order('updated_at', { ascending: false })
     .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function getInstagramSessionForScrapeById(sessionId) {
+  const sb = getSupabase();
+  if (!sb || !sessionId) throw new Error('Supabase or sessionId missing');
+  const { data, error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .select(
+      'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh, updated_at'
+    )
+    .eq('id', sessionId)
     .maybeSingle();
   if (error) throw error;
   return data || null;
@@ -1877,13 +1891,7 @@ async function updateSettingsInstagramUsername(clientId, instagramUsername) {
 async function getScraperSession(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return null;
-  const { data, error } = await sb
-    .from('cold_dm_scraper_sessions')
-    .select('session_data, instagram_username')
-    .eq('client_id', clientId)
-    .maybeSingle();
-  if (error) throw error;
-  return data;
+  return getMostRecentInstagramSessionForClient(clientId);
 }
 
 async function saveScraperSession(clientId, sessionData, instagramUsername) {
@@ -2460,7 +2468,7 @@ async function createScrapeJob(
   platformScraperSessionId = null,
   instagramSessionId = null,
   maxLeads = null,
-  scrapeMethod = 'instagrapi'
+  scrapeMethod = 'puppeteer'
 ) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
@@ -4635,6 +4643,7 @@ module.exports = {
   reactivateCampaignsWithPendingLeads,
   getMostRecentInstagramSessionForClient,
   getInstagramSessionForClientAndUsername,
+  getInstagramSessionForScrapeById,
   serviceSetInstagrapiSettings,
   serviceSetInstagrapiState,
   updateInstagramSessionProxy,
