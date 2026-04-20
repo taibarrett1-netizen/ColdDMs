@@ -1045,6 +1045,19 @@ async function saveSession(clientId, sessionData, instagramUsername, proxyOpts =
   if (error) throw error;
 }
 
+async function updateInstagramSessionProxy(sessionId, proxyOpts = {}) {
+  const sb = getSupabase();
+  if (!sb || !sessionId) throw new Error('Supabase or sessionId missing');
+  const update = { updated_at: new Date().toISOString() };
+  if (proxyOpts.proxyUrl) update.proxy_url = proxyOpts.proxyUrl;
+  if (proxyOpts.proxyAssignmentId) update.proxy_assignment_id = proxyOpts.proxyAssignmentId;
+  const { error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .update(update)
+    .eq('id', sessionId);
+  if (error) throw error;
+}
+
 async function getMostRecentInstagramSessionForClient(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
@@ -3492,21 +3505,32 @@ async function buildSendWorkFromJob(jobId) {
   }
   const { data: leadLink } = await sb
     .from('cold_dm_campaign_leads')
-    .select('id, lead_id, status')
+    .select('id, lead_id, status, lead_username, lead_first_name, lead_last_name, lead_display_name')
     .eq('id', job.campaign_lead_id)
     .maybeSingle();
   if (!leadLink || leadLink.status !== 'pending') {
     return { job, disposition: 'cancelled', reason: 'campaign_lead_not_pending' };
   }
-  const { data: lead } = await sb
-    .from('cold_dm_leads')
-    .select('id, username, first_name, last_name, display_name')
-    .eq('id', leadLink.lead_id)
-    .eq('client_id', job.client_id)
-    .maybeSingle();
-  if (!lead?.username) {
+  let lead = null;
+  try {
+    const { data } = await sb
+      .from('cold_dm_leads')
+      .select('id, username, first_name, last_name, display_name')
+      .eq('id', leadLink.lead_id)
+      .eq('client_id', job.client_id)
+      .maybeSingle();
+    lead = data || null;
+  } catch {}
+  const leadUsername = normalizeUsername(lead?.username || leadLink.lead_username || '').toLowerCase();
+  if (!leadUsername) {
     return { job, disposition: 'failed', reason: 'missing_lead_row' };
   }
+  const leadData = {
+    username: lead?.username || leadLink.lead_username || null,
+    first_name: lead?.first_name || leadLink.lead_first_name || null,
+    last_name: lead?.last_name || leadLink.lead_last_name || null,
+    display_name: lead?.display_name || leadLink.lead_display_name || null,
+  };
 
   let messageText = null;
   let messageGroupMessageId = null;
@@ -3551,9 +3575,9 @@ async function buildSendWorkFromJob(jobId) {
     };
   }
   const scrapeBlocklistSet = await getScrapeBlocklistUsernames(job.client_id);
-  const unameNorm = normalizeUsername(lead.username).toLowerCase();
+  const unameNorm = normalizeUsername(leadData.username).toLowerCase();
   if (scrapeBlocklistSet.has(unameNorm)) {
-    return { job, disposition: 'failed', reason: 'blocklist', lead, campaign, messageText, messageGroupMessageId, voiceNotePath, voiceNoteMode };
+    return { job, disposition: 'failed', reason: 'blocklist', lead: leadData, campaign, messageText, messageGroupMessageId, voiceNotePath, voiceNoteMode };
   }
   return {
     job,
@@ -3563,10 +3587,10 @@ async function buildSendWorkFromJob(jobId) {
       campaignLeadId: job.campaign_lead_id,
       campaignId: job.campaign_id,
       leadId: leadLink.lead_id,
-      username: normalizeUsername(lead.username),
-      first_name: lead.first_name ?? null,
-      last_name: lead.last_name ?? null,
-      display_name: lead.display_name ?? null,
+      username: normalizeUsername(leadData.username),
+      first_name: leadData.first_name ?? null,
+      last_name: leadData.last_name ?? null,
+      display_name: leadData.display_name ?? null,
       messageText,
       messageGroupId: campaign.message_group_id || null,
       messageGroupMessageId: messageGroupMessageId || null,
@@ -4129,7 +4153,7 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
 
     const { data: leadRows } = await sb
       .from('cold_dm_leads')
-      .select('id, username')
+      .select('id, username, first_name, last_name, display_name')
       .eq('client_id', clientId)
       .in('lead_group_id', leadGroupIds);
     dbg.leadRowsCount = leadRows?.length || 0;
@@ -4140,6 +4164,12 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
     }
 
     for (const lead of leadRows) {
+      const leadSnapshot = {
+        username: lead.username || null,
+        first_name: lead.first_name || null,
+        last_name: lead.last_name || null,
+        display_name: lead.display_name || null,
+      };
       const { data: existing } = await sb
         .from('cold_dm_campaign_leads')
         .select('id')
@@ -4148,7 +4178,15 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
         .maybeSingle();
       if (!existing) {
         await sb.from('cold_dm_campaign_leads').upsert(
-          { campaign_id: camp.id, lead_id: lead.id, status: 'pending' },
+          {
+            campaign_id: camp.id,
+            lead_id: lead.id,
+            status: 'pending',
+            lead_username: leadSnapshot.username,
+            lead_first_name: leadSnapshot.first_name,
+            lead_last_name: leadSnapshot.last_name,
+            lead_display_name: leadSnapshot.display_name,
+          },
           { onConflict: 'campaign_id,lead_id', ignoreDuplicates: true }
         );
       }
@@ -4159,7 +4197,11 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
     for (;;) {
       const nowIso = new Date().toISOString();
       const basePending = () =>
-        sb.from('cold_dm_campaign_leads').select('id, lead_id').eq('campaign_id', camp.id).eq('status', 'pending');
+        sb
+          .from('cold_dm_campaign_leads')
+          .select('id, lead_id, lead_username, lead_first_name, lead_last_name, lead_display_name')
+          .eq('campaign_id', camp.id)
+          .eq('status', 'pending');
       let { data: pendingRow, error } = await basePending()
         .is('leased_until', null)
         .order('id', { ascending: true })
@@ -4174,24 +4216,35 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
       }
       if (error || !pendingRow?.lead_id) break;
       dbg.pendingCount += 1;
-      const { data: leadData } = await sb
-        .from('cold_dm_leads')
-        .select('username, first_name, last_name, display_name')
-        .eq('id', pendingRow.lead_id)
-        .eq('client_id', clientId)
-        .maybeSingle();
-      if (!leadData?.username) {
+      let leadData = null;
+      try {
+        const { data } = await sb
+          .from('cold_dm_leads')
+          .select('username, first_name, last_name, display_name')
+          .eq('id', pendingRow.lead_id)
+          .eq('client_id', clientId)
+          .maybeSingle();
+        leadData = data || null;
+      } catch {}
+      const resolvedUsername = normalizeUsername(leadData?.username || pendingRow.lead_username || '').toLowerCase();
+      if (!resolvedUsername) {
         dbg.skippedMissingLeadRow += 1;
-        await updateCampaignLeadStatus(pendingRow.id, 'failed').catch(() => {});
+        await updateCampaignLeadStatus(pendingRow.id, 'failed', 'missing_lead_snapshot').catch(() => {});
         continue;
       }
-      const unameNorm = normalizeUsername(leadData.username).toLowerCase();
+      const resolvedLead = {
+        username: leadData?.username || pendingRow.lead_username || null,
+        first_name: leadData?.first_name || pendingRow.lead_first_name || null,
+        last_name: leadData?.last_name || pendingRow.lead_last_name || null,
+        display_name: leadData?.display_name || pendingRow.lead_display_name || null,
+      };
+      const unameNorm = normalizeUsername(resolvedLead.username).toLowerCase();
       if (scrapeBlocklistSet.has(unameNorm)) {
         dbg.skippedBlocklist += 1;
         await updateCampaignLeadStatus(pendingRow.id, 'failed', 'blocklist').catch(() => {});
         await logSentMessage(
           clientId,
-          leadData.username,
+          resolvedLead.username,
           messageText || null,
           'failed',
           camp.id,
@@ -4202,14 +4255,14 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
         ).catch((e) => console.error('[getNextPendingCampaignLead] logSentMessage blocklist', e && e.message));
         continue;
       }
-      const sent = await alreadySent(clientId, leadData.username);
+      const sent = await alreadySent(clientId, resolvedLead.username);
       if (sent) {
         dbg.skippedAlreadySent += 1;
         await updateCampaignLeadStatus(pendingRow.id, 'sent').catch(() => {});
         continue;
       }
       clRow = pendingRow;
-      leadRow = leadData;
+      leadRow = resolvedLead;
       break;
     }
     if (!clRow || !leadRow) {
@@ -4584,6 +4637,7 @@ module.exports = {
   getInstagramSessionForClientAndUsername,
   serviceSetInstagrapiSettings,
   serviceSetInstagrapiState,
+  updateInstagramSessionProxy,
   syncSendJobsForCampaign,
   syncSendJobsForClient,
   buildSendWorkFromJob,

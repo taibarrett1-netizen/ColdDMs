@@ -44,6 +44,7 @@ const {
   getInstagramSessionForClientAndUsername,
   serviceSetInstagrapiSettings,
   serviceSetInstagrapiState,
+  updateInstagramSessionProxy,
   releaseAllInstagramSessionLeases,
   releaseAllCampaignSendLeases,
   getClientIdsWithPauseZero,
@@ -1016,6 +1017,10 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
       });
     }
     // Connect succeeded without requiring a challenge (e.g. valid existing browser session/cookies).
+    await updateInstagramSessionProxy(sessionRow.id, {
+      proxyUrl: proxyMeta.proxyUrl,
+      proxyAssignmentId: proxyMeta.proxyAssignmentId,
+    }).catch(() => {});
     await saveSession(clientId, mergeInstagramSessionData(result.cookies, result.web_storage), result.username, {
       proxyUrl: proxyMeta.proxyUrl,
       proxyAssignmentId: proxyMeta.proxyAssignmentId,
@@ -1221,6 +1226,10 @@ app.post('/api/instagram/instagrapi/connect', connectLimiter, async (req, res) =
     if (!proxyUrl) {
       return res.status(503).json({ ok: false, error: 'Proxy URL missing for this Instagram account' });
     }
+    await updateInstagramSessionProxy(sessionRow.id, {
+      proxyUrl,
+      proxyAssignmentId: proxyMeta.proxyAssignmentId,
+    }).catch(() => {});
 
     const py = process.env.SCRAPER_PYTHON || process.env.ADMIN_LAB_PYTHON || 'python3';
     const scriptPath = path.join(__dirname, 'scraper_worker', 'instagrapi_login.py');
