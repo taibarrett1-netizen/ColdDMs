@@ -107,6 +107,10 @@ const COLD_DM_HARD_MAX_SENDS_PER_DAY = Math.max(
   1,
   parseInt(process.env.COLD_DM_MAX_SENDS_PER_DAY || '100', 10) || 100
 );
+const COLD_DM_HARD_MAX_SENDS_PER_HOUR = Math.max(
+  1,
+  parseInt(process.env.COLD_DM_MAX_SENDS_PER_HOUR || '25', 10) || 25
+);
 const COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS = Math.max(
   0,
   parseInt(process.env.COLD_DM_MIN_SECONDS_BETWEEN_SENDS || '30', 10) || 30
@@ -171,6 +175,13 @@ function normalizeColdOutreachDailyLimit(limit) {
   return Math.min(n, COLD_DM_HARD_MAX_SENDS_PER_DAY);
 }
 
+function normalizeColdOutreachHourlyLimit(limit) {
+  if (limit == null || limit === '') return COLD_DM_HARD_MAX_SENDS_PER_HOUR;
+  const n = Number(limit);
+  if (!Number.isFinite(n) || n <= 0) return COLD_DM_HARD_MAX_SENDS_PER_HOUR;
+  return Math.min(n, COLD_DM_HARD_MAX_SENDS_PER_HOUR);
+}
+
 function normalizeColdOutreachDelayWindow(minDelaySecRaw, maxDelaySecRaw) {
   const minDelaySec = Math.max(
     0,
@@ -194,6 +205,23 @@ function formatDurationShort(ms) {
   const hours = Math.floor(min / 60);
   const mins = min % 60;
   return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+}
+
+async function getClientLimitResumeAt(clientId, fallbackMs) {
+  const fallbackDelayMs = Math.max(1000, Number(fallbackMs) || 1000);
+  const fallbackAtIso = new Date(Date.now() + fallbackDelayMs).toISOString();
+  if (!clientId || typeof sb.getClientNoWorkResumeAt !== 'function') {
+    return { resumeAtIso: fallbackAtIso, delayMs: fallbackDelayMs };
+  }
+  const info = await sb.getClientNoWorkResumeAt(clientId).catch(() => null);
+  const resumeAtMs = info?.resumeAt ? new Date(info.resumeAt).getTime() : NaN;
+  if (!Number.isFinite(resumeAtMs) || resumeAtMs <= Date.now()) {
+    return { resumeAtIso: fallbackAtIso, delayMs: fallbackDelayMs };
+  }
+  return {
+    resumeAtIso: new Date(resumeAtMs).toISOString(),
+    delayMs: Math.max(1000, resumeAtMs - Date.now()),
+  };
 }
 
 const COLD_DM_CONCURRENCY_DEBUG =
@@ -4198,7 +4226,9 @@ async function sendDM(page, username, adapter, options = {}) {
   const effectiveDailyLimit = normalizeColdOutreachDailyLimit(
     freshCampaignLimits ? freshCampaignLimits.daily_send_limit : dailySendLimit
   );
-  const effectiveHourlyLimit = freshCampaignLimits ? freshCampaignLimits.hourly_send_limit : hourlySendLimit;
+  const effectiveHourlyLimit = normalizeColdOutreachHourlyLimit(
+    freshCampaignLimits ? freshCampaignLimits.hourly_send_limit : hourlySendLimit
+  );
   const stats = await Promise.resolve(adapter.getDailyStats(campaignId, effectiveDailyLimit));
   const hourlySent = await Promise.resolve(adapter.getHourlySent());
   const limitState = evaluateCampaignLimitState({
@@ -4410,6 +4440,7 @@ async function sendDM(page, username, adapter, options = {}) {
 
 function evaluateCampaignLimitState({ sentToday, sentThisHour, dailySendLimit, hourlySendLimit }) {
   const effectiveDailyLimit = normalizeColdOutreachDailyLimit(dailySendLimit);
+  const effectiveHourlyLimit = normalizeColdOutreachHourlyLimit(hourlySendLimit);
   if (effectiveDailyLimit != null && sentToday >= effectiveDailyLimit) {
     return {
       blocked: true,
@@ -4417,11 +4448,11 @@ function evaluateCampaignLimitState({ sentToday, sentThisHour, dailySendLimit, h
       statusMessage: `daily limit reached (effective daily=${effectiveDailyLimit}, sentToday=${sentToday}, counting=successful sends only)`,
     };
   }
-  if (hourlySendLimit != null && sentThisHour >= hourlySendLimit) {
+  if (effectiveHourlyLimit != null && sentThisHour >= effectiveHourlyLimit) {
     return {
       blocked: true,
       reason: 'hourly_limit',
-      statusMessage: `hourly limit reached (campaign hourly=${hourlySendLimit}, sentThisHour=${sentThisHour}, counting=successful sends only)`,
+      statusMessage: `hourly limit reached (effective hourly=${effectiveHourlyLimit}, sentThisHour=${sentThisHour}, counting=successful sends only)`,
     };
   }
   return { blocked: false, reason: null, statusMessage: null };
@@ -5030,7 +5061,9 @@ async function runBotMultiTenant() {
     const effDailyEarly = normalizeColdOutreachDailyLimit(
       campaignLimitsEarly?.daily_send_limit ?? work.dailySendLimit
     );
-    const effHourlyEarly = campaignLimitsEarly?.hourly_send_limit ?? work.hourlySendLimit;
+    const effHourlyEarly = normalizeColdOutreachHourlyLimit(
+      campaignLimitsEarly?.hourly_send_limit ?? work.hourlySendLimit
+    );
     try {
       const statsEarly = await adapter.getDailyStats(work.campaignId, effDailyEarly);
       const hourlyEarly = await adapter.getHourlySent();
@@ -5043,10 +5076,10 @@ async function runBotMultiTenant() {
       if (limEarly.blocked) {
         const msg = limEarly.statusMessage || limEarly.reason;
         const isDaily = limEarly.reason === 'daily_limit';
-        const deferMs = isDaily
+        const fallbackDeferMs = isDaily
           ? SEND_DAILY_LIMIT_DEFER_MS
           : randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
-        const untilIso = new Date(Date.now() + deferMs).toISOString();
+        const { resumeAtIso: untilIso, delayMs: deferMs } = await getClientLimitResumeAt(clientId, fallbackDeferMs);
         throttleSendLimitLog(`early:${work.campaignId}:${limEarly.reason}`, () => {
           logger.warn(msg);
           logger.log(
@@ -5261,28 +5294,33 @@ async function runBotMultiTenant() {
       let sendJobUpdates = {};
       let handledSendCooldownInline = false;
       if (!sendResult.ok && sendResult.reason === 'hourly_limit') {
-        delayMs = randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
+        const preciseResume = await getClientLimitResumeAt(clientId, randomDelay(55 * 60 * 1000, 60 * 60 * 1000));
+        delayMs = preciseResume.delayMs;
         const msg = sendResult.statusMessage || 'hourly limit reached';
         throttleSendLimitLog(`postSend:hourly:${work.campaignId}`, () => {
-          logger.log(`${msg}. Sleeping ${Math.round(delayMs / 60000)} minutes until window resets.`);
+          logger.log(`${msg}. Sleeping ${Math.round(delayMs / 60000)} minutes until the hourly window resets.`);
         });
-        sb.setClientStatusMessage(clientId, `${msg}. Next send in ~60 min.`).catch(() => {});
+        sb.setClientStatusMessage(clientId, `${msg}. Next send when the hourly window resets.`).catch(() => {});
         sendJobStatus = 'retry';
         sendJobUpdates = {
-          available_at: new Date(Date.now() + delayMs).toISOString(),
+          available_at: preciseResume.resumeAtIso,
           last_error_class: 'hourly_limit',
           last_error_message: msg,
         };
       } else if (!sendResult.ok && sendResult.reason === 'daily_limit') {
-        delayMs = SEND_DAILY_LIMIT_DEFER_MS;
+        if (page) {
+          await doLightInstagramBrowse(page, 'after_send').catch(() => {});
+        }
+        const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
+        delayMs = preciseResume.delayMs;
         const msg = sendResult.statusMessage || 'daily limit reached';
         throttleSendLimitLog(`postSend:daily:${work.campaignId}`, () => {
-          logger.log(`${msg}. Rechecking in ~${Math.round(delayMs / 60000)} minutes.`);
+          logger.log(`${msg}. Rechecking when the timezone day resets.`);
         });
         sb.setClientStatusMessage(clientId, msg).catch(() => {});
         sendJobStatus = 'retry';
         sendJobUpdates = {
-          available_at: new Date(Date.now() + delayMs).toISOString(),
+          available_at: preciseResume.resumeAtIso,
           last_error_class: 'daily_limit',
           last_error_message: msg,
         };

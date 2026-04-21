@@ -13,6 +13,22 @@ const CLIENT_ID_FILE = path.join(process.cwd(), '.cold_dm_client_id');
 let _client = null;
 let _coldDmCampaignsSupportsVoiceNoteColumns = null;
 let _loggedMissingColdDmCampaignVoiceColumns = false;
+const COLD_DM_HARD_MAX_SENDS_PER_DAY = Math.max(
+  1,
+  parseInt(process.env.COLD_DM_MAX_SENDS_PER_DAY || '100', 10) || 100
+);
+const COLD_DM_HARD_MAX_SENDS_PER_HOUR = Math.max(
+  1,
+  parseInt(process.env.COLD_DM_MAX_SENDS_PER_HOUR || '25', 10) || 25
+);
+const COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS = Math.max(
+  0,
+  parseInt(process.env.COLD_DM_MIN_SECONDS_BETWEEN_SENDS || '30', 10) || 30
+);
+const COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS = Math.max(
+  0,
+  parseInt(process.env.COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS || '10', 10) || 10
+);
 
 function noWorkDebugEnabled() {
   return process.env.NO_WORK_DEBUG === '1' || process.env.NO_WORK_DEBUG === 'true';
@@ -178,7 +194,12 @@ function getToday() {
 function hasValidCampaignSendDelayConfig(camp) {
   const min = Number(camp?.min_delay_sec);
   const max = Number(camp?.max_delay_sec);
-  return Number.isFinite(min) && Number.isFinite(max) && min >= 0 && max >= min;
+  return (
+    Number.isFinite(min) &&
+    Number.isFinite(max) &&
+    min >= COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS &&
+    max >= min + COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS
+  );
 }
 
 function describeCampaignSendDelayConfigProblem(camp) {
@@ -187,8 +208,27 @@ function describeCampaignSendDelayConfigProblem(camp) {
   if (min == null && max == null) return 'missing min_delay_sec and max_delay_sec';
   if (min == null) return 'missing min_delay_sec';
   if (max == null) return 'missing max_delay_sec';
-  if (Number(max) < Number(min)) return `max_delay_sec (${max}) is lower than min_delay_sec (${min})`;
+  if (Number(min) < COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS) {
+    return `min_delay_sec (${min}) is lower than ${COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS}`;
+  }
+  if (Number(max) < Number(min) + COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS) {
+    return `max_delay_sec (${max}) is lower than min_delay_sec + ${COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS}s`;
+  }
   return 'invalid send delay settings';
+}
+
+function normalizeColdOutreachDailyLimit(limit) {
+  if (limit == null || limit === '') return COLD_DM_HARD_MAX_SENDS_PER_DAY;
+  const n = Number(limit);
+  if (!Number.isFinite(n) || n <= 0) return COLD_DM_HARD_MAX_SENDS_PER_DAY;
+  return Math.min(n, COLD_DM_HARD_MAX_SENDS_PER_DAY);
+}
+
+function normalizeColdOutreachHourlyLimit(limit) {
+  if (limit == null || limit === '') return COLD_DM_HARD_MAX_SENDS_PER_HOUR;
+  const n = Number(limit);
+  if (!Number.isFinite(n) || n <= 0) return COLD_DM_HARD_MAX_SENDS_PER_HOUR;
+  return Math.min(n, COLD_DM_HARD_MAX_SENDS_PER_HOUR);
 }
 
 /**
@@ -1792,18 +1832,24 @@ async function getClientNoWorkResumeAt(clientId) {
     if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz)) continue;
     pendingCampaignsInSchedule.push(camp);
   }
-  const blockedDaily = pendingCampaignsInSchedule.find((camp) => camp.daily_send_limit != null && stats.total_sent >= camp.daily_send_limit);
+  const blockedDaily = pendingCampaignsInSchedule.find(
+    (camp) => stats.total_sent >= normalizeColdOutreachDailyLimit(camp.daily_send_limit)
+  );
   if (blockedDaily) {
+    const effectiveDailyLimit = normalizeColdOutreachDailyLimit(blockedDaily.daily_send_limit);
     return {
-      message: `daily limit reached (campaign daily=${blockedDaily.daily_send_limit}, sentToday=${stats.total_sent}, counting=successful sends only)`,
+      message: `daily limit reached (effective daily=${effectiveDailyLimit}, sentToday=${stats.total_sent}, counting=successful sends only)`,
       reason: 'daily_limit',
       resumeAt: getNextMidnightInTimezone(clientTz),
     };
   }
-  const blockedHourly = pendingCampaignsInSchedule.find((camp) => camp.hourly_send_limit != null && hourlySent >= camp.hourly_send_limit);
+  const blockedHourly = pendingCampaignsInSchedule.find(
+    (camp) => hourlySent >= normalizeColdOutreachHourlyLimit(camp.hourly_send_limit)
+  );
   if (blockedHourly) {
+    const effectiveHourlyLimit = normalizeColdOutreachHourlyLimit(blockedHourly.hourly_send_limit);
     return {
-      message: `hourly limit reached (campaign hourly=${blockedHourly.hourly_send_limit}, sentThisHour=${hourlySent}, counting=successful sends only)`,
+      message: `hourly limit reached (effective hourly=${effectiveHourlyLimit}, sentThisHour=${hourlySent}, counting=successful sends only)`,
       reason: 'hourly_limit',
       resumeAt: getNextHourStartInTimezone(clientTz),
     };
@@ -4018,7 +4064,7 @@ async function getMostSpecificNoWorkHint(clientId) {
     }
 
     const blockedDaily = pendingCampaignsInSchedule.find(
-      (camp) => camp.daily_send_limit != null && stats.total_sent >= camp.daily_send_limit
+      (camp) => stats.total_sent >= normalizeColdOutreachDailyLimit(camp.daily_send_limit)
     );
     if (blockedDaily) {
       const resumeAt = getNextMidnightInTimezone(clientTz);
@@ -4027,7 +4073,7 @@ async function getMostSpecificNoWorkHint(clientId) {
     }
 
     const blockedHourly = pendingCampaignsInSchedule.find(
-      (camp) => camp.hourly_send_limit != null && hourlySent >= camp.hourly_send_limit
+      (camp) => hourlySent >= normalizeColdOutreachHourlyLimit(camp.hourly_send_limit)
     );
     if (blockedHourly) {
       const resumeAt = getNextHourStartInTimezone(clientTz);
@@ -4315,13 +4361,13 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
     }
 
     const [stats, hourlySent] = await Promise.all([getDailyStats(clientId), getHourlySent(clientId)]);
-    if (camp.daily_send_limit != null && stats.total_sent >= camp.daily_send_limit) {
+    if (stats.total_sent >= normalizeColdOutreachDailyLimit(camp.daily_send_limit)) {
       dbg.blockedBy = 'daily_limit';
       dbg.reason = 'daily_limit_reached';
       campaignDebug.push(dbg);
       continue;
     }
-    if (camp.hourly_send_limit != null && hourlySent >= camp.hourly_send_limit) {
+    if (hourlySent >= normalizeColdOutreachHourlyLimit(camp.hourly_send_limit)) {
       dbg.blockedBy = 'hourly_limit';
       dbg.reason = 'hourly_limit_reached';
       campaignDebug.push(dbg);
