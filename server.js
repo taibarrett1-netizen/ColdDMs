@@ -227,6 +227,19 @@ const SEND_SCRAPE_COOLDOWN_MS = Math.max(
   60 * 1000,
   parseInt(process.env.SEND_SCRAPE_COOLDOWN_MS || String(5 * 60 * 1000), 10) || 5 * 60 * 1000
 );
+const PROCESS_SCHEDULED_RESPONSES_FALLBACK_ENABLED =
+  process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK !== '0' &&
+  process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK !== 'false';
+const PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS = Math.max(
+  30 * 1000,
+  parseInt(process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS || '60000', 10) || 60000
+);
+const PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS = Math.max(
+  10 * 1000,
+  parseInt(process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS || '45000', 10) || 45000
+);
+
+let processScheduledResponsesFallbackInFlight = false;
 
 function formatDurationShort(ms) {
   const safeMs = Math.max(0, Number(ms) || 0);
@@ -271,6 +284,64 @@ function normalizeProxyUrl(raw) {
     return s;
   } catch {
     return s;
+  }
+}
+
+function getProcessScheduledResponsesBearer() {
+  const edgeInternal = (process.env.EDGE_INTERNAL_FUNCTION_SECRET || '').trim();
+  if (edgeInternal) return edgeInternal;
+  return (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+}
+
+async function triggerProcessScheduledResponsesFallback(reason = 'interval') {
+  if (processScheduledResponsesFallbackInFlight) {
+    logger.log(`[process-scheduled-responses:fallback] skip overlapping tick reason=${reason}`);
+    return;
+  }
+  const supabaseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+  const bearer = getProcessScheduledResponsesBearer();
+  if (!supabaseUrl || !bearer) {
+    logger.warn(
+      '[process-scheduled-responses:fallback] disabled at runtime: SUPABASE_URL or auth secret missing on VPS'
+    );
+    return;
+  }
+
+  processScheduledResponsesFallbackInFlight = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS);
+  const startedAt = Date.now();
+  try {
+    const url = `${supabaseUrl}/functions/v1/process-scheduled-responses`;
+    logger.log(`[process-scheduled-responses:fallback] tick start reason=${reason}`);
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${bearer}`,
+        'Content-Type': 'application/json',
+        'X-Triggered-By': 'cold-dm-vps-fallback',
+      },
+      body: JSON.stringify({ timestamp: new Date().toISOString(), reason }),
+      signal: controller.signal,
+    });
+    const text = await res.text().catch(() => '');
+    const snippet = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+    if (!res.ok) {
+      logger.warn(
+        `[process-scheduled-responses:fallback] tick failed status=${res.status} reason=${reason} body=${snippet || 'n/a'}`
+      );
+      return;
+    }
+    logger.log(
+      `[process-scheduled-responses:fallback] tick ok reason=${reason} duration_ms=${Date.now() - startedAt} body=${snippet || '{}'}`
+    );
+  } catch (e) {
+    logger.warn(
+      `[process-scheduled-responses:fallback] tick exception reason=${reason} error=${e?.message || e}`
+    );
+  } finally {
+    clearTimeout(timeout);
+    processScheduledResponsesFallbackInFlight = false;
   }
 }
 
@@ -1584,5 +1655,16 @@ app.listen(PORT, '0.0.0.0', () => {
     );
     setInterval(() => runAutoScaleSendWorkersTick('interval'), SCALE_SEND_WORKERS_AUTO_INTERVAL_MS);
     setTimeout(() => runAutoScaleSendWorkersTick('startup'), 60_000);
+  }
+  if (PROCESS_SCHEDULED_RESPONSES_FALLBACK_ENABLED) {
+    const min = Math.round(PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS / 1000);
+    console.log(
+      `[process-scheduled-responses:fallback] enabled: every ${min}s from VPS dashboard process (backup for missing/broken Supabase cron)`
+    );
+    setInterval(
+      () => triggerProcessScheduledResponsesFallback('interval'),
+      PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS
+    );
+    setTimeout(() => triggerProcessScheduledResponsesFallback('startup'), 20_000);
   }
 });

@@ -5686,8 +5686,9 @@ async function runBotMultiTenant() {
         }
         if (sendResult.ok && activeCampaignsLeft === 0) {
           logger.log(
-            `Campaign cooldown ${delaySec}s applied to send jobs only (no active campaigns; dashboard status left as Completed.)`
+            `Campaign cooldown ${delaySec}s applied to send jobs only (no active campaigns; dashboard status set to Completed.)`
           );
+          sb.setClientStatusMessage(clientId, 'Completed.').catch(() => {});
         } else {
           logger.log(`Campaign cooldown from settings ${minSec}-${maxSec}s. Next send in ${delaySec} sec.`);
           sb.setClientStatusMessage(clientId, `Waiting. Campaign cooldown ${delaySec} sec (settings ${minSec}-${maxSec}s).`).catch(() => {});
