@@ -1157,6 +1157,9 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
   if (!followUps.length) return { processed: false };
 
   const dueCutoffIso = new Date(Date.now() + Math.max(0, Number(options.lookAheadMs) || 0)).toISOString();
+  logger.log(
+    `[follow-up-interleave] scanning queue for client ${clientId} session ${session.id} cutoff=${dueCutoffIso} items=${followUps.length}`
+  );
   const { data: pendingRows, error: queueErr } = await supabase
     .from('cold_dm_follow_up_queue')
     .select('id, client_id, follow_up_index, username, scheduled_for, retry_count')
@@ -1172,6 +1175,9 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
 
   const row = Array.isArray(pendingRows) ? pendingRows[0] : null;
   if (!row?.id) return { processed: false };
+  logger.log(
+    `[follow-up-interleave] found due row ${row.id} for @${row.username || 'unknown'} scheduled_for=${row.scheduled_for || 'n/a'}`
+  );
 
   const { data: claimed, error: claimErr } = await supabase.rpc('claim_cold_dm_follow_up_queue_item', {
     p_queue_id: row.id,
@@ -1226,7 +1232,9 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
   );
 
   try {
-    logger.log(`[follow-up-interleave] running queued follow-up for @${uname}`);
+    logger.log(
+      `[follow-up-interleave] running queued follow-up for @${uname} index=${row.follow_up_index} retry=${row.retry_count || 0}`
+    );
     const nav = await navigateToDmThread(page, uname);
     if (!nav.ok) throw new Error(nav.reason || 'follow_up_nav_failed');
     const sent = await sendPlainTextInThread(page, textOut);
@@ -4007,6 +4015,9 @@ async function sendFollowUp(body) {
   if (!leaseOk) {
     return fail('Instagram session is busy; try again in a few minutes', 409);
   }
+  logger.log(
+    `[follow-up] lease acquired clientId=${clientId} sessionId=${instagramSessionId} recipient=@${recipientUsername}${cLog}`
+  );
 
   const modeLabel = hasAudio ? (hasCaption ? 'voice+caption' : 'voice') : hasMessages ? `messages(${messageLines.length})` : 'text';
   logger.log(
@@ -4072,15 +4083,18 @@ async function sendFollowUp(body) {
 
     const u = normalizeUsername(recipientUsername);
     await tinyHumanMouseMove(page);
+    logger.log(`[follow-up] opening DM thread for @${u}${cLog}`);
     const nav = await navigateToDmThread(page, u);
     if (!nav.ok) {
       const errMsg = followUpReasonToError(nav.reason, nav.pageSnippet);
       return fail(errMsg, 400);
     }
+    logger.log(`[follow-up] DM thread ready for @${u}${cLog}`);
     if (hasAudio) await grantMicrophoneForInstagram(page, logger);
 
     if (textSingle) {
       await tinyHumanMouseMove(page);
+      logger.log(`[follow-up] sending text follow-up to @${u}${cLog}`);
       const sent = await sendPlainTextInThread(page, String(body.text).trim(), { idCapture });
       if (!sent.ok) {
         return fail(followUpReasonToError(sent.reason), 400);
@@ -4098,6 +4112,7 @@ async function sendFollowUp(body) {
       const collectedIds = [];
       for (const line of messageLines) {
         await tinyHumanMouseMove(page);
+        logger.log(`[follow-up] sending message chunk to @${u}${cLog}`);
         const sent = await sendPlainTextInThread(page, line, { idCapture });
         if (!sent.ok) {
           return fail(followUpReasonToError(sent.reason), 400);
@@ -4117,6 +4132,7 @@ async function sendFollowUp(body) {
       const captionIds = [];
       if (hasCaption) {
         await tinyHumanMouseMove(page);
+        logger.log(`[follow-up] sending voice caption to @${u}${cLog}`);
         const cap = await sendPlainTextInThread(page, captionRaw, { idCapture });
         if (!cap.ok) {
           return fail(followUpReasonToError(cap.reason), 400);
@@ -4125,6 +4141,7 @@ async function sendFollowUp(body) {
         await delay(1200);
       }
       await tinyHumanMouseMove(page);
+      logger.log(`[follow-up] sending voice note to @${u}${cLog}`);
       const prep = await prepareVoiceNoteUi(page, { logger });
       if (!prep.ok) {
         return fail(followUpReasonToError(prep.reason || 'voice_mic_not_found'), 400);

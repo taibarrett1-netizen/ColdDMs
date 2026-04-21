@@ -4109,11 +4109,41 @@ async function getRandomMessageFromGroup(messageGroupId) {
   try {
     const { data, error } = await sb
       .from('cold_dm_message_group_messages')
-      .select('id, message_text, send_voice_note, voice_note_storage_path')
+      .select('id, message_text, send_voice_note, voice_note_storage_path, sort_order, created_at')
       .eq('message_group_id', messageGroupId)
-      .order('sort_order', { ascending: true });
+      .order('sort_order', { ascending: true })
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true });
     if (error || !data || data.length === 0) return null;
-    const row = data[Math.floor(Math.random() * data.length)];
+    let rotationIndex = 0;
+    let canPersistRotation = true;
+    try {
+      const { data: stateRow, error: stateErr } = await sb
+        .from('cold_dm_message_group_rotation_state')
+        .select('next_index')
+        .eq('message_group_id', messageGroupId)
+        .maybeSingle();
+      if (stateErr) throw stateErr;
+      rotationIndex = Math.max(0, Math.floor(Number(stateRow?.next_index ?? 0)));
+    } catch (stateErr) {
+      canPersistRotation = false;
+    }
+
+    const row = data[rotationIndex % data.length];
+    if (canPersistRotation) {
+      const nextIndex = data.length <= 1 ? 0 : (rotationIndex + 1) % data.length;
+      await sb
+        .from('cold_dm_message_group_rotation_state')
+        .upsert(
+          {
+            message_group_id: messageGroupId,
+            next_index: nextIndex,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'message_group_id' }
+        )
+        .catch(() => {});
+    }
     return {
       id: row.id,
       message_text: row.message_text,
@@ -4123,12 +4153,19 @@ async function getRandomMessageFromGroup(messageGroupId) {
   } catch (e) {
     const { data, error } = await sb
       .from('cold_dm_message_group_messages')
-      .select('id, message_text')
+      .select('id, message_text, send_voice_note, voice_note_storage_path, sort_order, created_at')
       .eq('message_group_id', messageGroupId)
-      .order('sort_order', { ascending: true });
+      .order('sort_order', { ascending: true })
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true });
     if (error || !data || data.length === 0) return null;
-    const row = data[Math.floor(Math.random() * data.length)];
-    return { id: row.id, message_text: row.message_text, send_voice_note: false, voice_note_storage_path: null };
+    const row = data[0];
+    return {
+      id: row.id,
+      message_text: row.message_text,
+      send_voice_note: row.send_voice_note === true,
+      voice_note_storage_path: row.voice_note_storage_path || null,
+    };
   }
 }
 
