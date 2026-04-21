@@ -4923,6 +4923,7 @@ module.exports = {
   getSessions,
   getSessionsForCampaign,
   getWaitingInstagramSessionReason,
+  normalizeSessionDataForPuppeteer,
   claimInstagramSessionLease,
   claimInstagramSessionForCampaign,
   getInstagramSessionDailyUsage,
