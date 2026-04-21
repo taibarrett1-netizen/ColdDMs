@@ -244,13 +244,14 @@ let processScheduledResponsesFallbackInFlight = false;
 
 function formatDurationShort(ms) {
   const safeMs = Math.max(0, Number(ms) || 0);
-  const totalSec = Math.ceil(safeMs / 1000);
-  if (totalSec < 60) return `${totalSec}s`;
-  const min = Math.ceil(totalSec / 60);
-  if (min < 60) return `${min}m`;
+  const totalSec = Math.max(1, Math.ceil(safeMs / 1000));
+  if (totalSec < 60) return `${totalSec} second${totalSec === 1 ? '' : 's'}`;
+  const min = Math.max(1, Math.round(totalSec / 60));
+  if (min < 60) return `${min} minute${min === 1 ? '' : 's'}`;
   const hours = Math.floor(min / 60);
   const mins = min % 60;
-  return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+  if (mins === 0) return `${hours} hour${hours === 1 ? '' : 's'}`;
+  return `${hours} hour${hours === 1 ? '' : 's'} ${mins} minute${mins === 1 ? '' : 's'}`;
 }
 
 function normalizeProxyUrl(raw) {
@@ -311,10 +312,8 @@ async function triggerProcessScheduledResponsesFallback(reason = 'interval') {
   processScheduledResponsesFallbackInFlight = true;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS);
-  const startedAt = Date.now();
   try {
     const url = `${supabaseUrl}/functions/v1/process-scheduled-responses`;
-    logger.log(`[process-scheduled-responses:fallback] tick start reason=${reason}`);
     const res = await fetch(url, {
       method: 'POST',
       headers: {
@@ -333,9 +332,6 @@ async function triggerProcessScheduledResponsesFallback(reason = 'interval') {
       );
       return;
     }
-    logger.log(
-      `[process-scheduled-responses:fallback] tick ok reason=${reason} duration_ms=${Date.now() - startedAt} body=${snippet || '{}'}`
-    );
   } catch (e) {
     if (e?.name === 'AbortError' || String(e?.message || e) === 'This operation was aborted') {
       logger.log(

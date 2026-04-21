@@ -198,13 +198,14 @@ function normalizeColdOutreachDelayWindow(minDelaySecRaw, maxDelaySecRaw) {
 
 function formatDurationShort(ms) {
   const safeMs = Math.max(0, Number(ms) || 0);
-  const totalSec = Math.ceil(safeMs / 1000);
-  if (totalSec < 60) return `${totalSec}s`;
-  const min = Math.ceil(totalSec / 60);
-  if (min < 60) return `${min}m`;
+  const totalSec = Math.max(1, Math.ceil(safeMs / 1000));
+  if (totalSec < 60) return `${totalSec} second${totalSec === 1 ? '' : 's'}`;
+  const min = Math.max(1, Math.round(totalSec / 60));
+  if (min < 60) return `${min} minute${min === 1 ? '' : 's'}`;
   const hours = Math.floor(min / 60);
   const mins = min % 60;
-  return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+  if (mins === 0) return `${hours} hour${hours === 1 ? '' : 's'}`;
+  return `${hours} hour${hours === 1 ? '' : 's'} ${mins} minute${mins === 1 ? '' : 's'}`;
 }
 
 async function getClientLimitResumeAt(clientId, fallbackMs) {
@@ -5458,6 +5459,37 @@ async function runBotMultiTenant() {
         await delay(400);
         continue;
       }
+    }
+
+    const accountDailyLimit = normalizeColdOutreachDailyLimit(session.account_daily_limit ?? session.daily_dm_limit ?? 100);
+    const accountDailyUsage =
+      typeof sb.getInstagramSessionDailyUsage === 'function'
+        ? await sb.getInstagramSessionDailyUsage(clientId, session.id).catch(() => null)
+        : null;
+    if (accountDailyUsage && accountDailyUsage.totalSent >= accountDailyLimit) {
+      const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
+      const msg = 'Account hit daily limit';
+      logger.log(
+        `[send-worker] ${msg.toLowerCase()} for session=${session.id} totalSent=${accountDailyUsage.totalSent}/${accountDailyLimit}; retrying after reset.`
+      );
+      await sb.setClientStatusMessage(clientId, msg).catch(() => {});
+      await sb.updateSendJob(
+        claimedJob.id,
+        {
+          status: 'retry',
+          available_at: preciseResume.resumeAtIso,
+          last_error_class: 'account_daily_limit',
+          last_error_message: msg,
+        },
+        SEND_WORKER_ID
+      ).catch(() => {});
+      await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, preciseResume.resumeAtIso).catch(() => {});
+      await releaseClaimedCampaignLease(claimedJob.campaign_id);
+      await sb.releaseInstagramSessionLease(session.id, SEND_WORKER_ID).catch(() => {});
+      leasedSessionIdForSignal = null;
+      leasedCampaignIdForSignal = null;
+      await delay(400);
+      continue;
     }
 
     const leaseHeartbeatMs = Math.max(30000, Math.min(60000, Math.floor((SEND_LEASE_SECONDS * 1000) / 2)));

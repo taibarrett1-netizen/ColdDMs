@@ -615,7 +615,7 @@ async function getSessions(clientId) {
   try {
     const { data, error } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, scrape_cooldown_until')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, daily_dm_limit, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, scrape_cooldown_until')
       .eq('client_id', clientId)
       .order('id', { ascending: true });
     if (error) throw error;
@@ -623,7 +623,7 @@ async function getSessions(clientId) {
   } catch (e) {
     const { data, error } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh, scrape_cooldown_until')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, daily_dm_limit, web_session_needs_refresh, scrape_cooldown_until')
       .eq('client_id', clientId)
       .order('id', { ascending: true });
     if (error) throw error;
@@ -652,7 +652,7 @@ async function getSessionsForCampaign(clientId, campaignId) {
     try {
       const { data: sessions, error: sessErr } = await sb
         .from('cold_dm_instagram_sessions')
-        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, scrape_cooldown_until')
+        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, daily_dm_limit, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, scrape_cooldown_until')
         .eq('client_id', clientId)
         .in('id', ids)
         .order('id', { ascending: true });
@@ -661,7 +661,7 @@ async function getSessionsForCampaign(clientId, campaignId) {
     } catch (e) {
       const { data: sessions, error: sessErr } = await sb
         .from('cold_dm_instagram_sessions')
-        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh, scrape_cooldown_until')
+        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, daily_dm_limit, web_session_needs_refresh, scrape_cooldown_until')
         .eq('client_id', clientId)
         .in('id', ids)
         .order('id', { ascending: true });
@@ -697,6 +697,63 @@ function campaignSendLeaseStaleBeforeIso() {
     parseInt(process.env.CAMPAIGN_SEND_LEASE_STALE_SEC || '120', 10) || 120
   );
   return new Date(Date.now() - staleSec * 1000).toISOString();
+}
+
+function getDayBoundsForTimezone(timezone) {
+  const tz = normalizeTimezoneInput(timezone);
+  if (!tz) {
+    const now = new Date();
+    const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+    return { timezone: null, startIso: start.toISOString(), endIso: end.toISOString() };
+  }
+  const todayStr = getTodayInTimezone(tz);
+  const start = utcAtLocalDateAndHM(todayStr, '00:00', tz);
+  const end = getNextMidnightInTimezone(tz);
+  return { timezone: tz, startIso: start.toISOString(), endIso: end.toISOString() };
+}
+
+function getInstagramSessionDailyLimit(sessionRow) {
+  return normalizeColdOutreachDailyLimit(sessionRow?.daily_dm_limit ?? 100);
+}
+
+async function getInstagramSessionDailyUsage(clientId, instagramSessionId, timezone = null) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !instagramSessionId) {
+    return { coldOutreachSent: 0, followUpsSent: 0, totalSent: 0, startIso: null, endIso: null };
+  }
+  const effectiveTimezone = timezone || (await getSettings(clientId).catch(() => null))?.timezone || null;
+  const bounds = getDayBoundsForTimezone(effectiveTimezone);
+  const [coldDmRes, followUpsRes] = await Promise.all([
+    sb
+      .from('cold_dm_send_jobs')
+      .select('id', { count: 'exact', head: true })
+      .eq('client_id', clientId)
+      .eq('instagram_session_id', instagramSessionId)
+      .eq('status', 'completed')
+      .or('last_error_class.is.null,last_error_class.neq.already_sent')
+      .gte('finished_at', bounds.startIso)
+      .lt('finished_at', bounds.endIso),
+    sb
+      .from('cold_dm_follow_up_queue')
+      .select('id', { count: 'exact', head: true })
+      .eq('client_id', clientId)
+      .eq('vps_session_id', instagramSessionId)
+      .eq('status', 'sent')
+      .gte('sent_at', bounds.startIso)
+      .lt('sent_at', bounds.endIso),
+  ]);
+  if (coldDmRes.error) throw coldDmRes.error;
+  if (followUpsRes.error) throw followUpsRes.error;
+  const coldOutreachSent = coldDmRes.count || 0;
+  const followUpsSent = followUpsRes.count || 0;
+  return {
+    coldOutreachSent,
+    followUpsSent,
+    totalSent: coldOutreachSent + followUpsSent,
+    startIso: bounds.startIso,
+    endIso: bounds.endIso,
+  };
 }
 
 /** Postgres undefined_column or PostgREST "column does not exist" style errors. */
@@ -777,6 +834,8 @@ async function claimInstagramSessionLease(sessionId, workerId, leaseSeconds = 60
 async function claimInstagramSessionForCampaign(clientId, campaignId, workerId, leaseSeconds = 600) {
   const sessions = await getSessionsForCampaign(clientId, campaignId);
   if (!sessions?.length) return null;
+  const settings = await getSettings(clientId).catch(() => null);
+  const timezone = settings?.timezone || null;
   const now = Date.now();
   const staleMs =
     Math.max(45, parseInt(process.env.INSTAGRAM_SESSION_LEASE_STALE_SEC || '120', 10) || 120) * 1000;
@@ -790,9 +849,16 @@ async function claimInstagramSessionForCampaign(clientId, campaignId, workerId, 
     return heartbeatStale(s);
   });
   for (const candidate of eligible) {
+    const usage = await getInstagramSessionDailyUsage(clientId, candidate.id, timezone).catch(() => null);
+    const dailyLimit = getInstagramSessionDailyLimit(candidate);
+    if (usage && usage.totalSent >= dailyLimit) continue;
     const ok = await claimInstagramSessionLease(candidate.id, workerId, leaseSeconds);
     if (ok) {
-      return candidate;
+      return {
+        ...candidate,
+        account_daily_limit: dailyLimit,
+        account_daily_usage: usage,
+      };
     }
   }
   return null;
@@ -807,8 +873,23 @@ async function getWaitingInstagramSessionReason(clientId, campaignId) {
   if (!sb || !clientId || !campaignId) return null;
   const sessions = await getSessionsForCampaign(clientId, campaignId);
   if (!sessions?.length) return null;
+  const settings = await getSettings(clientId).catch(() => null);
+  const timezone = settings?.timezone || null;
   if (sessions.some((s) => s?.web_session_needs_refresh === true)) {
     return 'Please reconnect your account in Settings > Integrations > Automation session (outbound).';
+  }
+  const usageStates = await Promise.all(
+    sessions.map(async (session) => {
+      const usage = await getInstagramSessionDailyUsage(clientId, session.id, timezone).catch(() => null);
+      return {
+        usage,
+        dailyLimit: getInstagramSessionDailyLimit(session),
+      };
+    })
+  );
+  if (usageStates.length > 0 && usageStates.every((entry) => entry.usage && entry.usage.totalSent >= entry.dailyLimit)) {
+    const resumeAt = getNextMidnightInTimezone(timezone);
+    return `Account hit daily limit. Sending resumes after ${resumeAt.toLocaleString()}.`;
   }
   const now = Date.now();
   const leased = sessions
@@ -4844,6 +4925,7 @@ module.exports = {
   getWaitingInstagramSessionReason,
   claimInstagramSessionLease,
   claimInstagramSessionForCampaign,
+  getInstagramSessionDailyUsage,
   heartbeatInstagramSessionLease,
   releaseInstagramSessionLease,
   releaseAllInstagramSessionLeases,
