@@ -586,7 +586,9 @@ async function getInstagramSessionByIdForClient(clientId, sessionId) {
   try {
     const { data, error } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at')
+      .select(
+        'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
+      )
       .eq('id', sessionId)
       .eq('client_id', clientId)
       .maybeSingle();
@@ -595,7 +597,9 @@ async function getInstagramSessionByIdForClient(clientId, sessionId) {
   } catch (e) {
     const { data, error } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id')
+      .select(
+        'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
+      )
       .eq('id', sessionId)
       .eq('client_id', clientId)
       .maybeSingle();
