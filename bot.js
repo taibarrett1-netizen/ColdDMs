@@ -540,12 +540,19 @@ async function saveComposeFailureDebugScreenshot(page, username, label = 'compos
 }
 
 /**
- * Full-page screenshot right after a compose-recovery CTA (Continue, Accept, etc.).
- * Not gated on DM_COMPOSE_FAILURE_SCREENSHOT — always written when recovery runs so
- * account-picker / interstitial flows are visible on the VPS (logs/login-debug).
+ * Full-page screenshot after a compose-recovery CTA (Continue, Accept, thread row, etc.).
+ * Gated on DM_COMPOSE_RECOVERY_SCREENSHOT=1|true (default off).
  */
+function wantsComposeRecoveryScreenshot() {
+  return process.env.DM_COMPOSE_RECOVERY_SCREENSHOT === '1' || process.env.DM_COMPOSE_RECOVERY_SCREENSHOT === 'true';
+}
+
+function wantsDmComposeVerboseDiagnostics() {
+  return process.env.DM_COMPOSE_VERBOSE_DIAGNOSTICS === '1' || process.env.DM_COMPOSE_VERBOSE_DIAGNOSTICS === 'true';
+}
+
 async function saveAfterComposeRecoveryScreenshot(page, recoveryClicked, leadUsername) {
-  if (!page) return null;
+  if (!wantsComposeRecoveryScreenshot() || !page) return null;
   try {
     fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
     const u = String(leadUsername || 'lead').replace(/^@/, '').replace(/[^a-z0-9_-]/gi, '_').slice(0, 40);
@@ -560,66 +567,11 @@ async function saveAfterComposeRecoveryScreenshot(page, recoveryClicked, leadUse
   }
 }
 
-async function saveTechnicalRecoveryDebugSnapshot(page, leadUsername, stage) {
-  if (!page) return { screenshotPath: null, summary: null };
-  const safeStage = String(stage || 'technical-recovery').replace(/[^a-z0-9_-]/gi, '_').slice(0, 80);
-  const screenshotPath = await saveAfterComposeRecoveryScreenshot(page, `technical_${safeStage}`, leadUsername).catch(() => null);
-  const summary = await page
-    .evaluate(() => {
-      const visible = (el) => {
-        try {
-          return !!el && el.offsetParent !== null && (el.offsetWidth > 0 || el.offsetHeight > 0);
-        } catch {
-          return false;
-        }
-      };
-      const textOf = (el) => String(el?.textContent || '').replace(/\s+/g, ' ').trim();
-      const ctas = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"]'))
-        .filter(visible)
-        .map((el) => textOf(el))
-        .filter(Boolean)
-        .slice(0, 20);
-      const composers = Array.from(
-        document.querySelectorAll('textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]')
-      )
-        .filter(visible)
-        .map((el) => {
-          const rect = el.getBoundingClientRect();
-          return {
-            tag: String(el.tagName || '').toLowerCase(),
-            placeholder: String(el.getAttribute?.('placeholder') || ''),
-            aria: String(el.getAttribute?.('aria-label') || ''),
-            left: Math.round(rect.left),
-            top: Math.round(rect.top),
-            right: Math.round(rect.right),
-            bottom: Math.round(rect.bottom),
-          };
-        })
-        .slice(0, 10);
-      const body = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
-      return {
-        url: location.href,
-        path: location.pathname,
-        title: document.title || '',
-        bodySnippet: body.slice(0, 800),
-        ctas,
-        composers,
-      };
-    })
-    .catch((e) => ({ error: e?.message || String(e) }));
-  logger.log(`[compose-recovery] debug ${safeStage}: ${JSON.stringify(summary)}`);
-  if (screenshotPath) {
-    logger.log(`[compose-recovery] debug ${safeStage} screenshot=${screenshotPath}`);
-  }
-  return { screenshotPath, summary };
-}
-
 /**
  * Instagram shows "View profile" in the broken DM thread pane; clicking it fixes state without blowing away
  * the floating composer the way a raw profile URL navigation can.
  */
-async function clickInDmPaneViewProfile(page, username) {
-  const u = normalizeUsername(username);
+async function clickInDmPaneViewProfile(page) {
   const result = await page
     .evaluate(() => {
       const visible = (el) => {
@@ -651,13 +603,6 @@ async function clickInDmPaneViewProfile(page, username) {
       return { ok: false, label: null };
     })
     .catch((e) => ({ ok: false, label: null, err: e?.message || String(e) }));
-  if (result?.ok) {
-    logger.log(`[compose-recovery] in-DM View profile clicked for @${u}: ${result.label || 'ok'}`);
-  } else {
-    logger.log(
-      `[compose-recovery] in-DM View profile click missed for @${u}${result?.err ? ` (${result.err})` : ''}`
-    );
-  }
   return !!result?.ok;
 }
 
@@ -669,8 +614,7 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   const u = normalizeUsername(username);
   const profileUrl = `https://www.instagram.com/${u}/`;
   const profilePath = `/${u}/`;
-  logger.log(`[compose-recovery] technical error fallback start for @${u} from ${page.url()}`);
-  await saveTechnicalRecoveryDebugSnapshot(page, u, 'start').catch(() => {});
+  logger.log(`[compose-recovery] DM technical error — recovering @${u}`);
 
   /** Thread pane, profile right column, or floating DM overlay — not the left inbox search box. */
   const recoveryComposerVisible = async () => {
@@ -725,9 +669,7 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   };
 
   let composerVisible = await recoveryComposerVisible();
-  logger.log(`[compose-recovery] recovery composer visible (initial) for @${u}: ${composerVisible}`);
   if (composerVisible) {
-    logger.log('[compose-recovery] technical error recovery: composer already visible');
     await saveAfterComposeRecoveryScreenshot(page, 'recovery-composer-visible-initial', u);
     return { ok: true, recoveryClicked: 'recovery-composer-visible-initial' };
   }
@@ -735,35 +677,24 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   const startUrl = page.url();
   const onDirect = /\/direct\//i.test(startUrl);
   if (onDirect) {
-    logger.log(`[compose-recovery] on /direct/ thread — trying in-DM View profile before any profile URL navigation`);
-    const clickedVp = await clickInDmPaneViewProfile(page, u);
-    await saveTechnicalRecoveryDebugSnapshot(page, u, clickedVp ? 'after_in_dm_view_profile_click' : 'view_profile_not_found').catch(
-      () => {}
-    );
+    const clickedVp = await clickInDmPaneViewProfile(page);
     await delay(clickedVp ? 2400 : 800);
     await dismissInstagramHomeModals(page, logger).catch(() => {});
-    await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_in_dm_view_profile_settle').catch(() => {});
 
     composerVisible = await recoveryComposerVisible();
-    logger.log(`[compose-recovery] recovery composer visible after in-DM View profile for @${u}: ${composerVisible}`);
     if (composerVisible) {
       await saveAfterComposeRecoveryScreenshot(page, 'after-in-dm-view-profile', u);
       return { ok: true, recoveryClicked: 'in-dm-view-profile' };
     }
     await delay(1200);
     composerVisible = await recoveryComposerVisible();
-    logger.log(`[compose-recovery] recovery composer visible after extra wait for @${u}: ${composerVisible}`);
     if (composerVisible) {
       await saveAfterComposeRecoveryScreenshot(page, 'after-in-dm-view-profile-wait', u);
       return { ok: true, recoveryClicked: 'in-dm-view-profile-wait' };
     }
-  } else {
-    logger.log(`[compose-recovery] not on /direct/ (url=${startUrl}) — skipping in-DM View profile click`);
   }
 
-  logger.log(
-    `[compose-recovery] last-resort: navigating to profile URL ${profileUrl} (in-DM recovery did not expose composer)`
-  );
+  logger.log(`[compose-recovery] profile URL fallback @${u}`);
   try {
     await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   } catch {
@@ -779,13 +710,11 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   await page.waitForSelector('header, main, [role="main"]', { timeout: 10000 }).catch(() => {});
   await dismissInstagramHomeModals(page, logger).catch(() => {});
   await delay(2200);
-  await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_profile_url_open').catch(() => {});
   const isProfilePage = await page
     .evaluate((path) => location.pathname.toLowerCase().replace(/\/+$/, '/') === path, profilePath)
     .catch(() => false);
   if (!isProfilePage) {
-    logger.warn(`[compose-recovery] profile URL did not open cleanly for @${u}; current=${page.url()}`);
-    await saveTechnicalRecoveryDebugSnapshot(page, u, 'profile_url_open_failed').catch(() => {});
+    logger.warn(`[compose-recovery] profile URL failed @${u} url=${page.url()}`);
     return {
       ok: false,
       reason: 'instagram_technical_error',
@@ -794,22 +723,15 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
   }
 
   composerVisible = await recoveryComposerVisible();
-  logger.log(`[compose-recovery] recovery composer visible on profile page for @${u}: ${composerVisible}`);
   if (composerVisible) {
     await saveAfterComposeRecoveryScreenshot(page, 'after-profile-url-fallback', u);
     return { ok: true, recoveryClicked: 'profile-url-fallback' };
   }
 
-  logger.log(
-    `[compose-recovery] profile CTA click result for @${u}: skipped_row_message_cta (relying on corner/thread composer only)`
-  );
-  await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_skip_profile_message_cta').catch(() => {});
   await delay(2200);
   await dismissInstagramHomeModals(page, logger).catch(() => {});
-  await saveTechnicalRecoveryDebugSnapshot(page, u, 'after_settle_no_row_cta').catch(() => {});
 
   const composerVisibleAfterMessage = await recoveryComposerVisible();
-  logger.log(`[compose-recovery] composer visible after settle (no row CTA) for @${u}: ${composerVisibleAfterMessage}`);
   if (composerVisibleAfterMessage) {
     await saveAfterComposeRecoveryScreenshot(page, 'profile-composer-visible-after-settle', u);
     return { ok: true, recoveryClicked: 'profile-composer-visible-after-settle' };
@@ -817,14 +739,12 @@ async function recoverInstagramTechnicalErrorViaProfile(page, username) {
 
   await delay(1200);
   const composerVisibleAfterWait = await recoveryComposerVisible();
-  logger.log(`[compose-recovery] composer visible after settle wait for @${u}: ${composerVisibleAfterWait}`);
   if (composerVisibleAfterWait) {
     await saveAfterComposeRecoveryScreenshot(page, 'profile-composer-visible-after-wait', u);
     return { ok: true, recoveryClicked: 'profile-composer-visible-after-wait' };
   }
 
-  await saveTechnicalRecoveryDebugSnapshot(page, u, 'final_failure').catch(() => {});
-
+  logger.warn(`[compose-recovery] recovery failed @${u}`);
   return {
     ok: false,
     reason: 'instagram_technical_error',
@@ -1332,9 +1252,39 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
   const followUps = normalizeColdFollowUpItems(settings.follow_ups);
   if (!followUps.length) return { processed: false };
 
+  const followUpWaitCapMs = Math.max(
+    60_000,
+    parseInt(process.env.COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_WAIT_MS || '', 10) || 15 * 60 * 1000
+  );
+  const { data: nextPending, error: nextErr } = await supabase
+    .from('cold_dm_follow_up_queue')
+    .select('id, username, scheduled_for')
+    .eq('client_id', clientId)
+    .eq('status', 'pending')
+    .order('scheduled_for', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (!nextErr && nextPending?.scheduled_for) {
+    const dueMs = new Date(nextPending.scheduled_for).getTime();
+    const slackMs = 500;
+    const msLeft = dueMs - Date.now() - slackMs;
+    if (msLeft > 0 && msLeft <= followUpWaitCapMs) {
+      logger.log(
+        `[follow-up-interleave] waiting ${Math.ceil(msLeft / 1000)}s until follow-up due (@${nextPending.username || '?'})`
+      );
+      await delay(msLeft);
+    } else if (msLeft > followUpWaitCapMs) {
+      logger.log(
+        `[follow-up-interleave] next follow-up in ${Math.ceil(msLeft / 60000)}m (>${Math.ceil(
+          followUpWaitCapMs / 60000
+        )}m worker cap) — use Supabase cron process-scheduled-responses / cold-dm follow-up path`
+      );
+    }
+  }
+
   const dueCutoffIso = new Date(Date.now() + Math.max(0, Number(options.lookAheadMs) || 0)).toISOString();
   logger.log(
-    `[follow-up-interleave] scanning queue for client ${clientId} session ${session.id} cutoff=${dueCutoffIso} items=${followUps.length}`
+    `[follow-up-interleave] scan client=${clientId} session=${session.id} cutoff=${dueCutoffIso} configuredSteps=${followUps.length}`
   );
   const { data: pendingRows, error: queueErr } = await supabase
     .from('cold_dm_follow_up_queue')
@@ -2652,7 +2602,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     const recovered = await recoverInstagramTechnicalErrorViaProfile(page, u);
     if (recovered.ok) {
       sendOpts.preferSendIcon = true;
-      logger.log(`[compose-recovery] technical error recovered for @${u}`);
+      logger.log(`[compose-recovery] recovered @${u}`);
     } else {
       return {
         ok: false,
@@ -2762,7 +2712,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     else if (bodySnippet.includes('couldn\'t find') || bodySnippet.includes('no results')) noComposeReason = 'user_not_found';
     if (!composeFound) {
       logger.warn('Compose wait failed ' + e.message + (noComposeReason !== 'no_compose' ? ' (page suggests: ' + noComposeReason + ')' : ''));
-      logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+      if (wantsDmComposeVerboseDiagnostics()) {
+        logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+      }
       await saveComposeFailureDebugScreenshot(page, u, noComposeReason || 'compose_missing');
     } else {
       logger.log('Compose recovery succeeded; composer detected after retry action.');
@@ -3470,11 +3422,13 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       if (nameDebug && nameDebug.winningPath === 'thread_identity_mismatch') {
         const diag = await runComposeDiagnostic(page, u).catch(() => ({}));
         logger.warn(`Thread identity mismatch for @${u}; aborting to avoid wrong-thread extraction/send.`);
-        logger.log('Compose diagnostic: ' + JSON.stringify(diag));
-        if (diag.paneScopedSnippet) {
-          logger.log(
-            'Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet
-          );
+        if (wantsDmComposeVerboseDiagnostics()) {
+          logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+          if (diag.paneScopedSnippet) {
+            logger.log(
+              'Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet
+            );
+          }
         }
         return {
           ok: false,
@@ -3565,11 +3519,13 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       fullNameOut = [derivedNames.first_name, derivedNames.last_name].filter(Boolean).join(' ');
     }
     const diag = await runComposeDiagnostic(page, u).catch(() => ({}));
-    logger.log('Compose diagnostic: ' + JSON.stringify(diag));
-    if (diag.paneScopedSnippet) {
-      logger.log(
-        'Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet
-      );
+    if (wantsDmComposeVerboseDiagnostics()) {
+      logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+      if (diag.paneScopedSnippet) {
+        logger.log(
+          'Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet
+        );
+      }
     }
     return {
       ok: composeFound,
@@ -3710,9 +3666,11 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 
   if (composeFound) {
     const diag = await runComposeDiagnostic(page, u).catch(() => ({}));
-    logger.log('Compose diagnostic: ' + JSON.stringify(diag));
-    if (diag.paneScopedSnippet) {
-      logger.log('Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet);
+    if (wantsDmComposeVerboseDiagnostics()) {
+      logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+      if (diag.paneScopedSnippet) {
+        logger.log('Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet);
+      }
     }
     noComposeReason = null;
 
@@ -5611,8 +5569,18 @@ async function runBotMultiTenant() {
         const delaySec = Math.max(1, Math.ceil(delayMs / 1000));
         const minSec = normalizedDelayWindow.minDelaySec;
         const maxSec = normalizedDelayWindow.maxDelaySec;
-        logger.log(`Campaign cooldown from settings ${minSec}-${maxSec}s. Next send in ${delaySec} sec.`);
-        sb.setClientStatusMessage(clientId, `Waiting. Campaign cooldown ${delaySec} sec (settings ${minSec}-${maxSec}s).`).catch(() => {});
+        let activeCampaignsLeft = 1;
+        if (sendResult.ok) {
+          activeCampaignsLeft = await sb.countActiveCampaignsForClient(clientId).catch(() => 1);
+        }
+        if (sendResult.ok && activeCampaignsLeft === 0) {
+          logger.log(
+            `Campaign cooldown ${delaySec}s applied to send jobs only (no active campaigns; dashboard status left as Completed.)`
+          );
+        } else {
+          logger.log(`Campaign cooldown from settings ${minSec}-${maxSec}s. Next send in ${delaySec} sec.`);
+          sb.setClientStatusMessage(clientId, `Waiting. Campaign cooldown ${delaySec} sec (settings ${minSec}-${maxSec}s).`).catch(() => {});
+        }
         if (!sendResult.ok) {
           sendJobStatus = 'failed';
           sendJobUpdates = {

@@ -4664,6 +4664,19 @@ async function updateCampaignLeadStatus(campaignLeadId, status, failureReason = 
   }
 }
 
+/** Active cold_dm_campaigns rows for this client (status = active). */
+async function countActiveCampaignsForClient(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return 0;
+  const { count, error } = await sb
+    .from('cold_dm_campaigns')
+    .select('*', { count: 'exact', head: true })
+    .eq('client_id', clientId)
+    .eq('status', 'active');
+  if (error) return 1;
+  return Number(count ?? 0);
+}
+
 module.exports = {
   getSupabase,
   isSupabaseConfigured,
@@ -4756,6 +4769,7 @@ module.exports = {
   getMessageTemplateById,
   getNextPendingCampaignLead,
   updateCampaignLeadStatus,
+  countActiveCampaignsForClient,
   getClientIdsWithPauseZero,
   getDistinctActiveCampaignIdsWithReadySendJobs,
   getClientSendCampaignTurn,
