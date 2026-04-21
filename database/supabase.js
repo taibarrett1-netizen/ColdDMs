@@ -3286,63 +3286,35 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
   }
   if (rows.length === 0) return 0;
   let inserted = 0;
-  // 1) Preferred path: idempotent upsert on unique index.
-  const upsertRes = await sb.from('cold_dm_send_jobs').upsert(rows, {
-    onConflict: 'client_id,idempotency_key',
-    ignoreDuplicates: false,
-  });
-  if (!upsertRes.error) {
-    inserted = rows.length;
-  } else {
-    const upMsg = String(upsertRes.error?.message || '').toLowerCase();
-    const canFallbackInsert =
-      upsertRes.error?.code === '42P10' || // conflict index mismatch
-      upsertRes.error?.code === '42703' || // missing column
-      upMsg === 'bad request' ||
-      upMsg.includes('does not exist');
-    if (!canFallbackInsert) {
-      throw upsertRes.error;
+  // Insert rows individually so we don't depend on a specific conflict-target shape in older databases.
+  // The deterministic idempotency_key still protects us from duplicates at the row level.
+  for (const row of rows) {
+    const r = await sb.from('cold_dm_send_jobs').insert(row);
+    if (!r.error) {
+      inserted += 1;
+      continue;
     }
-    console.error(
-      '[syncSendJobsForCampaign] upsert failed; falling back to insert strategies',
-      JSON.stringify({
-        code: upsertRes.error?.code || null,
-        message: upsertRes.error?.message || String(upsertRes.error),
-        details: upsertRes.error?.details || null,
-      })
-    );
-
-    // 2) Insert with idempotency_key (ignore duplicates manually).
-    let insertedViaIdempotency = 0;
-    for (const row of rows) {
-      const r = await sb.from('cold_dm_send_jobs').insert(row);
-      if (!r.error) {
-        insertedViaIdempotency += 1;
-        continue;
-      }
-      const msg = String(r.error?.message || '').toLowerCase();
-      const duplicate = r.error?.code === '23505' || msg.includes('duplicate key');
-      if (duplicate) continue;
-      // 3) Older schema fallback: minimal row shape (omit payload/priority/idempotency_key).
-      const minimal = {
-        client_id: row.client_id,
-        campaign_id: row.campaign_id,
-        campaign_lead_id: row.campaign_lead_id,
-        username: row.username,
-        status: 'pending',
-        available_at: row.available_at,
-      };
-      const r2 = await sb.from('cold_dm_send_jobs').insert(minimal);
-      if (!r2.error) {
-        insertedViaIdempotency += 1;
-        continue;
-      }
-      const msg2 = String(r2.error?.message || '').toLowerCase();
-      const duplicate2 = r2.error?.code === '23505' || msg2.includes('duplicate key');
-      if (duplicate2) continue;
-      throw r2.error;
+    const msg = String(r.error?.message || '').toLowerCase();
+    const duplicate = r.error?.code === '23505' || msg.includes('duplicate key');
+    if (duplicate) continue;
+    // Older schema fallback: minimal row shape (omit payload/priority/idempotency_key).
+    const minimal = {
+      client_id: row.client_id,
+      campaign_id: row.campaign_id,
+      campaign_lead_id: row.campaign_lead_id,
+      username: row.username,
+      status: 'pending',
+      available_at: row.available_at,
+    };
+    const r2 = await sb.from('cold_dm_send_jobs').insert(minimal);
+    if (!r2.error) {
+      inserted += 1;
+      continue;
     }
-    inserted = insertedViaIdempotency;
+    const msg2 = String(r2.error?.message || '').toLowerCase();
+    const duplicate2 = r2.error?.code === '23505' || msg2.includes('duplicate key');
+    if (duplicate2) continue;
+    throw r2.error;
   }
   console.log(`[syncSendJobsForCampaign] created ${inserted} send job(s) for campaign ${campaignId}`);
   return inserted;
