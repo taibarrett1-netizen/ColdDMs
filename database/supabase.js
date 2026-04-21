@@ -1198,8 +1198,67 @@ async function alreadySent(clientId, username) {
   return !!data;
 }
 
+const COLD_DM_MAX_FOLLOW_UP_STEPS = 5;
+const COLD_DM_MAX_FOLLOW_UP_DELAY_MINUTES = 30 * 24 * 60;
+
+function normalizeColdDmFollowUpsFromSettings(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (let i = 0; i < raw.length && out.length < COLD_DM_MAX_FOLLOW_UP_STEPS; i++) {
+    const item = raw[i];
+    const type = item?.type;
+    const content = typeof item?.content === 'string' ? item.content.trim() : '';
+    const delay = typeof item?.delay_minutes === 'number' ? Math.floor(item.delay_minutes) : NaN;
+    if (type != null && type !== '' && type !== 'text') continue;
+    if (!content || !Number.isFinite(delay) || delay < 1 || delay > COLD_DM_MAX_FOLLOW_UP_DELAY_MINUTES) continue;
+    const id = typeof item?.id === 'string' && item.id.trim() ? item.id.trim() : `cold-fu-${i + 1}`;
+    out.push({ id, content, delay_minutes: delay });
+  }
+  return out;
+}
+
+/** Upsert cold_dm_follow_up_queue rows right after a successful send (edge cron also enqueues; this fixes interleaved worker). */
+async function enqueueColdDmFollowUpsForSentRow(clientId, sentRow) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !sentRow?.id || !sentRow?.sent_at || !sentRow?.username) return;
+  try {
+    const { data: settings, error: stErr } = await sb
+      .from('cold_dm_settings')
+      .select('follow_ups_enabled, follow_ups')
+      .eq('client_id', clientId)
+      .maybeSingle();
+    if (stErr || !settings || settings.follow_ups_enabled === false) return;
+    const items = normalizeColdDmFollowUpsFromSettings(settings.follow_ups);
+    if (!items.length) return;
+    const sentAtMs = new Date(sentRow.sent_at).getTime();
+    if (!Number.isFinite(sentAtMs)) return;
+    const nowIso = new Date().toISOString();
+    const uname = normalizeUsername(sentRow.username);
+    const rows = items.map((item, i) => ({
+      client_id: clientId,
+      source_sent_message_id: sentRow.id,
+      message_group_id: sentRow.message_group_id || null,
+      follow_up_index: i,
+      follow_up_id: item.id,
+      username: uname,
+      instagram_thread_id: sentRow.instagram_thread_id || null,
+      source_sent_at: sentRow.sent_at,
+      scheduled_for: new Date(sentAtMs + item.delay_minutes * 60 * 1000).toISOString(),
+      status: 'pending',
+      updated_at: nowIso,
+    }));
+    const { error: insErr } = await sb.from('cold_dm_follow_up_queue').upsert(rows, {
+      onConflict: 'client_id,source_sent_message_id,follow_up_index',
+      ignoreDuplicates: true,
+    });
+    if (insErr) console.error('[enqueueColdDmFollowUpsForSentRow]', insErr.message);
+  } catch (e) {
+    console.error('[enqueueColdDmFollowUpsForSentRow]', e && e.message ? e.message : e);
+  }
+}
+
 /**
- * @param {{ skipDailyStats?: boolean }} [options] - If skipDailyStats, insert cold_dm_sent_messages only (e.g. pre-send blocklist skip).
+ * @param {{ skipDailyStats?: boolean, instagramThreadId?: string }} [options] - skipDailyStats: insert only. instagramThreadId: stored on sent row for follow-up queue.
  */
 async function logSentMessage(
   clientId,
@@ -1235,8 +1294,20 @@ async function logSentMessage(
   if (messageGroupId) insertPayload.message_group_id = messageGroupId;
   if (messageGroupMessageId) insertPayload.message_group_message_id = messageGroupMessageId;
   if (status === 'failed' && failureReason) insertPayload.failure_reason = failureReason;
-  const { error: insertErr } = await sb.from('cold_dm_sent_messages').insert(insertPayload);
+  if (options && options.instagramThreadId) {
+    insertPayload.instagram_thread_id = String(options.instagramThreadId);
+  }
+  const { data: insertedRows, error: insertErr } = await sb
+    .from('cold_dm_sent_messages')
+    .insert(insertPayload)
+    .select('id, sent_at, username, message_group_id, message_group_message_id, instagram_thread_id');
   if (insertErr) throw insertErr;
+  const insertedRow = Array.isArray(insertedRows) ? insertedRows[0] : null;
+  if (status === 'success' && insertedRow) {
+    await enqueueColdDmFollowUpsForSentRow(clientId, insertedRow).catch((e) => {
+      console.error('[logSentMessage] follow-up enqueue failed:', e && e.message ? e.message : e);
+    });
+  }
   logColdDmMetricsDebug('insert cold_dm_sent_messages ok', {
     clientId,
     username: u,

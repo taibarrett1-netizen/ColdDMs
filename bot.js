@@ -4466,8 +4466,17 @@ async function sendDM(page, username, adapter, options = {}) {
   const messageTemplate = messageOverride || adapter.getRandomMessage();
   const resolvedVoicePath = (options.voice_note_path || options.voiceNotePath || VOICE_NOTE_FILE || '').trim();
   const resolvedVoiceMode = (options.voice_note_mode || options.voiceNoteMode || VOICE_NOTE_MODE || 'after_text').trim().toLowerCase();
-  const logSent = (status, finalMsg, failureReason = null) =>
-    adapter.logSentMessage(u, finalMsg != null ? finalMsg : messageTemplate, status, campaignId, messageGroupId, messageGroupMessageId, failureReason);
+  const logSent = (status, finalMsg, failureReason = null, extraOpts = {}) =>
+    adapter.logSentMessage(
+      u,
+      finalMsg != null ? finalMsg : messageTemplate,
+      status,
+      campaignId,
+      messageGroupId,
+      messageGroupMessageId,
+      failureReason,
+      extraOpts
+    );
 
   let lastError;
   const nameFallback = {
@@ -4536,7 +4545,11 @@ async function sendDM(page, username, adapter, options = {}) {
           await doLightInstagramBrowse(page, 'after_send');
         }
         const finalMessage = result.finalMessage != null ? result.finalMessage : (resolvedVoiceMode === 'voice_only' ? '' : messageTemplate);
-        await Promise.resolve(logSent('success', finalMessage));
+        await Promise.resolve(
+          logSent('success', finalMessage, null, {
+            instagramThreadId: result.instagramThreadId || undefined,
+          })
+        );
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent', null, sendWorkerId).catch(() => {});
         if (options.clientId && (result.display_name || result.first_name || result.last_name) && typeof sb.upsertLeadIdentity === 'function') {
           sb.upsertLeadIdentity(options.clientId, u, {
@@ -4705,8 +4718,8 @@ async function buildAdapterForClient(clientId) {
     dailyLimit: normalizeColdOutreachDailyLimit(settings?.daily_send_limit ?? 100),
     maxPerHour: settings?.max_sends_per_hour ?? 20,
     alreadySent: (u) => sb.alreadySent(clientId, u),
-    logSentMessage: (u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason) =>
-      sb.logSentMessage(clientId, u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason),
+    logSentMessage: (u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason, extraOpts) =>
+      sb.logSentMessage(clientId, u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason, extraOpts || {}),
     getDailyStats: async (campaignId = null, campaignDailyLimit = null) => {
       if (campaignId && campaignDailyLimit != null && Number.isFinite(Number(campaignDailyLimit))) {
         const limits = await sb.getCampaignLimitsById(campaignId).catch(() => null);
@@ -4776,44 +4789,49 @@ async function runBotMultiTenant() {
   let leasedSessionIdForSignal = null;
   /** Campaign currently leased by this worker (one at a time). */
   let leasedCampaignIdForSignal = null;
+  /** Dashboard Stop / PM2 SIGINT: finish current send + follow-up delivery; skip long cosmetic sleeps, then exit between jobs. */
+  let sendWorkerGracefulShutdown = false;
+  /** Second signal: immediate exit (leases best-effort). */
+  let sendWorkerForceExit = false;
   /** Concurrency debug signal: only log claim when client changes. */
   let lastClaimedClientIdForDebug = null;
-  process.once('SIGTERM', () => {
-    void (async () => {
-      const sid = leasedSessionIdForSignal;
-      if (sid) {
-        logger.warn('[send-worker] SIGTERM: releasing Instagram session lease');
-        await sb.releaseInstagramSessionLease(sid, SEND_WORKER_ID).catch(() => {});
-        leasedSessionIdForSignal = null;
+
+  async function drainSleep(ms, label) {
+    if (!ms || ms < 1) return;
+    const chunk = 500;
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (sendWorkerForceExit) return;
+      if (sendWorkerGracefulShutdown) {
+        logger.log(
+          `[send-worker] drain: skipping "${label}" (${Math.max(0, Math.ceil((end - Date.now()) / 1000))}s left) — shutdown requested`
+        );
+        return;
       }
-      const campaignId = leasedCampaignIdForSignal;
-      if (campaignId) {
-        logger.warn('[send-worker] SIGTERM: releasing campaign send lease');
-        await sb.releaseCampaignSendLease(campaignId, SEND_WORKER_ID).catch(() => {});
-        leasedCampaignIdForSignal = null;
-      }
-      await sb.releaseAllCampaignSendLeases(SEND_WORKER_ID).catch(() => {});
-      process.exit(0);
-    })();
-  });
-  process.once('SIGINT', () => {
-    void (async () => {
-      const sid = leasedSessionIdForSignal;
-      if (sid) {
-        logger.warn('[send-worker] SIGINT: releasing Instagram session lease');
-        await sb.releaseInstagramSessionLease(sid, SEND_WORKER_ID).catch(() => {});
-        leasedSessionIdForSignal = null;
-      }
-      const campaignId = leasedCampaignIdForSignal;
-      if (campaignId) {
-        logger.warn('[send-worker] SIGINT: releasing campaign send lease');
-        await sb.releaseCampaignSendLease(campaignId, SEND_WORKER_ID).catch(() => {});
-        leasedCampaignIdForSignal = null;
-      }
-      await sb.releaseAllCampaignSendLeases(SEND_WORKER_ID).catch(() => {});
-      process.exit(0);
-    })();
-  });
+      await delay(Math.min(chunk, Math.max(1, end - Date.now())));
+    }
+  }
+
+  function onSendWorkerShutdownSignal(sig) {
+    if (sendWorkerForceExit) return;
+    if (sendWorkerGracefulShutdown) {
+      sendWorkerForceExit = true;
+      logger.warn(`[send-worker] ${sig} again — forcing exit`);
+      void (async () => {
+        await sb.releaseAllCampaignSendLeases(SEND_WORKER_ID).catch(() => {});
+        await sb.releaseAllInstagramSessionLeases().catch(() => {});
+        process.exit(sig === 'SIGINT' ? 130 : 0);
+      })();
+      return;
+    }
+    sendWorkerGracefulShutdown = true;
+    logger.warn(
+      `[send-worker] ${sig}: graceful drain — completing in-flight send + follow-up sends; long cooldown sleeps will be skipped`
+    );
+  }
+
+  process.on('SIGTERM', () => onSendWorkerShutdownSignal('SIGTERM'));
+  process.on('SIGINT', () => onSendWorkerShutdownSignal('SIGINT'));
 
   function proxyKeyForSession(session) {
     return session && session.proxy_url ? String(session.proxy_url).trim() : '';
@@ -4975,6 +4993,13 @@ async function runBotMultiTenant() {
   for (;;) {
     await sb.workerHeartbeat(SEND_WORKER_ID, 'send', { pid: process.pid }).catch(() => {});
 
+    if (sendWorkerGracefulShutdown && !sendWorkerForceExit) {
+      logger.log('[send-worker] graceful shutdown: leaving main loop (current job finished; leases released in finally)');
+      await invalidateSendWorkerBrowser('graceful shutdown');
+      await sb.releaseAllCampaignSendLeases(SEND_WORKER_ID).catch(() => {});
+      process.exit(0);
+    }
+
     let pinnedCampaignIdsForClaim = null;
     /** When true, pinning is on but we must not claim without p_campaign_ids (avoids duplicate workers on one campaign/session). */
     let pinForcedIdle = false;
@@ -5011,6 +5036,12 @@ async function runBotMultiTenant() {
     }
 
     if (pinForcedIdle) {
+      if (sendWorkerGracefulShutdown) {
+        logger.log('[send-worker] graceful shutdown: exiting during campaign-pin idle');
+        await invalidateSendWorkerBrowser('graceful shutdown');
+        await sb.releaseAllCampaignSendLeases(SEND_WORKER_ID).catch(() => {});
+        process.exit(0);
+      }
       throttlePinIdleLog(`[send-worker] ${pinForcedIdleDetail}`);
       await delay(randomDelay(20000, 40000));
       continue;
@@ -5659,7 +5690,7 @@ async function runBotMultiTenant() {
                 )} sec before the next cold outreach send.`
               )
               .catch(() => {});
-            await delay(afterFollowUpDelayMs);
+            await drainSleep(afterFollowUpDelayMs, 'inter-send spacing after follow-up');
           }
 
           const elapsedMs = Date.now() - cooldownWindowStart;
@@ -5670,7 +5701,7 @@ async function runBotMultiTenant() {
                 elapsedMs / 1000
               )}s already used in ${delaySec}s window)`
             );
-            await delay(remainderMs);
+            await drainSleep(remainderMs, 'campaign cooldown remainder');
           }
 
           delayMs = 0;
@@ -5697,7 +5728,7 @@ async function runBotMultiTenant() {
           await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, cooldownUntilIso).catch(() => {});
           await delay(500);
         } else {
-          await delay(Math.min(delayMs, 1500));
+          await drainSleep(Math.min(delayMs, 1500), 'send job tail delay');
         }
       }
     } catch (e) {
