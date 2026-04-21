@@ -67,7 +67,10 @@ async function processOneJob(workerId, job) {
     if (sessionRow?.scrape_cooldown_until) {
       const scrapeCooldownUntilMs = new Date(sessionRow.scrape_cooldown_until).getTime();
       const cooldownRemainingMs = scrapeCooldownUntilMs - Date.now();
-      if (Number.isFinite(cooldownRemainingMs) && cooldownRemainingMs > 0) {
+      // claim_cold_dm_scrape_job sets a 5-minute session cooldown at claim time to prevent
+      // parallel claims. The job that just won the claim must still run.
+      const claimedThisRun = job.status === 'running' && job.leased_by_worker === workerId;
+      if (Number.isFinite(cooldownRemainingMs) && cooldownRemainingMs > 0 && !claimedThisRun) {
         await sb
           .retryScrapeJob(job.id, 'scrape_cooldown', Math.ceil(cooldownRemainingMs / 1000), workerId)
           .catch(() => {});
