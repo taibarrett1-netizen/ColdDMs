@@ -1095,8 +1095,13 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     let scrollCount = 0;
     let lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
     let stuckModalCount = 0;
+    let loopIter = 0;
 
     while (true) {
+      loopIter++;
+      logger.log(
+        `[Scraper][Loop ${loopIter}] Start: total=${newInsertsTotal} noNew=${noNewCount}/${MAX_NO_NEW} scrollCount=${scrollCount}`
+      );
       const jobCheck = await getScrapeJob(jobId);
       if (jobCheck && jobCheck.status === 'cancelled') {
         logger.log('[Scraper] Job cancelled');
@@ -1237,6 +1242,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       if (quotaStatus && newLeads.length > quotaStatus.remaining) {
         newLeads = newLeads.slice(0, quotaStatus.remaining);
       }
+      logger.log(
+        `[Scraper][Loop ${loopIter}] Extracted=${batch.length} candidates; after filters=${newLeads.length}; quotaRemaining=${quotaStatus?.remaining ?? 'n/a'}`
+      );
       for (const lead of newLeads) {
         const u = (typeof lead === 'string' ? lead : lead.username).trim().replace(/^@/, '').toLowerCase();
         seenUsernames.add(u);
@@ -1314,6 +1322,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         if (loadResult.exhausted) {
           exhaustedThisIter = true;
         }
+        logger.log(
+          `[Scraper][Loop ${loopIter}] Scroll chunk ${batchIndex + 1}/3: scrolled=${!!scrolled} moved=${!!loadResult.moved} loadedMore=${!!loadResult.loadedMore} exhausted=${!!loadResult.exhausted}`
+        );
 
         if (batchIndex < 2 && Math.random() < 0.35) {
           await randomMouseDrift(page, { totalDurationMs: randomDelay(250, 700) }).catch(() => {});
@@ -1346,6 +1357,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
             exhaustedThisIter = true;
             break;
           }
+          logger.log(
+            `[Scraper][Loop ${loopIter}] Retry ${loadRetries + 1}/${LOAD_WAIT_RETRIES}: moved=${!!retryResult.moved} loadedMore=${!!retryResult.loadedMore} exhausted=${!!retryResult.exhausted}`
+          );
 
           loadRetries++;
           await delay(randomDelay(800, 1800));
@@ -1374,6 +1388,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         (stuckModalCount >= 2 || (!anyScrollThisIter && hadNoNewThisIter)) &&
         (await maybeRefreshInstagramListModal(page, cleanTarget, listKind, logger, `stuck=${stuckModalCount}`))
       ) {
+        logger.log(
+          `[Scraper][Loop ${loopIter}] Modal refresh triggered (stuckModalCount=${stuckModalCount}, hadNoNew=${hadNoNewThisIter})`
+        );
         stuckModalCount = 0;
         lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
         await delay(randomDelay(12000, 35000));
@@ -1389,6 +1406,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         );
         break;
       }
+      logger.log(
+        `[Scraper][Loop ${loopIter}] End: hadNoNew=${hadNoNewThisIter} noNew=${noNewCount}/${MAX_NO_NEW} anyScroll=${anyScrollThisIter} loadedMore=${loadedMoreThisIter} exhausted=${exhaustedThisIter} stuckModalCount=${stuckModalCount} retryLoadHit=${weGotMoreFromWaitRetry}`
+      );
 
       await organicPause('between_actions', 1.6);
     }

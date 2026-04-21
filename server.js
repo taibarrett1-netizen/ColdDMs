@@ -519,6 +519,41 @@ async function ensureSendWorkerProcess() {
 }
 
 const STATUS_TIMEOUT_MS = 8000; // respond before typical Edge Function timeouts (~10–15s); status uses fast queries
+const STATUS_COMPONENT_TIMEOUT_MS = Math.max(
+  1200,
+  parseInt(process.env.STATUS_COMPONENT_TIMEOUT_MS || '3200', 10) || 3200
+);
+const STATUS_SLOW_COMPONENT_LOG_MS = Math.max(
+  250,
+  parseInt(process.env.STATUS_SLOW_COMPONENT_LOG_MS || '1200', 10) || 1200
+);
+
+function timeoutAfter(ms, label) {
+  return new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+}
+
+async function settleStatusComponent(label, promise, fallbackValue) {
+  const startedAt = Date.now();
+  try {
+    const value = await Promise.race([
+      Promise.resolve(promise),
+      timeoutAfter(STATUS_COMPONENT_TIMEOUT_MS, label),
+    ]);
+    const elapsedMs = Date.now() - startedAt;
+    if (elapsedMs >= STATUS_SLOW_COMPONENT_LOG_MS) {
+      console.warn(`[API] /api/status slow component ${label}: ${elapsedMs}ms`);
+    }
+    return { ok: true, value, elapsedMs };
+  } catch (err) {
+    const elapsedMs = Date.now() - startedAt;
+    console.warn(
+      `[API] /api/status component fallback ${label}: ${elapsedMs}ms (${err?.message || err})`
+    );
+    return { ok: false, value: fallbackValue, elapsedMs, error: err };
+  }
+}
 
 // --- API: health (for proxy/dashboard connectivity check; no DB or pm2) ---
 app.get('/api/health', (req, res) => {
@@ -527,84 +562,96 @@ app.get('/api/health', (req, res) => {
 
 // --- API: status & stats ---
 // Returns immediately using only fast queries and stored status (set by the sender loop). No schedule recomputation.
-app.get('/api/status', (req, res) => {
+app.get('/api/status', async (req, res) => {
   const clientId = resolveRequestedClientId(req);
   if (req.authClientId && clientId && req.authClientId !== clientId) {
     return res.status(403).json({ error: 'Forbidden: clientId mismatch for provided API key' });
   }
   const useSupabase = isSupabaseConfigured() && clientId;
-  let responded = false;
-  const send = (status, body) => {
-    if (responded) return;
-    responded = true;
-    clearTimeout(timer);
-    res.status(status).json(body);
-  };
-  const timer = setTimeout(() => {
-    if (responded) return;
-    console.warn('[API] /api/status timeout – responding 503');
-    send(503, {
-      error: 'Status request timed out. Try again.',
-      processRunning: false,
-      statusMessage: null,
-      todaySent: 0,
-      todayFailed: 0,
-      leadsTotal: 0,
-      leadsRemaining: 0,
-    });
-  }, STATUS_TIMEOUT_MS);
+  const requestStartedAt = Date.now();
 
-  const processRunningPromise = new Promise((resolve) => getBotProcessRunning(resolve));
-
-  (async () => {
-    try {
-      if (useSupabase) {
-        const [processRunningPm2, stats, statusMessage, leadsCounts, pauseFlag] = await Promise.all([
-          processRunningPromise,
-          getDailyStatsSupabase(clientId),
-          getClientStatusMessageSupabase(clientId),
-          getLeadsTotalAndRemaining(clientId),
-          getControlSupabase(clientId),
+  try {
+    if (useSupabase) {
+      const [processRunningPm2Res, statsRes, statusMessageRes, leadsCountsRes, pauseFlagRes] =
+        await Promise.all([
+          settleStatusComponent(
+            'pm2_running',
+            new Promise((resolve) => getBotProcessRunning(resolve)),
+            false
+          ),
+          settleStatusComponent('daily_stats', getDailyStatsSupabase(clientId), {
+            total_sent: 0,
+            total_failed: 0,
+          }),
+          settleStatusComponent('status_message', getClientStatusMessageSupabase(clientId), null),
+          settleStatusComponent('lead_counts', getLeadsTotalAndRemaining(clientId), {
+            total: 0,
+            remaining: 0,
+          }),
+          settleStatusComponent('control_pause', getControlSupabase(clientId), '1'),
         ]);
-        const paused = pauseFlag === '1' || pauseFlag === 1;
-        const processRunning = processRunningPm2 && !paused;
-        send(200, {
-          processRunning,
-          statusMessage: statusMessage ?? (processRunning ? null : 'Stopped'),
-          todaySent: stats.total_sent,
-          todayFailed: stats.total_failed,
-          leadsTotal: leadsCounts.total,
-          leadsRemaining: leadsCounts.remaining,
-        });
-      } else {
-        const processRunning = await processRunningPromise;
-        const stats = getDailyStats();
-        loadLeadsFromCSV(leadsPath)
-          .then((leads) => {
-            const leadsRemaining = leads.filter((u) => !alreadySent(u)).length;
-            send(200, {
-              processRunning,
-              todaySent: stats.total_sent,
-              todayFailed: stats.total_failed,
-              leadsTotal: leads.length,
-              leadsRemaining,
-            });
-          })
-          .catch(() => {
-            send(200, {
-              processRunning,
-              todaySent: stats.total_sent,
-              todayFailed: stats.total_failed,
-              leadsTotal: 0,
-              leadsRemaining: 0,
-            });
-          });
+
+      const paused = pauseFlagRes.value === '1' || pauseFlagRes.value === 1;
+      const processRunning = processRunningPm2Res.value && !paused;
+      const degraded =
+        !processRunningPm2Res.ok ||
+        !statsRes.ok ||
+        !statusMessageRes.ok ||
+        !leadsCountsRes.ok ||
+        !pauseFlagRes.ok;
+
+      if (degraded) {
+        const failedLabels = [
+          !processRunningPm2Res.ok ? 'pm2_running' : null,
+          !statsRes.ok ? 'daily_stats' : null,
+          !statusMessageRes.ok ? 'status_message' : null,
+          !leadsCountsRes.ok ? 'lead_counts' : null,
+          !pauseFlagRes.ok ? 'control_pause' : null,
+        ]
+          .filter(Boolean)
+          .join(', ');
+        console.warn(
+          `[API] /api/status degraded response for client=${clientId} after ${Date.now() - requestStartedAt}ms; failed=${failedLabels}`
+        );
+      } else if (Date.now() - requestStartedAt >= STATUS_TIMEOUT_MS) {
+        console.warn(
+          `[API] /api/status exceeded target timeout (${Date.now() - requestStartedAt}ms) without failure`
+        );
       }
-    } catch (e) {
-      console.error('[API] Status error', e);
-      send(500, { error: e.message });
+
+      return res.status(200).json({
+        processRunning,
+        statusMessage: statusMessageRes.value ?? (processRunning ? null : 'Stopped'),
+        todaySent: statsRes.value.total_sent ?? 0,
+        todayFailed: statsRes.value.total_failed ?? 0,
+        leadsTotal: leadsCountsRes.value.total ?? 0,
+        leadsRemaining: leadsCountsRes.value.remaining ?? 0,
+        statusDegraded: degraded,
+      });
     }
-  })();
+
+    const processRunningRes = await settleStatusComponent(
+      'pm2_running',
+      new Promise((resolve) => getBotProcessRunning(resolve)),
+      false
+    );
+    const stats = getDailyStats();
+    const leadsRes = await settleStatusComponent('csv_leads', loadLeadsFromCSV(leadsPath), []);
+    const leads = Array.isArray(leadsRes.value) ? leadsRes.value : [];
+    const leadsRemaining = leads.filter((u) => !alreadySent(u)).length;
+    const degraded = !processRunningRes.ok || !leadsRes.ok;
+    return res.status(200).json({
+      processRunning: processRunningRes.value,
+      todaySent: stats.total_sent,
+      todayFailed: stats.total_failed,
+      leadsTotal: leads.length,
+      leadsRemaining,
+      statusDegraded: degraded,
+    });
+  } catch (e) {
+    console.error('[API] Status error', e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/api/stats', (req, res) => {
