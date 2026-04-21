@@ -571,7 +571,7 @@ async function getSessions(clientId) {
   try {
     const { data, error } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, scrape_cooldown_until')
       .eq('client_id', clientId)
       .order('id', { ascending: true });
     if (error) throw error;
@@ -579,7 +579,7 @@ async function getSessions(clientId) {
   } catch (e) {
     const { data, error } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh, scrape_cooldown_until')
       .eq('client_id', clientId)
       .order('id', { ascending: true });
     if (error) throw error;
@@ -608,7 +608,7 @@ async function getSessionsForCampaign(clientId, campaignId) {
     try {
       const { data: sessions, error: sessErr } = await sb
         .from('cold_dm_instagram_sessions')
-        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh')
+        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, scrape_cooldown_until')
         .eq('client_id', clientId)
         .in('id', ids)
         .order('id', { ascending: true });
@@ -617,7 +617,7 @@ async function getSessionsForCampaign(clientId, campaignId) {
     } catch (e) {
       const { data: sessions, error: sessErr } = await sb
         .from('cold_dm_instagram_sessions')
-        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh')
+        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh, scrape_cooldown_until')
         .eq('client_id', clientId)
         .in('id', ids)
         .order('id', { ascending: true });
@@ -1055,6 +1055,17 @@ async function updateInstagramSessionProxy(sessionId, proxyOpts = {}) {
     .from('cold_dm_instagram_sessions')
     .update(update)
     .eq('id', sessionId);
+  if (error) throw error;
+}
+
+async function updateInstagramSessionScrapeCooldown(sessionId, cooldownUntilIso) {
+  const sb = getSupabase();
+  if (!sb || !sessionId) throw new Error('Supabase or sessionId missing');
+  const payload = {
+    scrape_cooldown_until: cooldownUntilIso || null,
+    updated_at: new Date().toISOString(),
+  };
+  const { error } = await sb.from('cold_dm_instagram_sessions').update(payload).eq('id', sessionId);
   if (error) throw error;
 }
 
@@ -1840,6 +1851,21 @@ async function getRecentSent(clientId, limit = 50) {
     .limit(Math.min(limit, 200));
   if (error) throw error;
   return data || [];
+}
+
+async function getLatestSuccessfulColdDmSentAt(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return null;
+  const { data, error } = await sb
+    .from('cold_dm_sent_messages')
+    .select('sent_at')
+    .eq('client_id', clientId)
+    .eq('status', 'success')
+    .order('sent_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data?.sent_at || null;
 }
 
 async function getSentUsernames(clientId) {
@@ -3972,6 +3998,43 @@ async function getMostSpecificNoWorkHint(clientId) {
     // active campaign with pending leads was outside its send window (schedule is checked in the worker only).
     const outsideMsg = await getClientOutsideScheduleStatus(clientId);
     if (outsideMsg) return outsideMsg;
+
+    const settings = await getSettings(clientId).catch(() => null);
+    const clientTz = settings?.timezone ?? null;
+    const [stats, hourlySent] = await Promise.all([
+      getDailyStats(clientId).catch(() => ({ total_sent: 0, total_failed: 0 })),
+      getHourlySent(clientId).catch(() => 0),
+    ]);
+    const pendingCampaignsInSchedule = [];
+    for (const camp of campaigns) {
+      const { count: campPending } = await sb
+        .from('cold_dm_campaign_leads')
+        .select('*', { count: 'exact', head: true })
+        .eq('campaign_id', camp.id)
+        .eq('status', 'pending');
+      if ((campPending ?? 0) === 0) continue;
+      if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, camp.timezone ?? null)) continue;
+      pendingCampaignsInSchedule.push(camp);
+    }
+
+    const blockedDaily = pendingCampaignsInSchedule.find(
+      (camp) => camp.daily_send_limit != null && stats.total_sent >= camp.daily_send_limit
+    );
+    if (blockedDaily) {
+      const resumeAt = getNextMidnightInTimezone(clientTz);
+      const resumeText = resumeAt ? ` Next send window opens ${resumeAt.toISOString().slice(0, 16)} UTC.` : '';
+      return `Campaign "${blockedDaily.name || blockedDaily.id}" hit its daily limit.${resumeText}`;
+    }
+
+    const blockedHourly = pendingCampaignsInSchedule.find(
+      (camp) => camp.hourly_send_limit != null && hourlySent >= camp.hourly_send_limit
+    );
+    if (blockedHourly) {
+      const resumeAt = getNextHourStartInTimezone(clientTz);
+      const resumeText = resumeAt ? ` Next send window opens ${resumeAt.toISOString().slice(0, 16)} UTC.` : '';
+      return `Campaign "${blockedHourly.name || blockedHourly.id}" hit its hourly limit.${resumeText}`;
+    }
+
     return '';
   }
   return 'No campaigns with pending leads.';
@@ -4549,6 +4612,7 @@ module.exports = {
   pauseClientAndAlert,
   getClientStatusMessage,
   getRecentSent,
+  getLatestSuccessfulColdDmSentAt,
   getSentUsernames,
   clearFailedAttempts,
   updateSettingsInstagramUsername,
@@ -4619,6 +4683,7 @@ module.exports = {
   serviceSetInstagrapiSettings,
   serviceSetInstagrapiState,
   updateInstagramSessionProxy,
+  updateInstagramSessionScrapeCooldown,
   syncSendJobsForCampaign,
   syncSendJobsForClient,
   buildSendWorkFromJob,

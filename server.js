@@ -43,6 +43,7 @@ const {
   releaseAllInstagramSessionLeases,
   releaseAllCampaignSendLeases,
   getClientIdsWithPauseZero,
+  getLatestSuccessfulColdDmSentAt,
 } = require('./database/supabase');
 const {
   loadLeadsFromCSV,
@@ -222,6 +223,21 @@ const uploadVoice = multer({ dest: voiceNotesDir, limits: { fileSize: 25 * 1024 
 const BOT_PM2_NAME = 'ig-dm-send';
 const SEND_WORKER_ENTRY = process.env.SEND_WORKER_ENTRY || 'workers/send-worker.js';
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
+const SEND_SCRAPE_COOLDOWN_MS = Math.max(
+  60 * 1000,
+  parseInt(process.env.SEND_SCRAPE_COOLDOWN_MS || String(5 * 60 * 1000), 10) || 5 * 60 * 1000
+);
+
+function formatDurationShort(ms) {
+  const safeMs = Math.max(0, Number(ms) || 0);
+  const totalSec = Math.ceil(safeMs / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const min = Math.ceil(totalSec / 60);
+  if (min < 60) return `${min}m`;
+  const hours = Math.floor(min / 60);
+  const mins = min % 60;
+  return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
+}
 
 function normalizeProxyUrl(raw) {
   const s = String(raw || '').trim();
@@ -1178,6 +1194,21 @@ app.post('/api/control/start', async (req, res) => {
           error: reconnectMessage,
         });
       }
+      const sessionRow = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+      if (sessionRow?.scrape_cooldown_until) {
+        const untilMs = new Date(sessionRow.scrape_cooldown_until).getTime();
+        if (Number.isFinite(untilMs) && untilMs > Date.now()) {
+          const waitMs = untilMs - Date.now();
+          const cooldownMessage = `Scraping cooldown active for account safety. Sending can resume in ${formatDurationShort(waitMs)}.`;
+          await setClientStatusMessage(clientId, cooldownMessage).catch(() => {});
+          return res.status(400).json({
+            ok: false,
+            code: 'scrape_cooldown',
+            error: cooldownMessage,
+            scrapeCooldownUntil: sessionRow.scrape_cooldown_until,
+          });
+        }
+      }
       const noWorkHint = await getNoWorkHint(clientId).catch(() => '');
       if (noWorkHint) {
         await setClientStatusMessage(clientId, noWorkHint).catch(() => {});
@@ -1395,6 +1426,20 @@ app.post('/api/scraper/start', async (req, res) => {
       });
     }
 
+    const latestSentAtIso = await getLatestSuccessfulColdDmSentAt(clientId).catch(() => null);
+    if (latestSentAtIso) {
+      const latestSentAtMs = new Date(latestSentAtIso).getTime();
+      const cooldownRemainingMs = latestSentAtMs + SEND_SCRAPE_COOLDOWN_MS - Date.now();
+      if (Number.isFinite(cooldownRemainingMs) && cooldownRemainingMs > 0) {
+        return res.status(400).json({
+          ok: false,
+          code: 'recent_send_cooldown',
+          error: `Account safety cooldown active after sending. Try scraping again in ${formatDurationShort(cooldownRemainingMs)}.`,
+          cooldownUntil: new Date(latestSentAtMs + SEND_SCRAPE_COOLDOWN_MS).toISOString(),
+        });
+      }
+    }
+
     // Bind scrape job to the client's most-recent IG session (client view: only one account).
     const sessionRow = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
     if (!sessionRow?.id) {
@@ -1407,10 +1452,11 @@ app.post('/api/scraper/start', async (req, res) => {
     if (sessionRow.scrape_cooldown_until) {
       const untilMs = new Date(sessionRow.scrape_cooldown_until).getTime();
       if (Number.isFinite(untilMs) && untilMs > Date.now()) {
+        const waitMs = untilMs - Date.now();
         return res.status(400).json({
           ok: false,
           code: 'scrape_cooldown',
-          error: `Scraping cooldown active. Try again after ${new Date(untilMs).toLocaleTimeString()}.`,
+          error: `Scraping cooldown active for account safety. Try again in ${formatDurationShort(waitMs)}.`,
           scrapeCooldownUntil: sessionRow.scrape_cooldown_until,
         });
       }

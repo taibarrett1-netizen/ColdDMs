@@ -40,6 +40,15 @@ const {
   typeInstagramDmPlainTextInComposer,
   typeInstagramDmPlainTextWithKeyboard,
 } = require('./utils/open-dm-thread');
+const {
+  clickElementNaturally,
+  focusAndTypeNaturally,
+  maybeLightStoryInteraction,
+  naturalScrollPage,
+  organicPause,
+  randomMouseDrift,
+  typeTextNaturally,
+} = require('./utils/human-interaction');
 const { clickInstagramDmSearchResult, formatSearchFailurePageSnippet } = require('./utils/instagram-dm-search');
 const { attachInstagramSendIdCapture } = require('./utils/instagram-dm-network-ids');
 const { applyProxyToLaunchOptions, authenticatePageForProxy } = require('./utils/proxy-puppeteer');
@@ -90,7 +99,32 @@ const SEND_LIMIT_LOG_THROTTLE_MS = Math.max(
   30_000,
   parseInt(process.env.SEND_LIMIT_LOG_THROTTLE_MS || String(10 * 60 * 1000), 10) || 10 * 60 * 1000
 );
+const SEND_PRESENCE_BROWSE_EVERY = Math.max(
+  1,
+  parseInt(process.env.SEND_PRESENCE_BROWSE_EVERY || '20', 10) || 20
+);
+const COLD_DM_HARD_MAX_SENDS_PER_DAY = Math.max(
+  1,
+  parseInt(process.env.COLD_DM_MAX_SENDS_PER_DAY || '100', 10) || 100
+);
+const COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS = Math.max(
+  0,
+  parseInt(process.env.COLD_DM_MIN_SECONDS_BETWEEN_SENDS || '30', 10) || 30
+);
+const COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS = Math.max(
+  0,
+  parseInt(process.env.COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS || '10', 10) || 10
+);
+const SCRAPE_SESSION_COOLDOWN_MS = Math.max(
+  60 * 1000,
+  parseInt(process.env.SCRAPE_SESSION_COOLDOWN_MS || String(5 * 60 * 1000), 10) || 5 * 60 * 1000
+);
+const COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_RETRIES = Math.max(
+  1,
+  parseInt(process.env.COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_RETRIES || '5', 10) || 5
+);
 const sendLimitLogLast = new Map();
+const sendPresenceBatchState = new Map();
 
 function throttleSendLimitLog(key, emit) {
   const now = Date.now();
@@ -98,6 +132,68 @@ function throttleSendLimitLog(key, emit) {
   if (now - prev < SEND_LIMIT_LOG_THROTTLE_MS) return;
   sendLimitLogLast.set(key, now);
   emit();
+}
+
+function getSendPresenceStateKey(instagramSessionId, clientId) {
+  const sid = String(instagramSessionId || '').trim();
+  const cid = String(clientId || '').trim();
+  return sid || cid || 'global';
+}
+
+function shouldBrowseBeforeBatch(key) {
+  const state = sendPresenceBatchState.get(key) || { completedSends: 0, preBrowsedForBatchStart: false };
+  return (
+    state.completedSends > 0 &&
+    state.completedSends % SEND_PRESENCE_BROWSE_EVERY === 0 &&
+    !state.preBrowsedForBatchStart
+  );
+}
+
+function markBrowsedBeforeBatch(key) {
+  const state = sendPresenceBatchState.get(key) || { completedSends: 0, preBrowsedForBatchStart: false };
+  state.preBrowsedForBatchStart = true;
+  sendPresenceBatchState.set(key, state);
+}
+
+function recordCompletedSendAndCheckPostBrowse(key) {
+  const state = sendPresenceBatchState.get(key) || { completedSends: 0, preBrowsedForBatchStart: false };
+  state.completedSends += 1;
+  const shouldBrowseAfter = state.completedSends % SEND_PRESENCE_BROWSE_EVERY === 0;
+  if (shouldBrowseAfter) state.preBrowsedForBatchStart = false;
+  sendPresenceBatchState.set(key, state);
+  return shouldBrowseAfter;
+}
+
+function normalizeColdOutreachDailyLimit(limit) {
+  if (limit == null || limit === '') return COLD_DM_HARD_MAX_SENDS_PER_DAY;
+  const n = Number(limit);
+  if (!Number.isFinite(n) || n <= 0) return COLD_DM_HARD_MAX_SENDS_PER_DAY;
+  return Math.min(n, COLD_DM_HARD_MAX_SENDS_PER_DAY);
+}
+
+function normalizeColdOutreachDelayWindow(minDelaySecRaw, maxDelaySecRaw) {
+  const minDelaySec = Math.max(
+    0,
+    Number(minDelaySecRaw) || 0,
+    COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS
+  );
+  const requestedMaxDelaySec = Math.max(0, Number(maxDelaySecRaw) || 0);
+  const maxDelaySec = Math.max(
+    requestedMaxDelaySec,
+    minDelaySec + COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS
+  );
+  return { minDelaySec, maxDelaySec };
+}
+
+function formatDurationShort(ms) {
+  const safeMs = Math.max(0, Number(ms) || 0);
+  const totalSec = Math.ceil(safeMs / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const min = Math.ceil(totalSec / 60);
+  if (min < 60) return `${min}m`;
+  const hours = Math.floor(min / 60);
+  const mins = min % 60;
+  return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
 }
 
 const COLD_DM_CONCURRENCY_DEBUG =
@@ -959,25 +1055,192 @@ async function humanDelay() {
 }
 
 async function tinyHumanMouseMove(page) {
-  if (!page || !page.mouse || typeof page.viewport !== 'function') return;
-  const vp = page.viewport() || {};
-  const width = Math.max(800, vp.width || 1200);
-  const height = Math.max(600, vp.height || 900);
-  const start = {
-    x: Math.max(20, Math.min(width - 20, Math.round(width * (0.18 + Math.random() * 0.18)))),
-    y: Math.max(20, Math.min(height - 20, Math.round(height * (0.22 + Math.random() * 0.16)))),
-  };
-  const end = {
-    x: Math.max(20, Math.min(width - 20, Math.round(width * (0.42 + Math.random() * 0.2)))),
-    y: Math.max(20, Math.min(height - 20, Math.round(height * (0.34 + Math.random() * 0.18)))),
-  };
+  await randomMouseDrift(page, { totalDurationMs: randomDelay(180, 420) });
+}
+
+async function doLightInstagramBrowse(page, phase = 'before_send') {
+  if (!page) return;
   try {
-    await page.mouse.move(start.x, start.y, { steps: 5 });
-    await delay(60 + Math.floor(Math.random() * 100));
-    await page.mouse.move(end.x, end.y, { steps: 7 });
-    await delay(80 + Math.floor(Math.random() * 140));
-  } catch {
-    // best-effort only
+    const url = String(page.url() || '').toLowerCase();
+    if (url.includes('/accounts/login')) return;
+    if (!url.includes('instagram.com')) {
+      await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await delay(900);
+    } else if (phase === 'after_send' && !/instagram\.com\/?$/.test(url.replace(/\/+$/, '/'))) {
+      await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await delay(900);
+    }
+    await dismissInstagramHomeModals(page, logger).catch(() => {});
+    await randomMouseDrift(page, { totalDurationMs: randomDelay(150, 320) });
+    await naturalScrollPage(page, {
+      rounds: phase === 'before_send' ? randomDelay(1, 2) : randomDelay(1, 3),
+      pauseMultiplier: phase === 'before_send' ? 0.7 : 0.85,
+    }).catch(() => {});
+    if (Math.random() < (phase === 'before_send' ? 0.28 : 0.35)) {
+      await naturalScrollPage(page, { rounds: 1, direction: 'up', pauseMultiplier: 0.55 }).catch(() => {});
+    }
+    await maybeLightStoryInteraction(page, {
+      openChance: phase === 'before_send' ? 0.08 : 0.12,
+    }).catch(() => {});
+    await organicPause('between_actions', phase === 'before_send' ? 0.8 : 1.0);
+  } catch (e) {
+    logger.warn(`[human-browse:${phase}] ${e.message || e}`);
+  }
+}
+
+function normalizeColdFollowUpItems(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item, index) => {
+      const content = typeof item?.content === 'string' ? item.content.trim() : '';
+      const delayMinutes = typeof item?.delay_minutes === 'number' ? Math.floor(item.delay_minutes) : NaN;
+      if (!content || !Number.isFinite(delayMinutes) || delayMinutes < 1) return null;
+      return {
+        id: typeof item?.id === 'string' && item.id.trim() ? item.id.trim() : `cold-fu-${index + 1}`,
+        content,
+        delay_minutes: delayMinutes,
+      };
+    })
+    .filter(Boolean);
+}
+
+async function maybeRunQueuedColdFollowUpForSession(page, session, options = {}) {
+  const clientId = String(options.clientId || '').trim();
+  if (!page || !session?.id || !clientId) return { processed: false };
+  const supabase = typeof sb.getSupabase === 'function' ? sb.getSupabase() : null;
+  if (!supabase) return { processed: false };
+
+  const { data: settingsRow, error: settingsErr } = await supabase
+    .from('cold_dm_settings')
+    .select('follow_ups_enabled, follow_ups, follow_up_instagram_session_id')
+    .eq('client_id', clientId)
+    .maybeSingle();
+  if (settingsErr) {
+    logger.warn(`[follow-up-interleave] settings load failed for client ${clientId}: ${settingsErr.message || settingsErr}`);
+    return { processed: false };
+  }
+
+  const settings = settingsRow || {};
+  if (settings.follow_ups_enabled === false) return { processed: false };
+  const configuredSessionId = (settings.follow_up_instagram_session_id || '').toString().trim();
+  if (configuredSessionId && configuredSessionId !== String(session.id)) return { processed: false };
+
+  const followUps = normalizeColdFollowUpItems(settings.follow_ups);
+  if (!followUps.length) return { processed: false };
+
+  const dueCutoffIso = new Date(Date.now() + Math.max(0, Number(options.lookAheadMs) || 0)).toISOString();
+  const { data: pendingRows, error: queueErr } = await supabase
+    .from('cold_dm_follow_up_queue')
+    .select('id, client_id, follow_up_index, username, scheduled_for, retry_count')
+    .eq('client_id', clientId)
+    .eq('status', 'pending')
+    .lte('scheduled_for', dueCutoffIso)
+    .order('scheduled_for', { ascending: true })
+    .limit(10);
+  if (queueErr) {
+    logger.warn(`[follow-up-interleave] queue load failed for client ${clientId}: ${queueErr.message || queueErr}`);
+    return { processed: false };
+  }
+
+  const row = Array.isArray(pendingRows) ? pendingRows[0] : null;
+  if (!row?.id) return { processed: false };
+
+  const { data: claimed, error: claimErr } = await supabase.rpc('claim_cold_dm_follow_up_queue_item', {
+    p_queue_id: row.id,
+  });
+  if (claimErr) {
+    logger.warn(`[follow-up-interleave] claim failed for row ${row.id}: ${claimErr.message || claimErr}`);
+    return { processed: false };
+  }
+  if (!claimed) return { processed: false };
+
+  const followUpItem = followUps[row.follow_up_index];
+  if (!followUpItem?.content) {
+    await supabase
+      .from('cold_dm_follow_up_queue')
+      .update({
+        status: 'cancelled',
+        cancel_reason: 'missing_follow_up_item',
+        cancelled_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', row.id)
+      .eq('status', 'processing');
+    return { processed: false };
+  }
+
+  const uname = normalizeUsername(row.username || '');
+  const [leadRow, senderName, firstNameBlocklist] = await Promise.all([
+    supabase
+      .from('cold_dm_leads')
+      .select('username, first_name, last_name, display_name')
+      .eq('client_id', clientId)
+      .eq('username', uname)
+      .maybeSingle()
+      .then((r) => r.data || null)
+      .catch(() => null),
+    typeof sb.getUserAccountName === 'function' ? sb.getUserAccountName(clientId).catch(() => '') : '',
+    typeof sb.getFirstNameBlocklist === 'function' ? sb.getFirstNameBlocklist(clientId).catch(() => []) : [],
+  ]);
+
+  const textOut = substituteVariables(
+    followUpItem.content,
+    {
+      username: leadRow?.username || uname,
+      first_name: leadRow?.first_name || null,
+      last_name: leadRow?.last_name || null,
+      display_name: leadRow?.display_name || null,
+    },
+    {
+      senderName: senderName || '',
+      firstNameBlocklist: new Set((firstNameBlocklist || []).map((x) => String(x).toLowerCase())),
+    }
+  );
+
+  try {
+    logger.log(`[follow-up-interleave] running queued follow-up for @${uname}`);
+    const nav = await navigateToDmThread(page, uname);
+    if (!nav.ok) throw new Error(nav.reason || 'follow_up_nav_failed');
+    const sent = await sendPlainTextInThread(page, textOut);
+    if (!sent.ok) throw new Error(sent.reason || 'follow_up_send_failed');
+    await supabase
+      .from('cold_dm_follow_up_queue')
+      .update({
+        status: 'sent',
+        sent_at: new Date().toISOString(),
+        error_message: null,
+        vps_session_id: session.id,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', row.id)
+      .eq('status', 'processing');
+    return { processed: true, username: uname };
+  } catch (e) {
+    const retryCount = Math.max(0, Number(row.retry_count || 0));
+    const nextRetryCount = retryCount + 1;
+    const shouldRetry = nextRetryCount < COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_RETRIES;
+    const nextAtIso = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+    await supabase
+      .from('cold_dm_follow_up_queue')
+      .update(
+        shouldRetry
+          ? {
+              status: 'pending',
+              scheduled_for: nextAtIso,
+              retry_count: nextRetryCount,
+              error_message: e?.message || 'interleaved_follow_up_failed',
+              updated_at: new Date().toISOString(),
+            }
+          : {
+              status: 'failed',
+              error_message: e?.message || 'interleaved_follow_up_failed',
+              updated_at: new Date().toISOString(),
+            }
+      )
+      .eq('id', row.id)
+      .eq('status', 'processing');
+    logger.warn(`[follow-up-interleave] failed for @${uname}: ${e?.message || e}`);
+    return { processed: false, error: e?.message || String(e) };
   }
 }
 
@@ -1245,14 +1508,28 @@ async function login(page, credentials) {
   page.on('response', respHandler);
 
   logger.log('Login form found, entering credentials...');
-  await userEl.click({ clickCount: 1 }).catch(() => {});
+  await clickElementNaturally(page, userEl, { totalDurationMs: randomDelay(220, 420) }).catch(() => {});
+  await organicPause('micro');
+  await typeTextNaturally(page, username, {
+    minKeyDelay: 45,
+    maxKeyDelay: 120,
+    correctionChance: 0.02,
+    pauseChance: 0.09,
+  });
   await setReactLoginInputValue(userEl, username);
   await userEl.dispose();
-  await humanDelay();
-  await passEl.click({ clickCount: 1 }).catch(() => {});
+  await organicPause('between_actions', 0.7);
+  await clickElementNaturally(page, passEl, { totalDurationMs: randomDelay(220, 420) }).catch(() => {});
+  await organicPause('micro');
+  await typeTextNaturally(page, password, {
+    minKeyDelay: 50,
+    maxKeyDelay: 135,
+    correctionChance: 0.015,
+    pauseChance: 0.08,
+  });
   await setReactLoginInputValue(passEl, password);
   await passEl.dispose();
-  await humanDelay();
+  await organicPause('between_actions', 0.8);
 
   const submitStyle = (process.env.LOGIN_SUBMIT || 'click').toLowerCase();
   let submitMethod = 'click';
@@ -2016,12 +2293,17 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     const retrySearchEl = retryHandle.asElement();
     if (retrySearchEl) {
       const retryMeta = await page.evaluate((el) => ({ tag: el.tagName, type: el.type || '', isCE: !!el.isContentEditable }), retrySearchEl).catch(() => ({}));
-      await retrySearchEl.click({ delay: 50 }).catch(() => {});
-      if (retryMeta.tag === 'INPUT' || retryMeta.tag === 'TEXTAREA') {
-        await retrySearchEl.type(u, { delay: 90 });
+      await clickElementNaturally(page, retrySearchEl, { totalDurationMs: randomDelay(220, 420) }).catch(() => {});
+      await organicPause('compose', 0.45);
+      if (retryMeta.tag === 'INPUT' || retryMeta.tag === 'TEXTAREA' || retryMeta.isCE) {
+        await focusAndTypeNaturally(page, retrySearchEl, u, {
+          clearFirst: true,
+          minKeyDelay: 45,
+          maxKeyDelay: 120,
+        });
       } else {
         await delay(100);
-        await page.keyboard.type(u, { delay: 90 });
+        await typeTextNaturally(page, u, { minKeyDelay: 45, maxKeyDelay: 120 });
       }
       await retrySearchEl.dispose().catch(() => {});
       await retryHandle.dispose().catch(() => {});
@@ -2033,19 +2315,24 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 
   const searchMeta = await page.evaluate((el) => ({ tag: el.tagName, type: el.type || '', isCE: !!el.isContentEditable }), searchEl).catch(() => ({}));
   await tinyHumanMouseMove(page);
-  await searchEl.click({ delay: 50 }).catch(() => {});
+  await clickElementNaturally(page, searchEl, { totalDurationMs: randomDelay(240, 440) }).catch(() => {});
+  await organicPause('compose', 0.45);
 
-  if (searchMeta.tag === 'INPUT' || searchMeta.tag === 'TEXTAREA') {
-    await searchEl.type(u, { delay: 90 });
+  if (searchMeta.tag === 'INPUT' || searchMeta.tag === 'TEXTAREA' || searchMeta.isCE) {
+    await focusAndTypeNaturally(page, searchEl, u, {
+      clearFirst: true,
+      minKeyDelay: 45,
+      maxKeyDelay: 120,
+    });
   } else {
     // contenteditable element: use keyboard typing so React/Instagram gets the right events
     await delay(100);
-    await page.keyboard.type(u, { delay: 90 });
+    await typeTextNaturally(page, u, { minKeyDelay: 45, maxKeyDelay: 120 });
   }
 
   await searchEl.dispose();
   await searchHandle.dispose();
-  await delay(2800);
+  await organicPause('open_dm');
   await dismissInstagramHomeModals(page, logger).catch(() => {});
   await delay(300);
 
@@ -2082,7 +2369,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   if (sidebarDisplayName) {
     logger.log(`[name-extraction] sidebar display name for @${u}: "${sidebarDisplayName}"`);
   }
-  await delay(1500);
+  await organicPause('between_actions');
 
   const openedThread = await page.evaluate(() => {
     const targets = ['button', 'div[role="button"]', 'a', 'span[role="button"]'];
@@ -2113,8 +2400,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     }
     return false;
   });
-  if (openedThread) await delay(2500);
-  await delay(2000);
+  if (openedThread) await organicPause('open_dm');
+  await organicPause('between_actions');
 
   try {
     await page.waitForFunction(
@@ -2131,10 +2418,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         });
         if (nextOrChat && nextOrChat.offsetParent) nextOrChat.click();
       });
-      await delay(3000);
+      await organicPause('open_dm');
     }
   }
-  await delay(2000);
+  await organicPause('between_actions');
 
   await dismissInstagramHomeModals(page, logger);
   await delay(600);
@@ -3160,14 +3447,15 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   };
 
   const submitTypedText = async () => {
-    await humanDelay();
+    await organicPause('compose');
     await tinyHumanMouseMove(page);
     if (preferSendIcon && (await clickInstagramTextSendIcon())) {
-      await delay(1500);
+      await organicPause('post_send');
       return true;
     }
+    if (Math.random() < 0.12) await delay(randomDelay(180, 480));
     await page.keyboard.press('Enter');
-    await delay(1500);
+    await organicPause('post_send');
     return true;
   };
 
@@ -3235,18 +3523,21 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     });
     const compose = composeEl.asElement();
     if (compose && shouldSendText) {
-      await delay(500);
+      await organicPause('compose', 0.55);
       await tinyHumanMouseMove(page);
-      await compose.click();
+      await clickElementNaturally(page, compose, { totalDurationMs: randomDelay(240, 460) }).catch(() => {});
       await saveComposeTypingDebugScreenshot(page, u);
-    await typeInstagramDmPlainTextInComposer(page, compose, msg, {
-      delay: 60 + Math.floor(Math.random() * 40),
-    });
-    await compose.dispose();
-    await composeEl.dispose();
-    await submitTypedText();
-    await saveComposePostSendDebugScreenshot(page, u);
-    textSent = true;
+      await typeInstagramDmPlainTextInComposer(page, compose, msg, {
+        minKeyDelay: 50,
+        maxKeyDelay: 125,
+        correctionChance: 0.03,
+        pauseChance: 0.12,
+      });
+      await compose.dispose();
+      await composeEl.dispose();
+      await submitTypedText();
+      await saveComposePostSendDebugScreenshot(page, u);
+      textSent = true;
     } else if (compose) {
       await compose.dispose();
       await composeEl.dispose();
@@ -3278,9 +3569,14 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     return true;
   }, msg) : false;
   if (keyboardSent) {
-    await delay(300);
+    await organicPause('compose', 0.45);
     await saveComposeTypingDebugScreenshot(page, u);
-    await typeInstagramDmPlainTextWithKeyboard(page, msg, { delay: 60 + Math.floor(Math.random() * 40) });
+    await typeInstagramDmPlainTextWithKeyboard(page, msg, {
+      minKeyDelay: 50,
+      maxKeyDelay: 125,
+      correctionChance: 0.03,
+      pauseChance: 0.12,
+    });
     await submitTypedText();
     await saveComposePostSendDebugScreenshot(page, u);
     textSent = true;
@@ -3660,6 +3956,16 @@ async function sendFollowUp(body) {
   if (!session) {
     return fail('Instagram session not found for this client', 404);
   }
+  if (session.scrape_cooldown_until) {
+    const scrapeCooldownUntilMs = new Date(session.scrape_cooldown_until).getTime();
+    if (Number.isFinite(scrapeCooldownUntilMs) && scrapeCooldownUntilMs > Date.now()) {
+      const waitMs = scrapeCooldownUntilMs - Date.now();
+      return fail(
+        `Scraping cooldown active for account safety. Try again in ${formatDurationShort(waitMs)}.`,
+        409
+      );
+    }
+  }
   const cookies = session.session_data?.cookies;
   if (!cookies?.length) {
     return fail('Session has no cookies; reconnect Instagram', 400);
@@ -3877,6 +4183,7 @@ async function sendDM(page, username, adapter, options = {}) {
   } = options;
   const sendWorkerId = options.sendWorkerId || null;
   const u = normalizeUsername(username);
+  const sendPresenceKey = getSendPresenceStateKey(options.instagramSessionId, options.clientId);
   const sent = await Promise.resolve(adapter.alreadySent(u));
   if (sent) {
     logger.warn(`Already sent to @${u}, skipping.`);
@@ -3888,14 +4195,9 @@ async function sendDM(page, username, adapter, options = {}) {
     campaignId && typeof sb.getCampaignLimitsById === 'function'
       ? await sb.getCampaignLimitsById(campaignId).catch(() => null)
       : null;
-  const hardDailyMax = Math.max(0, parseInt(process.env.COLD_DM_MAX_SENDS_PER_DAY || '0', 10) || 0);
-  let effectiveDailyLimit = freshCampaignLimits ? freshCampaignLimits.daily_send_limit : dailySendLimit;
-  if (hardDailyMax > 0) {
-    effectiveDailyLimit =
-      effectiveDailyLimit != null
-        ? Math.min(Number(effectiveDailyLimit) || hardDailyMax, hardDailyMax)
-        : hardDailyMax;
-  }
+  const effectiveDailyLimit = normalizeColdOutreachDailyLimit(
+    freshCampaignLimits ? freshCampaignLimits.daily_send_limit : dailySendLimit
+  );
   const effectiveHourlyLimit = freshCampaignLimits ? freshCampaignLimits.hourly_send_limit : hourlySendLimit;
   const stats = await Promise.resolve(adapter.getDailyStats(campaignId, effectiveDailyLimit));
   const hourlySent = await Promise.resolve(adapter.getHourlySent());
@@ -3944,18 +4246,20 @@ async function sendDM(page, username, adapter, options = {}) {
     logger.warn(statusMessage);
     return { ok: false, reason: 'missing_delay_config', statusMessage };
   }
-  const hardMinSecBetweenSends = Math.max(
-    0,
-    parseInt(process.env.COLD_DM_MIN_SECONDS_BETWEEN_SENDS || '0', 10) || 0
+  const { minDelaySec, maxDelaySec } = normalizeColdOutreachDelayWindow(
+    options.minDelaySec,
+    options.maxDelaySec
   );
-  const minDelaySec = Math.max(0, Number(options.minDelaySec), hardMinSecBetweenSends);
-  const maxDelaySec = Math.max(minDelaySec, Math.max(0, Number(options.maxDelaySec)));
   const sendCooldownMs = randomDelay(
     minDelaySec * 1000,
     maxDelaySec * 1000
   );
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
+      if (page && shouldBrowseBeforeBatch(sendPresenceKey)) {
+        await doLightInstagramBrowse(page, 'before_send');
+        markBrowsedBeforeBatch(sendPresenceKey);
+      }
       if (page && instagramSessionId) {
         try {
           const pu = page.url() || '';
@@ -3978,6 +4282,10 @@ async function sendDM(page, username, adapter, options = {}) {
         preferThreadName,
       });
       if (result.ok) {
+        const shouldBrowseAfterBatch = recordCompletedSendAndCheckPostBrowse(sendPresenceKey);
+        if (page && shouldBrowseAfterBatch) {
+          await doLightInstagramBrowse(page, 'after_send');
+        }
         const finalMessage = result.finalMessage != null ? result.finalMessage : (resolvedVoiceMode === 'voice_only' ? '' : messageTemplate);
         await Promise.resolve(logSent('success', finalMessage));
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent', null, sendWorkerId).catch(() => {});
@@ -4101,11 +4409,12 @@ async function sendDM(page, username, adapter, options = {}) {
 }
 
 function evaluateCampaignLimitState({ sentToday, sentThisHour, dailySendLimit, hourlySendLimit }) {
-  if (dailySendLimit != null && sentToday >= dailySendLimit) {
+  const effectiveDailyLimit = normalizeColdOutreachDailyLimit(dailySendLimit);
+  if (effectiveDailyLimit != null && sentToday >= effectiveDailyLimit) {
     return {
       blocked: true,
       reason: 'daily_limit',
-      statusMessage: `daily limit reached (campaign daily=${dailySendLimit}, sentToday=${sentToday}, counting=successful sends only)`,
+      statusMessage: `daily limit reached (effective daily=${effectiveDailyLimit}, sentToday=${sentToday}, counting=successful sends only)`,
     };
   }
   if (hourlySendLimit != null && sentThisHour >= hourlySendLimit) {
@@ -4143,7 +4452,7 @@ async function buildAdapterForClient(clientId) {
   const minDelayMs = (settings?.min_delay_minutes ?? 5) * 60 * 1000;
   const maxDelayMs = (settings?.max_delay_minutes ?? 30) * 60 * 1000;
   const adapter = {
-    dailyLimit: Math.min(settings?.daily_send_limit ?? 100, 200),
+    dailyLimit: normalizeColdOutreachDailyLimit(settings?.daily_send_limit ?? 100),
     maxPerHour: settings?.max_sends_per_hour ?? 20,
     alreadySent: (u) => sb.alreadySent(clientId, u),
     logSentMessage: (u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason) =>
@@ -4718,7 +5027,9 @@ async function runBotMultiTenant() {
       work.campaignId && typeof sb.getCampaignLimitsById === 'function'
         ? await sb.getCampaignLimitsById(work.campaignId).catch(() => null)
         : null;
-    const effDailyEarly = campaignLimitsEarly?.daily_send_limit ?? work.dailySendLimit;
+    const effDailyEarly = normalizeColdOutreachDailyLimit(
+      campaignLimitsEarly?.daily_send_limit ?? work.dailySendLimit
+    );
     const effHourlyEarly = campaignLimitsEarly?.hourly_send_limit ?? work.hourlySendLimit;
     try {
       const statsEarly = await adapter.getDailyStats(work.campaignId, effDailyEarly);
@@ -4795,6 +5106,32 @@ async function runBotMultiTenant() {
     leasedSessionIdForSignal = session.id;
     leasedCampaignIdForSignal = work.campaignId;
     await sb.updateSendJob(claimedJob.id, { instagram_session_id: session.id }, SEND_WORKER_ID).catch(() => {});
+
+    if (session.scrape_cooldown_until) {
+      const scrapeCooldownUntilMs = new Date(session.scrape_cooldown_until).getTime();
+      if (Number.isFinite(scrapeCooldownUntilMs) && scrapeCooldownUntilMs > Date.now()) {
+        const waitMs = scrapeCooldownUntilMs - Date.now();
+        const statusMsg = `Scraping cooldown active for account safety. Sending resumes in ${formatDurationShort(waitMs)}.`;
+        await sb.setClientStatusMessage(clientId, statusMsg).catch(() => {});
+        await sb.updateSendJob(
+          claimedJob.id,
+          {
+            status: 'retry',
+            available_at: new Date(scrapeCooldownUntilMs).toISOString(),
+            last_error_class: 'scrape_cooldown',
+            last_error_message: statusMsg,
+          },
+          SEND_WORKER_ID
+        ).catch(() => {});
+        await releaseClaimedCampaignLease(claimedJob.campaign_id);
+        await sb.releaseInstagramSessionLease(session.id, SEND_WORKER_ID).catch(() => {});
+        leasedSessionIdForSignal = null;
+        leasedCampaignIdForSignal = null;
+        await delay(400);
+        continue;
+      }
+    }
+
     const leaseHeartbeatMs = Math.max(30000, Math.min(60000, Math.floor((SEND_LEASE_SECONDS * 1000) / 2)));
     let leaseHeartbeatTimer = null;
     let sendJobHeartbeatTimer = null;
@@ -4873,8 +5210,8 @@ async function runBotMultiTenant() {
         messageGroupMessageId: work.messageGroupMessageId,
         dailySendLimit: work.dailySendLimit,
         hourlySendLimit: work.hourlySendLimit,
-        minDelaySec: work.minDelaySec,
-        maxDelaySec: work.maxDelaySec,
+        minDelaySec: normalizeColdOutreachDelayWindow(work.minDelaySec, work.maxDelaySec).minDelaySec,
+        maxDelaySec: normalizeColdOutreachDelayWindow(work.minDelaySec, work.maxDelaySec).maxDelaySec,
         first_name: work.first_name,
         last_name: work.last_name,
         display_name: work.display_name,
@@ -4922,6 +5259,7 @@ async function runBotMultiTenant() {
       let delayMs;
       let sendJobStatus = 'completed';
       let sendJobUpdates = {};
+      let handledSendCooldownInline = false;
       if (!sendResult.ok && sendResult.reason === 'hourly_limit') {
         delayMs = randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
         const msg = sendResult.statusMessage || 'hourly limit reached';
@@ -5001,10 +5339,14 @@ async function runBotMultiTenant() {
             'Instagram unreachable (proxy/VPN tunnel failed). Sending paused — fix connectivity and press Start.'
         ).catch(() => {});
       } else {
-        delayMs = sendResult.cooldownMs != null ? sendResult.cooldownMs : randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000);
+        const normalizedDelayWindow = normalizeColdOutreachDelayWindow(work.minDelaySec, work.maxDelaySec);
+        delayMs =
+          sendResult.cooldownMs != null
+            ? sendResult.cooldownMs
+            : randomDelay(normalizedDelayWindow.minDelaySec * 1000, normalizedDelayWindow.maxDelaySec * 1000);
         const delaySec = Math.max(1, Math.ceil(delayMs / 1000));
-        const minSec = Math.max(0, Number(work.minDelaySec) || 0);
-        const maxSec = Math.max(0, Number(work.maxDelaySec) || 0);
+        const minSec = normalizedDelayWindow.minDelaySec;
+        const maxSec = normalizedDelayWindow.maxDelaySec;
         logger.log(`Campaign cooldown from settings ${minSec}-${maxSec}s. Next send in ${delaySec} sec.`);
         sb.setClientStatusMessage(clientId, `Waiting. Campaign cooldown ${delaySec} sec (settings ${minSec}-${maxSec}s).`).catch(() => {});
         if (!sendResult.ok) {
@@ -5013,6 +5355,47 @@ async function runBotMultiTenant() {
             last_error_class: sendResult.reason || 'send_failed',
             last_error_message: sendResult.reason || 'send_failed',
           };
+        }
+
+        if (sendResult.ok && delayMs > 1000 && page && session) {
+          handledSendCooldownInline = true;
+          logger.log(
+            `[follow-up-interleave] waiting ${delaySec}s after cold send before checking queued follow-ups`
+          );
+          await delay(delayMs);
+
+          const interleaved = await maybeRunQueuedColdFollowUpForSession(page, session, {
+            clientId,
+            lookAheadMs: 0,
+          }).catch((e) => {
+            logger.warn(`[follow-up-interleave] check failed: ${e?.message || e}`);
+            return { processed: false, error: e?.message || String(e) };
+          });
+
+          if (interleaved?.processed) {
+            const afterFollowUpDelayMs = randomDelay(
+              normalizedDelayWindow.minDelaySec * 1000,
+              normalizedDelayWindow.maxDelaySec * 1000
+            );
+            logger.log(
+              `[follow-up-interleave] sent queued follow-up for @${interleaved.username || 'unknown'}; waiting ${Math.max(
+                1,
+                Math.ceil(afterFollowUpDelayMs / 1000)
+              )}s before next cold send`
+            );
+            sb
+              .setClientStatusMessage(
+                clientId,
+                `Queued follow-up sent. Waiting ${Math.max(
+                  1,
+                  Math.ceil(afterFollowUpDelayMs / 1000)
+                )} sec before the next cold outreach send.`
+              )
+              .catch(() => {});
+            await delay(afterFollowUpDelayMs);
+          }
+
+          delayMs = 0;
         }
       }
       await sb.updateSendJob(claimedJob.id, { status: sendJobStatus, ...sendJobUpdates }, SEND_WORKER_ID).catch(() => {});
@@ -5031,7 +5414,7 @@ async function runBotMultiTenant() {
         await delay(500);
       } else {
         const isSendCooldown = sendJobStatus === 'completed' || sendJobStatus === 'failed';
-        if (isSendCooldown && delayMs > 1000 && work && work.campaignId) {
+        if (!handledSendCooldownInline && isSendCooldown && delayMs > 1000 && work && work.campaignId) {
           const cooldownUntilIso = new Date(Date.now() + delayMs).toISOString();
           await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, cooldownUntilIso).catch(() => {});
           await delay(500);
