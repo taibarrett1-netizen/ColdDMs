@@ -1354,9 +1354,12 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
   const sessionDailyCap = normalizeColdOutreachDailyLimit(session.account_daily_limit ?? session.daily_dm_limit ?? 100);
   const usageForCap =
     typeof sb.getInstagramSessionDailyUsage === 'function'
-      ? await sb.getInstagramSessionDailyUsage(clientId, session.id).catch(() => null)
+      ? await sb.getInstagramSessionDailyUsage(clientId, session.id).catch((e) => {
+          logger.warn(`[follow-up-interleave] usage probe failed: ${e?.message || e} — treating as over cap`);
+          return { totalSent: Number.POSITIVE_INFINITY };
+        })
       : null;
-  const trackedOutbound = Number(usageForCap?.totalSent) || 0;
+  const trackedOutbound = Number.isFinite(usageForCap?.totalSent) ? Number(usageForCap.totalSent) : Number.POSITIVE_INFINITY;
   const effectiveOutbound = trackedOutbound + pendingColdCompleting;
   if (effectiveOutbound >= sessionDailyCap) {
     const horizonIso = new Date(Date.now() + followUpWaitCapMs + 2000).toISOString();
@@ -4333,7 +4336,10 @@ async function sendFollowUp(body) {
 
   const sessionDailyCapApi = normalizeColdOutreachDailyLimit(session.account_daily_limit ?? session.daily_dm_limit ?? 100);
   if (typeof sb.getInstagramSessionDailyUsage === 'function') {
-    const usageApi = await sb.getInstagramSessionDailyUsage(clientId, instagramSessionId).catch(() => null);
+    const usageApi = await sb.getInstagramSessionDailyUsage(clientId, instagramSessionId).catch((e) => {
+      logger.warn(`[follow-up] usage probe failed: ${e?.message || e} — treating as over cap (fail-closed)`);
+      return { totalSent: Number.POSITIVE_INFINITY };
+    });
     if (usageApi && usageApi.totalSent >= sessionDailyCapApi) {
       const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
       return fail(
@@ -5557,10 +5563,24 @@ async function runBotMultiTenant() {
     }
 
     const accountDailyLimit = normalizeColdOutreachDailyLimit(session.account_daily_limit ?? session.daily_dm_limit ?? 100);
+    // Fail-closed: if the usage probe throws we assume cap hit (so bugs never *over*-send).
     const accountDailyUsage =
       typeof sb.getInstagramSessionDailyUsage === 'function'
-        ? await sb.getInstagramSessionDailyUsage(clientId, session.id).catch(() => null)
+        ? await sb.getInstagramSessionDailyUsage(clientId, session.id).catch((e) => {
+            logger.warn(
+              `[send-worker] account daily usage probe failed session=${session.id}: ${e?.message || e} — treating as over cap (fail-closed).`
+            );
+            return { totalSent: Number.POSITIVE_INFINITY };
+          })
         : null;
+    if (accountDailyUsage) {
+      logger.log(
+        `[send-worker] account usage session=${session.id} limit=${accountDailyLimit} ` +
+          `total=${accountDailyUsage.totalSent} sentMessages=${accountDailyUsage.sentMessagesTotal ?? '?'} ` +
+          `jobsCompleted=${accountDailyUsage.jobsCompleted ?? accountDailyUsage.coldOutreachSent ?? '?'} ` +
+          `followUpsSent=${accountDailyUsage.followUpsSent ?? '?'}`
+      );
+    }
     if (accountDailyUsage && accountDailyUsage.totalSent >= accountDailyLimit) {
       const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
       const msg = 'Account hit daily limit';

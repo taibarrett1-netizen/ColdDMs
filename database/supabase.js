@@ -724,7 +724,17 @@ async function getInstagramSessionDailyUsage(clientId, instagramSessionId, timez
   }
   const effectiveTimezone = timezone || (await getSettings(clientId).catch(() => null))?.timezone || null;
   const bounds = getDayBoundsForTimezone(effectiveTimezone);
-  const [coldDmRes, followUpsRes] = await Promise.all([
+  // Authoritative counter: cold_dm_sent_messages has one row per real DM (same counter the dashboard
+  // shows as "sent today"). cold_dm_send_jobs.status='completed' can lag behind (lease mismatch, older
+  // code paths, retries) so we also read it and take max — never undercount, never over-send.
+  const [sentMessagesRes, jobsRes, followUpsRes] = await Promise.all([
+    sb
+      .from('cold_dm_sent_messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('client_id', clientId)
+      .eq('status', 'success')
+      .gte('sent_at', bounds.startIso)
+      .lt('sent_at', bounds.endIso),
     sb
       .from('cold_dm_send_jobs')
       .select('id', { count: 'exact', head: true })
@@ -743,14 +753,24 @@ async function getInstagramSessionDailyUsage(clientId, instagramSessionId, timez
       .gte('sent_at', bounds.startIso)
       .lt('sent_at', bounds.endIso),
   ]);
-  if (coldDmRes.error) throw coldDmRes.error;
+  if (sentMessagesRes.error) throw sentMessagesRes.error;
+  if (jobsRes.error) throw jobsRes.error;
   if (followUpsRes.error) throw followUpsRes.error;
-  const coldOutreachSent = coldDmRes.count || 0;
+  const sentMessagesTotal = sentMessagesRes.count || 0;
+  const jobsCompleted = jobsRes.count || 0;
   const followUpsSent = followUpsRes.count || 0;
+  // Cold DMs are recorded in both cold_dm_sent_messages (one row per real outbound) and
+  // cold_dm_send_jobs (queue row; status → completed after send). Send-job rows can lag or
+  // fail to update on lease mismatch, so take the max of the two as the cold count, then
+  // add follow-ups (queue.sent, not present in cold_dm_sent_messages).
+  const coldOutreachSent = Math.max(sentMessagesTotal, jobsCompleted);
+  const totalSent = coldOutreachSent + followUpsSent;
   return {
     coldOutreachSent,
+    jobsCompleted,
+    sentMessagesTotal,
     followUpsSent,
-    totalSent: coldOutreachSent + followUpsSent,
+    totalSent,
     startIso: bounds.startIso,
     endIso: bounds.endIso,
   };
@@ -849,9 +869,21 @@ async function claimInstagramSessionForCampaign(clientId, campaignId, workerId, 
     return heartbeatStale(s);
   });
   for (const candidate of eligible) {
-    const usage = await getInstagramSessionDailyUsage(clientId, candidate.id, timezone).catch(() => null);
+    const usage = await getInstagramSessionDailyUsage(clientId, candidate.id, timezone).catch((e) => {
+      console.warn(
+        `[claimInstagramSessionForCampaign] daily usage probe failed client=${clientId} session=${candidate.id}: ${e && e.message ? e.message : e} — refusing to claim (fail-closed)`
+      );
+      return { totalSent: Infinity, coldOutreachSent: 0, followUpsSent: 0, startIso: null, endIso: null };
+    });
     const dailyLimit = getInstagramSessionDailyLimit(candidate);
-    if (usage && usage.totalSent >= dailyLimit) continue;
+    if (usage && usage.totalSent >= dailyLimit) {
+      console.log(
+        `[claimInstagramSessionForCampaign] skip session ${candidate.id} at cap ` +
+          `client=${clientId} total=${usage.totalSent}/${dailyLimit} ` +
+          `sentMessages=${usage.sentMessagesTotal ?? '?'} jobsCompleted=${usage.jobsCompleted ?? '?'} followUpsSent=${usage.followUpsSent ?? '?'}`
+      );
+      continue;
+    }
     const ok = await claimInstagramSessionLease(candidate.id, workerId, leaseSeconds);
     if (ok) {
       return {
