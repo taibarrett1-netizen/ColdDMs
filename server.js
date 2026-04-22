@@ -379,22 +379,32 @@ app.post('/api/admin/update', (req, res) => {
   // Protected by the same Bearer COLD_DM_API_KEY middleware above.
   const branch = String(process.env.COLD_DM_WORKER_BRANCH || process.env.GIT_BRANCH || 'main')
     .trim() || 'main';
+  const updateId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString('hex');
   const cmd = `${getPuppeteerDepsInstallCommand()} && cd ${projectRoot} && git pull origin ${branch} && npm install && pm2 restart all --update-env`;
-  exec(cmd, { maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
-    if (err) {
-      return res.status(500).json({
-        ok: false,
-        error: String(err.message || err),
-        stdout: String(stdout || '').slice(0, 8000),
-        stderr: String(stderr || '').slice(0, 8000),
-      });
-    }
-    return res.json({
-      ok: true,
-      stdout: String(stdout || '').slice(0, 8000),
-      stderr: String(stderr || '').slice(0, 8000),
-    });
+
+  logger.log(`[admin:update] accepted updateId=${updateId} branch=${branch}`);
+  res.json({
+    ok: true,
+    accepted: true,
+    updateId,
+    branch,
+    restarting: true,
+    bootIdBeforeRestart: PROCESS_BOOT_ID,
   });
+
+  setTimeout(() => {
+    exec(cmd, { maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        logger.error(`[admin:update] failed updateId=${updateId} error=${String(err.message || err)}`);
+        if (stdout) logger.error(`[admin:update] stdout updateId=${updateId} ${String(stdout).slice(0, 8000)}`);
+        if (stderr) logger.error(`[admin:update] stderr updateId=${updateId} ${String(stderr).slice(0, 8000)}`);
+        return;
+      }
+      logger.log(`[admin:update] finished updateId=${updateId}`);
+      if (stdout) logger.log(`[admin:update] stdout updateId=${updateId} ${String(stdout).slice(0, 8000)}`);
+      if (stderr) logger.log(`[admin:update] stderr updateId=${updateId} ${String(stderr).slice(0, 8000)}`);
+    });
+  }, 25);
 });
 
 app.post('/api/admin/assign-client', (req, res) => {
