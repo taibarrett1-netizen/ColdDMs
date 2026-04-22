@@ -196,7 +196,9 @@ app.use('/api', (req, res, next) => {
 app.post('/api/admin/update', (req, res) => {
   // Safe "pull + restart" endpoint for per-client droplets so Edge can deploy updates without SSH.
   // Protected by the same Bearer COLD_DM_API_KEY middleware above.
-  const cmd = `cd ${projectRoot} && git pull origin main && npm install && pm2 restart all`;
+  const branch = String(process.env.COLD_DM_WORKER_BRANCH || process.env.GIT_BRANCH || 'main')
+    .trim() || 'main';
+  const cmd = `cd ${projectRoot} && git pull origin ${branch} && npm install && pm2 restart all --update-env`;
   exec(cmd, { maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
     if (err) {
       return res.status(500).json({
@@ -210,6 +212,40 @@ app.post('/api/admin/update', (req, res) => {
       ok: true,
       stdout: String(stdout || '').slice(0, 8000),
       stderr: String(stderr || '').slice(0, 8000),
+    });
+  });
+});
+
+app.post('/api/admin/assign-client', (req, res) => {
+  // Used by the Edge function when assigning a spare pool droplet to a client.
+  // Pins this droplet to that clientId so requests cannot target other tenants.
+  const clientId = (req.body?.clientId || '').toString().trim();
+  if (!clientId) {
+    return res.status(400).json({ ok: false, error: 'clientId is required' });
+  }
+  try {
+    const env = readEnv();
+    env.COLD_DM_CLIENT_ID = clientId;
+    writeEnv(env);
+    setClientId(clientId);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) || 'Failed to pin clientId' });
+  }
+  // Restart dashboard so requireScopedClientId enforces the pin immediately.
+  exec('pm2 restart ig-dm-dashboard', { maxBuffer: 2 * 1024 * 1024 }, (err, stdout, stderr) => {
+    if (err) {
+      return res.status(500).json({
+        ok: false,
+        error: String(err.message || err),
+        stdout: String(stdout || '').slice(0, 4000),
+        stderr: String(stderr || '').slice(0, 4000),
+      });
+    }
+    return res.json({
+      ok: true,
+      clientId,
+      stdout: String(stdout || '').slice(0, 4000),
+      stderr: String(stderr || '').slice(0, 4000),
     });
   });
 });
@@ -1204,19 +1240,22 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
   }
   try {
     const isAdmin = await isAdminUser(clientId).catch(() => false);
+    const igKey = String(username)
+      .trim()
+      .replace(/^@/, '')
+      .toLowerCase();
     if (!isAdmin) {
-      const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
-      if (activeCount > 0) {
+      // Non-admins can have only one automation account. Reconnect is allowed only when it's the same handle.
+      const existing = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+      const existingKey =
+        existing?.instagram_username != null ? String(existing.instagram_username).trim().toLowerCase() : null;
+      if (existingKey && existingKey !== igKey) {
         return res.status(400).json({
           ok: false,
           error: 'Only one automation Instagram account is allowed for this account. Remove the current session before connecting another.',
         });
       }
     }
-    const igKey = String(username)
-      .trim()
-      .replace(/^@/, '')
-      .toLowerCase();
     let proxyMeta = { proxyUrl: null, proxyAssignmentId: null };
     try {
       proxyMeta = await getOrResolveColdDmProxyUrl(clientId, igKey);
@@ -1224,6 +1263,16 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
       return res.status(503).json({
         ok: false,
         error: pe instanceof Error ? pe.message : String(pe) || 'Could not allocate proxy (check Decodo API and credits)',
+      });
+    }
+    const allowNoProxy =
+      process.env.COLD_DM_ALLOW_NO_PROXY === '1' || process.env.COLD_DM_ALLOW_NO_PROXY === 'true';
+    if (!allowNoProxy && !proxyMeta.proxyUrl) {
+      return res.status(503).json({
+        ok: false,
+        error:
+          'Proxy is not configured for this VPS worker. Set DECODO_SHARED_USERNAME/DECODO_SHARED_PASSWORD (or DECODO_API_KEY) and retry Connect.',
+        code: 'proxy_not_configured',
       });
     }
     const result = await connectInstagram(username, password, null, { proxyUrl: proxyMeta.proxyUrl });
@@ -1256,14 +1305,11 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
       });
     }
     // Connect succeeded without requiring a challenge (e.g. valid existing browser session/cookies).
-    await updateInstagramSessionProxy(sessionRow.id, {
-      proxyUrl: proxyMeta.proxyUrl,
-      proxyAssignmentId: proxyMeta.proxyAssignmentId,
-    }).catch(() => {});
     await saveSession(clientId, mergeInstagramSessionData(result.cookies, result.web_storage), result.username, {
       proxyUrl: proxyMeta.proxyUrl,
       proxyAssignmentId: proxyMeta.proxyAssignmentId,
     });
+    await updateSettingsInstagramUsername(clientId, result.username).catch(() => {});
     return res.status(200).json({
       ok: true,
       username: result.username,
@@ -1311,8 +1357,11 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
     const result = await completeInstagram2FA(pending.page, pending.browser, twoFactorCode, pending.username);
     const isAdmin = await isAdminUser(clientId).catch(() => false);
     if (!isAdmin) {
-      const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
-      if (activeCount > 0) {
+      const existing = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+      const existingKey =
+        existing?.instagram_username != null ? String(existing.instagram_username).trim().toLowerCase() : null;
+      const nextKey = result?.username != null ? String(result.username).trim().replace(/^@/, '').toLowerCase() : null;
+      if (existingKey && nextKey && existingKey !== nextKey) {
         if (pending.browser) pending.browser.close().catch(() => {});
         return res.status(400).json({
           ok: false,
@@ -1358,8 +1407,11 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
     const result = await completeInstagramEmailVerification(pending.page, pending.browser, emailCode, pending.username);
     const isAdmin = await isAdminUser(clientId).catch(() => false);
     if (!isAdmin) {
-      const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
-      if (activeCount > 0) {
+      const existing = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+      const existingKey =
+        existing?.instagram_username != null ? String(existing.instagram_username).trim().toLowerCase() : null;
+      const nextKey = result?.username != null ? String(result.username).trim().replace(/^@/, '').toLowerCase() : null;
+      if (existingKey && nextKey && existingKey !== nextKey) {
         if (pending.browser) pending.browser.close().catch(() => {});
         return res.status(400).json({
           ok: false,
