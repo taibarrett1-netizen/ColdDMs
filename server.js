@@ -87,6 +87,33 @@ const API_KEY_CLIENT_MAP = (process.env.COLD_DM_API_KEYS || '')
 const COOKIE_NAME = 'cold_dm_api';
 const cookieSecure =
   process.env.COLD_DM_COOKIE_SECURE === '1' || process.env.COLD_DM_COOKIE_SECURE === 'true';
+const PUPPETEER_APT_PACKAGES = [
+  'libgbm1',
+  'libasound2',
+  'libnss3',
+  'libatk1.0-0',
+  'libatk-bridge2.0-0',
+  'libcups2',
+  'libdrm2',
+  'libxkbcommon0',
+  'libxcomposite1',
+  'libxdamage1',
+  'libxfixes3',
+  'libxrandr2',
+  'libpango-1.0-0',
+  'libcairo2',
+  'libgtk-3-0',
+  'libdbus-1-3',
+  'libnspr4',
+  'libx11-xcb1',
+  'libxshmfence1',
+  'fonts-liberation',
+  'xdg-utils',
+];
+
+function getPuppeteerDepsInstallCommand() {
+  return `apt-get update && apt-get install -y ${PUPPETEER_APT_PACKAGES.join(' ')}`;
+}
 
 function envCheckSnapshot(req) {
   const auth = req.headers.authorization;
@@ -251,7 +278,7 @@ app.post('/api/admin/update', (req, res) => {
   // Protected by the same Bearer COLD_DM_API_KEY middleware above.
   const branch = String(process.env.COLD_DM_WORKER_BRANCH || process.env.GIT_BRANCH || 'main')
     .trim() || 'main';
-  const cmd = `cd ${projectRoot} && git pull origin ${branch} && npm install && pm2 restart all --update-env`;
+  const cmd = `${getPuppeteerDepsInstallCommand()} && cd ${projectRoot} && git pull origin ${branch} && npm install && pm2 restart all --update-env`;
   exec(cmd, { maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
     if (err) {
       return res.status(500).json({
@@ -287,7 +314,8 @@ app.post('/api/admin/assign-client', (req, res) => {
   // which makes the Edge function hang/timeout even though the assignment succeeded.
   res.json({ ok: true, clientId, restarting: true });
   setTimeout(() => {
-    exec('pm2 restart ig-dm-dashboard', { maxBuffer: 2 * 1024 * 1024 }, (err) => {
+    const cmd = `${getPuppeteerDepsInstallCommand()} && pm2 restart ig-dm-dashboard`;
+    exec(cmd, { maxBuffer: 4 * 1024 * 1024 }, (err) => {
       if (err) console.error('[API] assign-client pm2 restart failed', err);
     });
   }, 250);
