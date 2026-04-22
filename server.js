@@ -3,6 +3,7 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { exec, spawn } = require('child_process');
 const multer = require('multer');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
@@ -25,8 +26,6 @@ const {
   countActiveVpsInstagramSessions,
   countActiveGraphInstagramAccounts,
   updateSettingsInstagramUsername,
-  getScraperSession,
-  saveScraperSession,
   getLatestScrapeJob,
   getScrapeQuotaStatus,
   createScrapeJob,
@@ -36,14 +35,18 @@ const {
   syncSendJobsForClient,
   getNoWorkHint,
   getClientNoWorkResumeAt,
+  canClientActivelySendNow,
   getCampaignsMissingSendDelays,
   getSessionsForCampaign,
   reactivateCampaignsWithPendingLeads,
   tryVpsIdempotencyOnce,
   getOrResolveColdDmProxyUrl,
+  getMostRecentInstagramSessionForClient,
+  updateInstagramSessionProxy,
   releaseAllInstagramSessionLeases,
   releaseAllCampaignSendLeases,
   getClientIdsWithPauseZero,
+  getLatestSuccessfulColdDmSentAt,
 } = require('./database/supabase');
 const {
   loadLeadsFromCSV,
@@ -54,7 +57,6 @@ const {
   scheduleDebugFollowUpBrowser,
   previewDmLeadNamesFromSession,
 } = require('./bot');
-const { connectScraper } = require('./scraper');
 const { MESSAGES } = require('./config/messages');
 const logger = require('./utils/logger');
 const { mergeInstagramSessionData } = require('./utils/instagram-web-storage');
@@ -66,6 +68,7 @@ const envPath = path.join(projectRoot, '.env');
 const leadsPath = path.join(projectRoot, process.env.LEADS_CSV || 'leads.csv');
 const voiceNotesDir = path.join(projectRoot, 'voice-notes');
 const followUpScreenshotsDir = path.join(projectRoot, 'follow-up-screenshots');
+const PROCESS_BOOT_ID = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
@@ -87,6 +90,76 @@ const API_KEY_CLIENT_MAP = (process.env.COLD_DM_API_KEYS || '')
 const COOKIE_NAME = 'cold_dm_api';
 const cookieSecure =
   process.env.COLD_DM_COOKIE_SECURE === '1' || process.env.COLD_DM_COOKIE_SECURE === 'true';
+const PUPPETEER_APT_PACKAGES = [
+  'libgbm1',
+  'libasound2',
+  'libnss3',
+  'libatk1.0-0',
+  'libatk-bridge2.0-0',
+  'libcups2',
+  'libdrm2',
+  'libxkbcommon0',
+  'libxcomposite1',
+  'libxdamage1',
+  'libxfixes3',
+  'libxrandr2',
+  'libpango-1.0-0',
+  'libcairo2',
+  'libgtk-3-0',
+  'libdbus-1-3',
+  'libnspr4',
+  'libx11-xcb1',
+  'libxshmfence1',
+  'fonts-liberation',
+  'xdg-utils',
+];
+
+function getPuppeteerDepsInstallCommand() {
+  return `apt-get update && apt-get install -y ${PUPPETEER_APT_PACKAGES.join(' ')}`;
+}
+
+function envCheckSnapshot(req) {
+  const auth = req.headers.authorization;
+  const bearer = typeof auth === 'string' ? auth.replace(/^Bearer\s+/i, '').trim() : '';
+  const xApiKey = (req.headers['x-api-key'] || '').toString().trim();
+  const cookieKey = req.cookies && req.cookies[COOKIE_NAME] ? String(req.cookies[COOKIE_NAME]).trim() : '';
+  const presentedKey = getPresentedApiKey(req);
+
+  const supabaseUrl = (process.env.SUPABASE_URL || '').trim();
+  const serviceRoleLen = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim().length;
+  const edgeSecretLen = (process.env.EDGE_INTERNAL_FUNCTION_SECRET || '').trim().length;
+  const coldDmApiKeyLen = (process.env.COLD_DM_API_KEY || '').trim().length;
+
+  return {
+    presented: {
+      hasKey: Boolean(presentedKey),
+      keyLen: presentedKey ? String(presentedKey).length : 0,
+      sources: {
+        bearer: bearer.length > 0,
+        xApiKey: xApiKey.length > 0,
+        cookie: cookieKey.length > 0,
+      },
+    },
+    server: {
+      apiKeyConfigured: API_KEY.length > 0,
+      apiKeyLen: API_KEY.length,
+      apiKeysMapCount: Object.keys(API_KEY_CLIENT_MAP).length,
+      pinnedClientId: Boolean((process.env.COLD_DM_CLIENT_ID || '').trim()),
+    },
+    env: {
+      supabaseUrlPresent: supabaseUrl.length > 0,
+      supabaseUrl: supabaseUrl ? supabaseUrl.replace(/\/$/, '') : '',
+      supabaseServiceRoleKeyLen: serviceRoleLen,
+      edgeInternalSecretLen: edgeSecretLen,
+      coldDmApiKeyLen,
+    },
+    process: {
+      cwd: process.cwd(),
+      node: process.version,
+      pm2: process.env.pm_id != null,
+    },
+  };
+}
 
 // Dashboard HTML: set HttpOnly cookie from server env so the browser never types or sees the API key in JS/repo.
 app.get('/', (req, res) => {
@@ -117,6 +190,15 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
 });
 app.use('/api', apiLimiter);
+
+// Debug helper: confirms what env/headers the running VPS process sees at runtime.
+// Enable with COLD_DM_DEBUG_AUTH=1 and hit GET /api/internal/env-check.
+app.get('/api/internal/env-check', (req, res) => {
+  if ((process.env.COLD_DM_DEBUG_AUTH || '').trim() !== '1') {
+    return res.status(404).json({ ok: false });
+  }
+  return res.json({ ok: true, ...envCheckSnapshot(req) });
+});
 
 const followUpLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -160,6 +242,11 @@ function requireScopedClientId(req, res) {
     res.status(400).json({ ok: false, error: 'clientId is required' });
     return null;
   }
+  const pinnedClientId = (process.env.COLD_DM_CLIENT_ID || '').trim();
+  if (pinnedClientId && pinnedClientId !== clientId) {
+    res.status(403).json({ ok: false, error: 'Forbidden: this worker is pinned to a different clientId' });
+    return null;
+  }
   if (req.authClientId && req.authClientId !== clientId) {
     res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
     return null;
@@ -167,8 +254,108 @@ function requireScopedClientId(req, res) {
   return clientId;
 }
 
+function getHealthPayload() {
+  const assignedClientId = getClientId();
+  return {
+    ok: true,
+    bootId: PROCESS_BOOT_ID,
+    poolMode: process.env.COLD_DM_POOL_MODE === '1' || process.env.COLD_DM_POOL_MODE === 'true',
+    assignedClientIdPresent: Boolean(assignedClientId),
+  };
+}
+
+async function fetchTextWithTimeout(url, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return '';
+    return String(await res.text().catch(() => '')).trim();
+  } catch {
+    return '';
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function notifyPoolWorkerReady(reason = 'startup') {
+  const isPoolMode = process.env.COLD_DM_POOL_MODE === '1' || process.env.COLD_DM_POOL_MODE === 'true';
+  if (!isPoolMode) return true;
+  if (getClientId()) return true;
+
+  const supabaseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+  const bearer =
+    (process.env.EDGE_INTERNAL_FUNCTION_SECRET || '').trim() ||
+    (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  if (!supabaseUrl || !bearer) {
+    console.warn(
+      `[pool-worker-ready] skip reason=${reason} missing env (SUPABASE_URL=${supabaseUrl ? 'set' : 'missing'} bearer=${
+        bearer ? 'set' : 'missing'
+      })`
+    );
+    return false;
+  }
+
+  const [dropletIdRaw, publicIp] = await Promise.all([
+    fetchTextWithTimeout('http://169.254.169.254/metadata/v1/id', 3000),
+    fetchTextWithTimeout('http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address', 3000),
+  ]);
+  const dropletId = Number(dropletIdRaw);
+  if (!Number.isFinite(dropletId) || dropletId <= 0 || !publicIp) {
+    console.warn(
+      `[pool-worker-ready] metadata unavailable reason=${reason} dropletId=${dropletIdRaw || 'missing'} publicIp=${
+        publicIp || 'missing'
+      }`
+    );
+    return false;
+  }
+
+  try {
+    const res = await fetch(`${supabaseUrl}/functions/v1/cold-dm-vps-proxy`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${bearer}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'poolWorkerReady',
+        dropletId,
+        publicIp,
+      }),
+    });
+    if (!res.ok) {
+      const bodyPreview = String(await res.text().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 300);
+      console.warn(
+        `[pool-worker-ready] callback failed reason=${reason} status=${res.status} body=${bodyPreview || 'n/a'}`
+      );
+      return false;
+    }
+    console.log(`[pool-worker-ready] callback ok reason=${reason} dropletId=${dropletId} publicIp=${publicIp}`);
+    return true;
+  } catch (e) {
+    console.warn(`[pool-worker-ready] callback exception reason=${reason} error=${e?.message || e}`);
+    return false;
+  }
+}
+
+function schedulePoolWorkerReadyRegistration() {
+  const isPoolMode = process.env.COLD_DM_POOL_MODE === '1' || process.env.COLD_DM_POOL_MODE === 'true';
+  if (!isPoolMode) return;
+
+  const runAfter = (reason, delayMs) => {
+    setTimeout(async () => {
+      if (getClientId()) return;
+      const ok = await notifyPoolWorkerReady(reason);
+      if (!ok && !getClientId()) runAfter('retry', 30000);
+    }, delayMs);
+  };
+
+  runAfter('startup', 5000);
+}
+
 app.use('/api', (req, res, next) => {
   if (req.path === '/health') return next();
+  if (req.path === '/internal/env-check') return next();
   if (req.path === '/internal/scale-send-workers') return next();
   const key = getPresentedApiKey(req);
   if (!key) {
@@ -187,6 +374,65 @@ app.use('/api', (req, res, next) => {
   return res.status(401).json({ error: 'Unauthorized' });
 });
 
+// --- API: admin maintenance (fixed actions only; no arbitrary command execution) ---
+app.post('/api/admin/update', (req, res) => {
+  // Safe "pull + restart" endpoint for per-client droplets so Edge can deploy updates without SSH.
+  // Protected by the same Bearer COLD_DM_API_KEY middleware above.
+  const branch = String(process.env.COLD_DM_WORKER_BRANCH || process.env.GIT_BRANCH || 'main')
+    .trim() || 'main';
+  const updateId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString('hex');
+  const cmd = `${getPuppeteerDepsInstallCommand()} && cd ${projectRoot} && git pull origin ${branch} && npm install && pm2 restart all --update-env`;
+
+  logger.log(`[admin:update] accepted updateId=${updateId} branch=${branch}`);
+  res.json({
+    ok: true,
+    accepted: true,
+    updateId,
+    branch,
+    restarting: true,
+    bootIdBeforeRestart: PROCESS_BOOT_ID,
+  });
+
+  setTimeout(() => {
+    exec(cmd, { maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        logger.error(`[admin:update] failed updateId=${updateId} error=${String(err.message || err)}`);
+        if (stdout) logger.error(`[admin:update] stdout updateId=${updateId} ${String(stdout).slice(0, 8000)}`);
+        if (stderr) logger.error(`[admin:update] stderr updateId=${updateId} ${String(stderr).slice(0, 8000)}`);
+        return;
+      }
+      logger.log(`[admin:update] finished updateId=${updateId}`);
+      if (stdout) logger.log(`[admin:update] stdout updateId=${updateId} ${String(stdout).slice(0, 8000)}`);
+      if (stderr) logger.log(`[admin:update] stderr updateId=${updateId} ${String(stderr).slice(0, 8000)}`);
+    });
+  }, 25);
+});
+
+app.post('/api/admin/assign-client', (req, res) => {
+  // Used by the Edge function when assigning a spare pool droplet to a client.
+  // Pins this droplet to that clientId so requests cannot target other tenants.
+  const clientId = (req.body?.clientId || '').toString().trim();
+  if (!clientId) {
+    return res.status(400).json({ ok: false, error: 'clientId is required' });
+  }
+  try {
+    // Do not rewrite the whole .env (it contains secrets); patch just this key.
+    upsertEnvKey('COLD_DM_CLIENT_ID', clientId);
+    setClientId(clientId);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) || 'Failed to pin clientId' });
+  }
+  // IMPORTANT: respond before restarting. Restarting the process can kill this request mid-flight,
+  // which makes the Edge function hang/timeout even though the assignment succeeded.
+  res.json({ ok: true, clientId, restarting: true, bootIdBeforeRestart: PROCESS_BOOT_ID });
+  setTimeout(() => {
+    const cmd = 'pm2 restart ig-dm-dashboard --update-env';
+    exec(cmd, { maxBuffer: 4 * 1024 * 1024 }, (err) => {
+      if (err) console.error('[API] assign-client pm2 restart failed', err);
+    });
+  }, 50);
+});
+
 const { registerAdminLabRoutes } = require('./admin_lab/http');
 const { runScaleSendWorkers } = require('./lib/scaleSendWorkers');
 registerAdminLabRoutes(app);
@@ -197,6 +443,133 @@ const uploadVoice = multer({ dest: voiceNotesDir, limits: { fileSize: 25 * 1024 
 const BOT_PM2_NAME = 'ig-dm-send';
 const SEND_WORKER_ENTRY = process.env.SEND_WORKER_ENTRY || 'workers/send-worker.js';
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
+const SEND_SCRAPE_COOLDOWN_MS = Math.max(
+  60 * 1000,
+  parseInt(process.env.SEND_SCRAPE_COOLDOWN_MS || String(5 * 60 * 1000), 10) || 5 * 60 * 1000
+);
+const PROCESS_SCHEDULED_RESPONSES_FALLBACK_ENABLED =
+  process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK !== '0' &&
+  process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK !== 'false';
+const PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS = Math.max(
+  30 * 1000,
+  parseInt(process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS || '60000', 10) || 60000
+);
+const PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS = Math.max(
+  30 * 1000,
+  parseInt(process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS || '300000', 10) || 300000
+);
+
+let processScheduledResponsesFallbackInFlight = false;
+
+function formatDurationShort(ms) {
+  const safeMs = Math.max(0, Number(ms) || 0);
+  const totalSec = Math.max(1, Math.ceil(safeMs / 1000));
+  if (totalSec < 60) return `${totalSec} second${totalSec === 1 ? '' : 's'}`;
+  const min = Math.max(1, Math.round(totalSec / 60));
+  if (min < 60) return `${min} minute${min === 1 ? '' : 's'}`;
+  const hours = Math.floor(min / 60);
+  const mins = min % 60;
+  if (mins === 0) return `${hours} hour${hours === 1 ? '' : 's'}`;
+  return `${hours} hour${hours === 1 ? '' : 's'} ${mins} minute${mins === 1 ? '' : 's'}`;
+}
+
+function normalizeProxyUrl(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  // Decodo colon format: host:port:user:pass
+  if (!/^[a-z]+:\/\//i.test(s)) {
+    const parts = s.split(':');
+    if (parts.length >= 4 && parts[0] && parts[1] && parts[2]) {
+      const host = parts[0];
+      const port = parts[1];
+      const user = parts[2];
+      const pass = parts.slice(3).join(':');
+      return normalizeProxyUrl(`http://${user}:${pass}@${host}:${port}`);
+    }
+    return s;
+  }
+  try {
+    const u = new URL(s);
+    if (u.username || u.password) {
+      // Percent-encode userinfo; keep unreserved per RFC3986.
+      const enc = (v) =>
+        encodeURIComponent(v)
+          .replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase())
+          .replace(/%7E/g, '~');
+      const user = enc(u.username || '');
+      const pass = enc(u.password || '');
+      const host = u.host;
+      const auth = user || pass ? `${user}:${pass}@` : '';
+      return `${u.protocol}//${auth}${host}${u.pathname || ''}${u.search || ''}${u.hash || ''}`;
+    }
+    return s;
+  } catch {
+    return s;
+  }
+}
+
+function getProcessScheduledResponsesBearer() {
+  const edgeInternal = (process.env.EDGE_INTERNAL_FUNCTION_SECRET || '').trim();
+  if (edgeInternal) return edgeInternal;
+  return (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+}
+
+async function triggerProcessScheduledResponsesFallback(reason = 'interval') {
+  if (processScheduledResponsesFallbackInFlight) {
+    logger.log(`[process-scheduled-responses:fallback] skip overlapping tick reason=${reason}`);
+    return;
+  }
+  const supabaseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+  const bearer = getProcessScheduledResponsesBearer();
+  if (!supabaseUrl || !bearer) {
+    logger.warn(
+      `[process-scheduled-responses:fallback] disabled at runtime: missing env (SUPABASE_URL=${
+        supabaseUrl ? 'set' : 'missing'
+      } auth_secret_len=${String(bearer || '').length})`
+    );
+    return;
+  }
+
+  processScheduledResponsesFallbackInFlight = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS);
+  try {
+    const url = `${supabaseUrl}/functions/v1/process-scheduled-responses`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${bearer}`,
+        'Content-Type': 'application/json',
+        'X-Triggered-By': 'cold-dm-vps-fallback',
+      },
+      body: JSON.stringify({ timestamp: new Date().toISOString(), reason }),
+      signal: controller.signal,
+    });
+    const text = await res.text().catch(() => '');
+    const snippet = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400);
+    if (!res.ok) {
+      logger.warn(
+        `[process-scheduled-responses:fallback] tick failed status=${res.status} reason=${reason} body=${snippet || 'n/a'}`
+      );
+      return;
+    }
+  } catch (e) {
+    if (e?.name === 'AbortError' || String(e?.message || e) === 'This operation was aborted') {
+      logger.log(
+        `[process-scheduled-responses:fallback] tick timed out after ${Math.ceil(
+          PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS / 1000
+        )}s reason=${reason}`
+      );
+      return;
+    }
+    logger.warn(
+      `[process-scheduled-responses:fallback] tick exception reason=${reason} error=${e?.message || e}`
+    );
+  } finally {
+    clearTimeout(timeout);
+    processScheduledResponsesFallbackInFlight = false;
+  }
+}
 
 /** Hands-free PM2 scaling: on by default when Supabase is configured. Set SCALE_SEND_WORKERS_AUTO=0 to disable (e.g. laptop without PM2). */
 function shouldAutoScaleSendWorkers() {
@@ -383,94 +756,252 @@ async function ensureSendWorkerProcess() {
   return { ok: false, action: 'create_missing_failed', out: create.out, err: create.err };
 }
 
-// Status must return before dashboard / edge proxies time out. `pm2 jlist` can stall when PM2 RPC is slow — cap it separately (getBotProcessRunning).
-const STATUS_TIMEOUT_MS = 12000;
+const STATUS_TIMEOUT_MS = 8000; // respond before typical Edge Function timeouts (~10–15s); status uses fast queries
+const STATUS_COMPONENT_TIMEOUT_MS = Math.max(
+  1200,
+  parseInt(process.env.STATUS_COMPONENT_TIMEOUT_MS || '3200', 10) || 3200
+);
+const STATUS_SLOW_COMPONENT_LOG_MS = Math.max(
+  250,
+  parseInt(process.env.STATUS_SLOW_COMPONENT_LOG_MS || '1200', 10) || 1200
+);
+const STATUS_CACHE_TTL_MS = Math.max(
+  1000,
+  parseInt(process.env.STATUS_CACHE_TTL_MS || '12000', 10) || 12000
+);
+const STATUS_CACHE_STALE_MAX_MS = Math.max(
+  STATUS_CACHE_TTL_MS,
+  parseInt(process.env.STATUS_CACHE_STALE_MAX_MS || '120000', 10) || 120000
+);
+const PM2_STATUS_CACHE_TTL_MS = Math.max(
+  1000,
+  parseInt(process.env.PM2_STATUS_CACHE_TTL_MS || '15000', 10) || 15000
+);
+
+const statusCacheByKey = new Map();
+const pm2RunningCache = {
+  value: false,
+  updatedAt: 0,
+  inFlight: null,
+};
+
+function timeoutAfter(ms, label) {
+  return new Promise((_, reject) => {
+    setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+}
+
+async function settleStatusComponent(label, promise, fallbackValue) {
+  const startedAt = Date.now();
+  try {
+    const value = await Promise.race([
+      Promise.resolve(promise),
+      timeoutAfter(STATUS_COMPONENT_TIMEOUT_MS, label),
+    ]);
+    const elapsedMs = Date.now() - startedAt;
+    if (elapsedMs >= STATUS_SLOW_COMPONENT_LOG_MS) {
+      console.warn(`[API] /api/status slow component ${label}: ${elapsedMs}ms`);
+    }
+    return { ok: true, value, elapsedMs };
+  } catch (err) {
+    const elapsedMs = Date.now() - startedAt;
+    console.warn(
+      `[API] /api/status component fallback ${label}: ${elapsedMs}ms (${err?.message || err})`
+    );
+    return { ok: false, value: fallbackValue, elapsedMs, error: err };
+  }
+}
+
+function getStatusCacheKey(useSupabase, clientId) {
+  if (useSupabase && clientId) return `sb:${clientId}`;
+  return 'local';
+}
+
+async function getBotProcessRunningCached() {
+  const now = Date.now();
+  if (now - pm2RunningCache.updatedAt <= PM2_STATUS_CACHE_TTL_MS) {
+    return pm2RunningCache.value;
+  }
+  if (pm2RunningCache.inFlight) {
+    return pm2RunningCache.inFlight;
+  }
+  pm2RunningCache.inFlight = new Promise((resolve) => getBotProcessRunning(resolve))
+    .then((v) => {
+      pm2RunningCache.value = !!v;
+      pm2RunningCache.updatedAt = Date.now();
+      return pm2RunningCache.value;
+    })
+    .catch(() => {
+      pm2RunningCache.updatedAt = Date.now();
+      return pm2RunningCache.value;
+    })
+    .finally(() => {
+      pm2RunningCache.inFlight = null;
+    });
+  return pm2RunningCache.inFlight;
+}
+
+async function buildStatusPayload({ useSupabase, clientId, requestStartedAt }) {
+  if (useSupabase) {
+    const [processRunningPm2Res, statsRes, statusMessageRes, leadsCountsRes, pauseFlagRes] =
+      await Promise.all([
+        settleStatusComponent('pm2_running', getBotProcessRunningCached(), false),
+        settleStatusComponent('daily_stats', getDailyStatsSupabase(clientId), {
+          total_sent: 0,
+          total_failed: 0,
+        }),
+        settleStatusComponent('status_message', getClientStatusMessageSupabase(clientId), null),
+        settleStatusComponent('lead_counts', getLeadsTotalAndRemaining(clientId), {
+          total: 0,
+          remaining: 0,
+        }),
+        settleStatusComponent('control_pause', getControlSupabase(clientId), '1'),
+      ]);
+
+    const paused = pauseFlagRes.value === '1' || pauseFlagRes.value === 1;
+    const processRunning = processRunningPm2Res.value && !paused;
+    const degraded =
+      !processRunningPm2Res.ok ||
+      !statsRes.ok ||
+      !statusMessageRes.ok ||
+      !leadsCountsRes.ok ||
+      !pauseFlagRes.ok;
+
+    if (degraded) {
+      const failedLabels = [
+        !processRunningPm2Res.ok ? 'pm2_running' : null,
+        !statsRes.ok ? 'daily_stats' : null,
+        !statusMessageRes.ok ? 'status_message' : null,
+        !leadsCountsRes.ok ? 'lead_counts' : null,
+        !pauseFlagRes.ok ? 'control_pause' : null,
+      ]
+        .filter(Boolean)
+        .join(', ');
+      console.warn(
+        `[API] /api/status degraded response for client=${clientId} after ${Date.now() - requestStartedAt}ms; failed=${failedLabels}`
+      );
+    } else if (Date.now() - requestStartedAt >= STATUS_TIMEOUT_MS) {
+      console.warn(
+        `[API] /api/status exceeded target timeout (${Date.now() - requestStartedAt}ms) without failure`
+      );
+    }
+
+    return {
+      processRunning,
+      statusMessage: statusMessageRes.value ?? (processRunning ? null : 'Stopped'),
+      todaySent: statsRes.value.total_sent ?? 0,
+      todayFailed: statsRes.value.total_failed ?? 0,
+      leadsTotal: leadsCountsRes.value.total ?? 0,
+      leadsRemaining: leadsCountsRes.value.remaining ?? 0,
+      statusDegraded: degraded,
+    };
+  }
+
+  const processRunningRes = await settleStatusComponent('pm2_running', getBotProcessRunningCached(), false);
+  const stats = getDailyStats();
+  const leadsRes = await settleStatusComponent('csv_leads', loadLeadsFromCSV(leadsPath), []);
+  const leads = Array.isArray(leadsRes.value) ? leadsRes.value : [];
+  const leadsRemaining = leads.filter((u) => !alreadySent(u)).length;
+  const degraded = !processRunningRes.ok || !leadsRes.ok;
+  return {
+    processRunning: processRunningRes.value,
+    todaySent: stats.total_sent,
+    todayFailed: stats.total_failed,
+    leadsTotal: leads.length,
+    leadsRemaining,
+    statusDegraded: degraded,
+  };
+}
+
+function readCachedStatus(cacheKey) {
+  const entry = statusCacheByKey.get(cacheKey);
+  if (!entry || !entry.payload || !entry.updatedAt) return null;
+  const ageMs = Date.now() - entry.updatedAt;
+  return {
+    entry,
+    ageMs,
+    isFresh: ageMs <= STATUS_CACHE_TTL_MS,
+    isWithinStaleWindow: ageMs <= STATUS_CACHE_STALE_MAX_MS,
+  };
+}
 
 // --- API: health (for proxy/dashboard connectivity check; no DB or pm2) ---
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true });
+  res.json(getHealthPayload());
 });
 
 // --- API: status & stats ---
 // Returns immediately using only fast queries and stored status (set by the sender loop). No schedule recomputation.
-app.get('/api/status', (req, res) => {
+app.get('/api/status', async (req, res) => {
   const clientId = resolveRequestedClientId(req);
   if (req.authClientId && clientId && req.authClientId !== clientId) {
     return res.status(403).json({ error: 'Forbidden: clientId mismatch for provided API key' });
   }
   const useSupabase = isSupabaseConfigured() && clientId;
-  let responded = false;
-  const send = (status, body) => {
-    if (responded) return;
-    responded = true;
-    clearTimeout(timer);
-    res.status(status).json(body);
-  };
-  const timer = setTimeout(() => {
-    if (responded) return;
-    console.warn('[API] /api/status timeout – responding 503');
-    send(503, {
-      error: 'Status request timed out. Try again.',
-      processRunning: false,
-      statusMessage: null,
-      todaySent: 0,
-      todayFailed: 0,
-      leadsTotal: 0,
-      leadsRemaining: 0,
+  const requestStartedAt = Date.now();
+  const cacheKey = getStatusCacheKey(useSupabase, clientId);
+  const cached = readCachedStatus(cacheKey);
+
+  if (cached?.isFresh) {
+    return res.status(200).json({
+      ...cached.entry.payload,
+      statusCached: true,
+      statusCacheAgeMs: cached.ageMs,
     });
-  }, STATUS_TIMEOUT_MS);
+  }
 
-  const processRunningPromise = new Promise((resolve) => getBotProcessRunning(resolve));
-
-  (async () => {
-    try {
-      if (useSupabase) {
-        const [processRunningPm2, stats, statusMessage, leadsCounts, pauseFlag] = await Promise.all([
-          processRunningPromise,
-          getDailyStatsSupabase(clientId),
-          getClientStatusMessageSupabase(clientId),
-          getLeadsTotalAndRemaining(clientId),
-          getControlSupabase(clientId),
-        ]);
-        const paused = pauseFlag === '1' || pauseFlag === 1;
-        const processRunning = processRunningPm2 && !paused;
-        send(200, {
-          processRunning,
-          statusMessage: statusMessage ?? (processRunning ? null : 'Stopped'),
-          todaySent: stats.total_sent,
-          todayFailed: stats.total_failed,
-          leadsTotal: leadsCounts.total,
-          leadsRemaining: leadsCounts.remaining,
-        });
-      } else {
-        const processRunning = await processRunningPromise;
-        const stats = getDailyStats();
-        loadLeadsFromCSV(leadsPath)
-          .then((leads) => {
-            const leadsRemaining = leads.filter((u) => !alreadySent(u)).length;
-            send(200, {
-              processRunning,
-              todaySent: stats.total_sent,
-              todayFailed: stats.total_failed,
-              leadsTotal: leads.length,
-              leadsRemaining,
-            });
-          })
-          .catch(() => {
-            send(200, {
-              processRunning,
-              todaySent: stats.total_sent,
-              todayFailed: stats.total_failed,
-              leadsTotal: 0,
-              leadsRemaining: 0,
-            });
-          });
-      }
-    } catch (e) {
-      console.error('[API] Status error', e);
-      send(500, { error: e.message });
+  try {
+    let cacheEntry = statusCacheByKey.get(cacheKey);
+    if (!cacheEntry) {
+      cacheEntry = { payload: null, updatedAt: 0, inFlight: null };
+      statusCacheByKey.set(cacheKey, cacheEntry);
     }
-  })();
+
+    if (!cacheEntry.inFlight) {
+      cacheEntry.inFlight = buildStatusPayload({ useSupabase, clientId, requestStartedAt })
+        .then((payload) => {
+          cacheEntry.payload = payload;
+          cacheEntry.updatedAt = Date.now();
+          return payload;
+        })
+        .finally(() => {
+          cacheEntry.inFlight = null;
+        });
+    }
+
+    // Serve stale quickly while a refresh is happening; avoids hammering pm2/supabase under load.
+    if (cached?.isWithinStaleWindow && cacheEntry.inFlight) {
+      return res.status(200).json({
+        ...cached.entry.payload,
+        statusCached: true,
+        statusStale: true,
+        statusCacheAgeMs: cached.ageMs,
+      });
+    }
+
+    const payload = await cacheEntry.inFlight;
+    return res.status(200).json({
+      ...payload,
+      statusCached: false,
+      statusCacheAgeMs: 0,
+    });
+  } catch (e) {
+    const fallback = readCachedStatus(cacheKey);
+    if (fallback?.isWithinStaleWindow) {
+      console.warn(
+        `[API] /api/status using stale cache after refresh error (${e?.message || e}); age=${fallback.ageMs}ms`
+      );
+      return res.status(200).json({
+        ...fallback.entry.payload,
+        statusCached: true,
+        statusStale: true,
+        statusCacheAgeMs: fallback.ageMs,
+        statusDegraded: true,
+      });
+    }
+    console.error('[API] Status error', e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
 app.get('/api/stats', (req, res) => {
@@ -541,19 +1072,62 @@ function readEnv() {
   const content = fs.readFileSync(envPath, 'utf8');
   for (const line of content.split('\n')) {
     const m = line.match(/^([^#=]+)=(.*)$/);
-    if (m) out[m[1].trim()] = m[2].trim();
+    if (!m) continue;
+    const k = m[1].trim();
+    // Only expose/edit non-secret dashboard settings keys.
+    if (ENV_KEYS.includes(k)) {
+      out[k] = m[2].trim();
+    }
   }
   return out;
 }
 
-function writeEnv(obj) {
-  const lines = [];
-  for (const key of ENV_KEYS) {
-    if (obj[key] !== undefined && obj[key] !== '') {
-      lines.push(`${key}=${String(obj[key]).trim()}`);
-    }
+function upsertEnvKey(key, value) {
+  const k = String(key || '').trim();
+  if (!k) return;
+  const v = value == null ? '' : String(value).trim();
+  const nextLine = `${k}=${v}`;
+  const existing = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf8') : '';
+  const lines = existing.split('\n');
+  let replaced = false;
+  const out = lines.map((line) => {
+    const m = line.match(/^([^#=]+)=(.*)$/);
+    if (!m) return line;
+    const lk = m[1].trim();
+    if (lk !== k) return line;
+    replaced = true;
+    return nextLine;
+  });
+  if (!replaced) {
+    if (out.length > 0 && out[out.length - 1] !== '') out.push('');
+    out.push(nextLine);
   }
-  fs.writeFileSync(envPath, lines.join('\n') + '\n', 'utf8');
+  fs.writeFileSync(envPath, out.join('\n').replace(/\n+$/g, '\n') + '\n', 'utf8');
+}
+
+function deleteEnvKey(key) {
+  const k = String(key || '').trim();
+  if (!k) return;
+  if (!fs.existsSync(envPath)) return;
+  const existing = fs.readFileSync(envPath, 'utf8');
+  const lines = existing.split('\n');
+  const out = lines.filter((line) => {
+    const m = line.match(/^([^#=]+)=(.*)$/);
+    if (!m) return true;
+    return m[1].trim() !== k;
+  });
+  fs.writeFileSync(envPath, out.join('\n').replace(/\n+$/g, '\n') + '\n', 'utf8');
+}
+
+function writeEnv(obj) {
+  // IMPORTANT: do not overwrite the entire .env. It contains secrets used by the worker
+  // (SUPABASE_URL, service keys, proxy creds, API key), and we only allow editing a safe subset.
+  for (const key of ENV_KEYS) {
+    if (obj[key] === undefined) continue;
+    const v = String(obj[key] ?? '').trim();
+    if (!v) deleteEnvKey(key);
+    else upsertEnvKey(key, v);
+  }
 }
 
 app.get('/api/settings', (req, res) => {
@@ -567,10 +1141,9 @@ app.post('/api/settings', (req, res) => {
   const env = readEnv();
   const body = req.body || {};
   for (const key of ENV_KEYS) {
-    if (body[key] !== undefined) {
-      if (key === 'INSTAGRAM_PASSWORD' && body[key] === '********') continue;
-      env[key] = body[key];
-    }
+    if (body[key] === undefined) continue;
+    if (key === 'INSTAGRAM_PASSWORD' && body[key] === '********') continue;
+    env[key] = body[key];
   }
   writeEnv(env);
   res.json({ ok: true });
@@ -899,9 +1472,16 @@ function cleanupExpiredScraper2FA() {
 // { ok: false, code: 'two_factor_required', pending2FAId } for POST /api/instagram/connect/2fa.
 // If it does not reach 2FA (e.g. straight login or email-code checkpoint), connect is rejected.
 app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
-  const { username, password, clientId, platformScraperPool, platformScraperBackup } = req.body || {};
-  const isPlatformPool = platformScraperPool === true || platformScraperPool === 'true' || platformScraperPool === 1;
-  const isPlatformBackup = platformScraperBackup === true || platformScraperBackup === 'true' || platformScraperBackup === 1;
+  const { username, password, clientId } = req.body || {};
+  const reqId = require('crypto').randomBytes(6).toString('hex');
+  const startedAt = Date.now();
+  const safeUser = String(username || '').trim().replace(/^@/, '').toLowerCase();
+  const safeClient = String(clientId || '').trim();
+  console.log(
+    `[API] instagram_connect:start id=${reqId} clientId=${safeClient ? safeClient.slice(0, 8) : 'missing'} user=${
+      safeUser || 'missing'
+    }`
+  );
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
@@ -913,31 +1493,59 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
   }
   try {
     const isAdmin = await isAdminUser(clientId).catch(() => false);
-    // Platform pool uses a shared client_id with many cold_dm_instagram_sessions + platform rows (primary + backup).
-    // isAdminUser(clientId) is keyed by user id, not client id — do not block pool connects after the first session.
-    if (!isAdmin && !isPlatformPool) {
-      const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
-      if (activeCount > 0) {
+    const igKey = String(username)
+      .trim()
+      .replace(/^@/, '')
+      .toLowerCase();
+    if (!isAdmin) {
+      // Non-admins can have only one automation account. Reconnect is allowed only when it's the same handle.
+      const existing = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+      const existingKey =
+        existing?.instagram_username != null ? String(existing.instagram_username).trim().toLowerCase() : null;
+      if (existingKey && existingKey !== igKey) {
         return res.status(400).json({
           ok: false,
           error: 'Only one automation Instagram account is allowed for this account. Remove the current session before connecting another.',
         });
       }
     }
-    const igKey = String(username)
-      .trim()
-      .replace(/^@/, '')
-      .toLowerCase();
     let proxyMeta = { proxyUrl: null, proxyAssignmentId: null };
     try {
       proxyMeta = await getOrResolveColdDmProxyUrl(clientId, igKey);
     } catch (pe) {
+      console.error(
+        `[API] instagram_connect:proxy_failed id=${reqId} afterMs=${Date.now() - startedAt}`,
+        pe
+      );
       return res.status(503).json({
         ok: false,
         error: pe instanceof Error ? pe.message : String(pe) || 'Could not allocate proxy (check Decodo API and credits)',
       });
     }
+    console.log(
+      `[API] instagram_connect:proxy_ok id=${reqId} afterMs=${Date.now() - startedAt} proxy=${
+        proxyMeta.proxyUrl ? 'set' : 'missing'
+      } assignmentId=${proxyMeta.proxyAssignmentId ? String(proxyMeta.proxyAssignmentId).slice(0, 8) : 'n/a'}`
+    );
+    const allowNoProxy =
+      process.env.COLD_DM_ALLOW_NO_PROXY === '1' || process.env.COLD_DM_ALLOW_NO_PROXY === 'true';
+    if (!allowNoProxy && !proxyMeta.proxyUrl) {
+      return res.status(503).json({
+        ok: false,
+        error:
+          'Proxy is not configured for this VPS worker. Set DECODO_SHARED_USERNAME/DECODO_SHARED_PASSWORD (or DECODO_API_KEY) and retry Connect.',
+        code: 'proxy_not_configured',
+      });
+    }
+    console.log(
+      `[API] instagram_connect:puppeteer_start id=${reqId} afterMs=${Date.now() - startedAt}`
+    );
     const result = await connectInstagram(username, password, null, { proxyUrl: proxyMeta.proxyUrl });
+    console.log(
+      `[API] instagram_connect:puppeteer_done id=${reqId} afterMs=${Date.now() - startedAt} twoFactor=${
+        result?.twoFactorRequired ? '1' : '0'
+      } emailVerify=${result?.emailVerificationRequired ? '1' : '0'}`
+    );
     if (result.twoFactorRequired) {
       cleanupExpired2FA();
       const pendingId = require('crypto').randomBytes(16).toString('hex');
@@ -949,9 +1557,13 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
         createdAt: Date.now(),
         proxyUrl: proxyMeta.proxyUrl,
         proxyAssignmentId: proxyMeta.proxyAssignmentId,
-        platformScraperPool: isPlatformPool,
-        platformScraperBackup: isPlatformBackup,
       });
+      console.log(
+        `[API] instagram_connect:two_factor_required id=${reqId} afterMs=${Date.now() - startedAt} pending2FAId=${pendingId.slice(
+          0,
+          8
+        )}`
+      );
       return res.status(200).json({
         ok: false,
         code: 'two_factor_required',
@@ -961,6 +1573,9 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
     }
     if (result.emailVerificationRequired) {
       if (result.browser) result.browser.close().catch(() => {});
+      console.log(
+        `[API] instagram_connect:email_verification_required id=${reqId} afterMs=${Date.now() - startedAt}`
+      );
       return res.status(400).json({
         ok: false,
         code: 'two_factor_required_for_connect',
@@ -973,21 +1588,22 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
       proxyUrl: proxyMeta.proxyUrl,
       proxyAssignmentId: proxyMeta.proxyAssignmentId,
     });
-    if (isPlatformPool) {
-      await savePlatformScraperSession(
-        mergeInstagramSessionData(result.cookies, result.web_storage),
-        result.username,
-        req.body?.daily_actions_limit != null ? req.body.daily_actions_limit : 500,
-        { forceInsert: isPlatformBackup }
-      );
-    }
+    await updateSettingsInstagramUsername(clientId, result.username).catch(() => {});
+    console.log(
+      `[API] instagram_connect:success id=${reqId} afterMs=${Date.now() - startedAt} user=${String(
+        result.username || ''
+      )
+        .trim()
+        .replace(/^@/, '')
+        .toLowerCase()}`
+    );
     return res.status(200).json({
       ok: true,
       username: result.username,
       message: 'Connected. Existing Instagram session was restored.',
     });
   } catch (e) {
-    console.error('[API] Instagram connect failed', e);
+    console.error(`[API] instagram_connect:failed id=${reqId} afterMs=${Date.now() - startedAt}`, e);
     if (e.code === 'TWO_FACTOR_REQUIRED') {
       return res.status(200).json({ ok: false, code: 'two_factor_required', message: e.message || 'Enter the 6-digit code from your app or WhatsApp.' });
     }
@@ -1004,9 +1620,7 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
 });
 
 app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
-  const { pending2FAId, twoFactorCode, clientId, platformScraperPool, platformScraperBackup, daily_actions_limit } = req.body || {};
-  const isPlatformPool = platformScraperPool === true || platformScraperPool === 'true' || platformScraperPool === 1;
-  const isPlatformBackup = platformScraperBackup === true || platformScraperBackup === 'true' || platformScraperBackup === 1;
+  const { pending2FAId, twoFactorCode, clientId } = req.body || {};
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
@@ -1029,10 +1643,12 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
   try {
     const result = await completeInstagram2FA(pending.page, pending.browser, twoFactorCode, pending.username);
     const isAdmin = await isAdminUser(clientId).catch(() => false);
-    const poolConnect = isPlatformPool || pending.platformScraperPool === true;
-    if (!isAdmin && !poolConnect) {
-      const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
-      if (activeCount > 0) {
+    if (!isAdmin) {
+      const existing = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+      const existingKey =
+        existing?.instagram_username != null ? String(existing.instagram_username).trim().toLowerCase() : null;
+      const nextKey = result?.username != null ? String(result.username).trim().replace(/^@/, '').toLowerCase() : null;
+      if (existingKey && nextKey && existingKey !== nextKey) {
         if (pending.browser) pending.browser.close().catch(() => {});
         return res.status(400).json({
           ok: false,
@@ -1044,16 +1660,6 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
       proxyUrl: pending.proxyUrl,
       proxyAssignmentId: pending.proxyAssignmentId,
     });
-    if (isPlatformPool || pending.platformScraperPool) {
-      await savePlatformScraperSession(
-        mergeInstagramSessionData(result.cookies, result.web_storage),
-        result.username,
-        daily_actions_limit != null ? daily_actions_limit : 500,
-        { forceInsert: isPlatformBackup || pending.platformScraperBackup === true }
-      ).catch(() => {});
-      res.json({ ok: true, cookies: result.cookies, username: result.username, instagram_username: result.username });
-      return;
-    }
     await updateSettingsInstagramUsername(clientId, result.username);
     res.json({ ok: true });
   } catch (e) {
@@ -1064,9 +1670,7 @@ app.post('/api/instagram/connect/2fa', connectLimiter, async (req, res) => {
 });
 
 app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) => {
-  const { pendingEmailId, emailCode, clientId, platformScraperPool, platformScraperBackup, daily_actions_limit } = req.body || {};
-  const isPlatformPool = platformScraperPool === true || platformScraperPool === 'true' || platformScraperPool === 1;
-  const isPlatformBackup = platformScraperBackup === true || platformScraperBackup === 'true' || platformScraperBackup === 1;
+  const { pendingEmailId, emailCode, clientId } = req.body || {};
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
@@ -1080,9 +1684,6 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
   if (String(pending.clientId) !== String(clientId)) {
     return res.status(403).json({ ok: false, error: 'Forbidden: pending verification session does not belong to this clientId' });
   }
-  if (!!pending.platformScraperPool !== !!isPlatformPool) {
-    return res.status(403).json({ ok: false, error: 'Forbidden: pending verification session type mismatch' });
-  }
   if (Date.now() - pending.createdAt > PENDING_2FA_TTL_MS) {
     pendingEmailVerifyMap.delete(pendingEmailId);
     if (pending.browser) pending.browser.close().catch(() => {});
@@ -1092,10 +1693,12 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
   try {
     const result = await completeInstagramEmailVerification(pending.page, pending.browser, emailCode, pending.username);
     const isAdmin = await isAdminUser(clientId).catch(() => false);
-    const poolConnectEmail = isPlatformPool || pending.platformScraperPool === true;
-    if (!isAdmin && !poolConnectEmail) {
-      const activeCount = await countActiveVpsInstagramSessions(clientId).catch(() => 0);
-      if (activeCount > 0) {
+    if (!isAdmin) {
+      const existing = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+      const existingKey =
+        existing?.instagram_username != null ? String(existing.instagram_username).trim().toLowerCase() : null;
+      const nextKey = result?.username != null ? String(result.username).trim().replace(/^@/, '').toLowerCase() : null;
+      if (existingKey && nextKey && existingKey !== nextKey) {
         if (pending.browser) pending.browser.close().catch(() => {});
         return res.status(400).json({
           ok: false,
@@ -1107,15 +1710,6 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
       proxyUrl: pending.proxyUrl,
       proxyAssignmentId: pending.proxyAssignmentId,
     });
-    if (isPlatformPool) {
-      await savePlatformScraperSession(
-        mergeInstagramSessionData(result.cookies, result.web_storage),
-        result.username,
-        daily_actions_limit || 500,
-        { forceInsert: isPlatformBackup || pending.platformScraperBackup === true }
-      ).catch(() => {});
-      return res.json({ ok: true, cookies: result.cookies, username: result.username, instagram_username: result.username });
-    }
     await updateSettingsInstagramUsername(clientId, result.username);
     res.json({ ok: true });
   } catch (e) {
@@ -1123,6 +1717,13 @@ app.post('/api/instagram/connect/email-code', connectLimiter, async (req, res) =
     if (pending.browser) pending.browser.close().catch(() => {});
     res.status(500).json({ ok: false, error: e.message || 'Email verification failed' });
   }
+});
+
+app.post('/api/instagram/instagrapi/connect', (_req, res) => {
+  return res.status(410).json({
+    ok: false,
+    error: 'Instagrapi scraping has been removed. Use the legacy Puppeteer connect and scrape flow.',
+  });
 });
 
 // --- API: bot control (PM2 start/stop) ---
@@ -1166,6 +1767,27 @@ app.post('/api/control/start', async (req, res) => {
           code: 'session_reconnect_required',
           error: reconnectMessage,
         });
+      }
+      const sessionRow = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+      if (sessionRow?.scrape_cooldown_until) {
+        const untilMs = new Date(sessionRow.scrape_cooldown_until).getTime();
+        if (Number.isFinite(untilMs) && untilMs > Date.now()) {
+          const waitMs = untilMs - Date.now();
+          const cooldownMessage = `Scraping cooldown active for account safety. Sending can resume in ${formatDurationShort(waitMs)}.`;
+          await setClientStatusMessage(clientId, cooldownMessage).catch(() => {});
+          return res.status(400).json({
+            ok: false,
+            code: 'scrape_cooldown',
+            error: cooldownMessage,
+            scrapeCooldownUntil: sessionRow.scrape_cooldown_until,
+          });
+        }
+      }
+      const noWorkHint = await getNoWorkHint(clientId).catch(() => '');
+      if (noWorkHint) {
+        await setClientStatusMessage(clientId, noWorkHint).catch(() => {});
+      } else {
+        await setClientStatusMessage(clientId, 'Starting…').catch(() => {});
       }
     } catch (e) {
       console.error('[API] reactivateCampaignsWithPendingLeads', e);
@@ -1285,18 +1907,18 @@ app.post('/api/campaigns/add-leads-from-groups', async (req, res) => {
   }
 });
 
-// --- Scraper account connect has moved to Admin Scraper Pool (platform accounts only). ---
+// --- Scraper connect is deprecated; scraping now uses the same sender session. ---
 app.post('/api/scraper/connect', connectLimiter, async (_req, res) => {
   return res.status(410).json({
     ok: false,
-    error: 'Deprecated endpoint. Scraper accounts are now managed from Admin Panel -> Scraper Pool.',
+    error: 'Deprecated endpoint. Scraping now uses the same Instagram session as sending. Reconnect it in Settings > Integrations.',
   });
 });
 
 app.post('/api/scraper/connect/2fa', connectLimiter, async (_req, res) => {
   return res.status(410).json({
     ok: false,
-    error: 'Deprecated endpoint. Scraper accounts are now managed from Admin Panel -> Scraper Pool.',
+    error: 'Deprecated endpoint. Scraping now uses the same Instagram session as sending. Reconnect it in Settings > Integrations.',
   });
 });
 
@@ -1312,7 +1934,7 @@ app.get('/api/scraper/status', async (req, res) => {
     return res.status(503).json({ error: 'Supabase not configured' });
   }
   try {
-    const session = await getScraperSession(clientId);
+    const session = await getMostRecentInstagramSessionForClient(clientId);
     const connected = !!(session?.session_data?.cookies?.length);
     const response = {
       connected,
@@ -1346,7 +1968,7 @@ app.post('/api/scraper/status', async (req, res) => {
     return res.status(503).json({ error: 'Supabase not configured' });
   }
   try {
-    const session = await getScraperSession(clientId);
+    const session = await getMostRecentInstagramSessionForClient(clientId);
     const connected = !!(session?.session_data?.cookies?.length);
     const response = {
       connected,
@@ -1376,27 +1998,83 @@ app.post('/api/scraper/start', async (req, res) => {
   const rawType = String(scrape_type || 'followers')
     .trim()
     .toLowerCase();
-  const scrapeType =
-    rawType === 'comments' ? 'comments' : rawType === 'following' ? 'following' : 'followers';
+  const scrapeType = rawType === 'followers' ? 'followers' : rawType;
 
   if (!clientId) {
     return res.status(400).json({ ok: false, error: 'clientId is required' });
   }
-  if ((scrapeType === 'followers' || scrapeType === 'following') && !target_username) {
+  if (scrapeType !== 'followers' && scrapeType !== 'following') {
+    return res.status(400).json({
+      ok: false,
+      error: 'Only follower and following scraping are supported right now.',
+      code: 'scrape_type_not_supported',
+    });
+  }
+  if (!target_username) {
     return res
       .status(400)
       .json({ ok: false, error: 'target_username is required for follower or following scrape' });
   }
-  if (scrapeType === 'comments') {
-    if (!post_urls || !Array.isArray(post_urls) || post_urls.length === 0) {
-      return res.status(400).json({ ok: false, error: 'post_urls (array of Instagram post URLs) is required for comment scrape' });
-    }
-    if (post_urls.some((u) => typeof u !== 'string')) {
-      return res.status(400).json({ ok: false, error: 'post_urls must be an array of strings' });
-    }
-  }
 
   try {
+    // Scraping may run whenever nothing can actively send right now.
+    const activelySendableNow = await canClientActivelySendNow(clientId).catch(() => false);
+    if (activelySendableNow) {
+      return res.status(400).json({
+        ok: false,
+        code: 'campaigns_active',
+        error: 'Scraping is blocked while a campaign can actively send right now. Pause it or wait until it is out of schedule / capped.',
+      });
+    }
+
+    const latestSentAtIso = await getLatestSuccessfulColdDmSentAt(clientId).catch(() => null);
+    if (latestSentAtIso) {
+      const latestSentAtMs = new Date(latestSentAtIso).getTime();
+      const cooldownRemainingMs = latestSentAtMs + SEND_SCRAPE_COOLDOWN_MS - Date.now();
+      if (Number.isFinite(cooldownRemainingMs) && cooldownRemainingMs > 0) {
+        return res.status(400).json({
+          ok: false,
+          code: 'recent_send_cooldown',
+          error: `Account safety cooldown active after sending. Try scraping again in ${formatDurationShort(cooldownRemainingMs)}.`,
+          cooldownUntil: new Date(latestSentAtMs + SEND_SCRAPE_COOLDOWN_MS).toISOString(),
+        });
+      }
+    }
+
+    // Bind scrape job to the client's most-recent IG session (client view: only one account).
+    const sessionRow = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+    if (!sessionRow?.id) {
+      return res.status(400).json({
+        ok: false,
+        code: 'missing_instagram_session',
+        error: 'Connect your Instagram automation session first (Settings → Integrations).',
+      });
+    }
+    if (sessionRow.scrape_cooldown_until) {
+      const untilMs = new Date(sessionRow.scrape_cooldown_until).getTime();
+      if (Number.isFinite(untilMs) && untilMs > Date.now()) {
+        const waitMs = untilMs - Date.now();
+        return res.status(400).json({
+          ok: false,
+          code: 'scrape_cooldown',
+          error: `Scraping cooldown active for account safety. Try again in ${formatDurationShort(waitMs)}.`,
+          scrapeCooldownUntil: sessionRow.scrape_cooldown_until,
+        });
+      }
+    }
+    if (sessionRow.leased_until) {
+      const leaseUntilMs = new Date(sessionRow.leased_until).getTime();
+      if (Number.isFinite(leaseUntilMs) && leaseUntilMs > Date.now()) {
+        return res.status(409).json({
+          ok: false,
+          code: 'instagram_session_busy',
+          error:
+            'This Instagram session is busy sending follow-ups or messages right now. Try the scrape again in a few minutes.',
+          leasedUntil: sessionRow.leased_until,
+        });
+      }
+    }
+
     const quota = await getScrapeQuotaStatus(clientId);
     if (quota.remaining <= 0) {
       return res.status(400).json({
@@ -1405,20 +2083,51 @@ app.post('/api/scraper/start', async (req, res) => {
         scrapeQuota: quota,
       });
     }
-    const targetForJob =
-      scrapeType === 'comments' ? '_comment_scrape' : target_username.trim().replace(/^@/, '');
+    const targetForJob = target_username.trim().replace(/^@/, '');
     const requestedMaxLeads = max_leads != null && max_leads > 0 ? max_leads : null;
     const boundedMax = requestedMaxLeads != null && requestedMaxLeads > 0 ? Math.min(requestedMaxLeads, quota.remaining) : quota.remaining;
     const effectiveMaxLeads = boundedMax > 0 ? boundedMax : null;
+
+    // Final cooldown re-check right before queueing — closes the race window where a DM
+    // finished (and set scrape_cooldown_until on the session) between our earlier read and
+    // this call. If still in cooldown, refuse loudly so the UI can toast.
+    const freshSessionRow = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+    if (freshSessionRow?.scrape_cooldown_until) {
+      const untilMs = new Date(freshSessionRow.scrape_cooldown_until).getTime();
+      if (Number.isFinite(untilMs) && untilMs > Date.now()) {
+        const waitMs = untilMs - Date.now();
+        return res.status(400).json({
+          ok: false,
+          code: 'scrape_cooldown',
+          error: `Scraping cooldown active for account safety. Try again in ${formatDurationShort(waitMs)}.`,
+          scrapeCooldownUntil: freshSessionRow.scrape_cooldown_until,
+        });
+      }
+    }
+    const freshLatestSentAtIso = await getLatestSuccessfulColdDmSentAt(clientId).catch(() => null);
+    if (freshLatestSentAtIso) {
+      const freshLatestSentAtMs = new Date(freshLatestSentAtIso).getTime();
+      const freshCooldownRemainingMs = freshLatestSentAtMs + SEND_SCRAPE_COOLDOWN_MS - Date.now();
+      if (Number.isFinite(freshCooldownRemainingMs) && freshCooldownRemainingMs > 0) {
+        return res.status(400).json({
+          ok: false,
+          code: 'recent_send_cooldown',
+          error: `Account safety cooldown active after sending. Try scraping again in ${formatDurationShort(freshCooldownRemainingMs)}.`,
+          cooldownUntil: new Date(freshLatestSentAtMs + SEND_SCRAPE_COOLDOWN_MS).toISOString(),
+        });
+      }
+    }
+
     const jobId = await createScrapeJob(
       clientId,
       targetForJob,
       lead_group_id || null,
       scrapeType,
-      scrapeType === 'comments' ? post_urls : null,
       null,
+      null, // legacy platformScraperSessionId (unused for per-client puppeteer scrape)
+      (freshSessionRow && freshSessionRow.id) || sessionRow.id,
       effectiveMaxLeads != null && effectiveMaxLeads > 0 ? effectiveMaxLeads : null,
-      'instagrapi'
+      'puppeteer'
     );
     res.json({
       ok: true,
@@ -1455,31 +2164,6 @@ app.post('/api/scraper/stop', async (req, res) => {
   } catch (e) {
     console.error('[API] Scraper stop error', e);
     res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-app.post('/api/scraper/connect-platform', connectLimiter, async (req, res) => {
-  const { username, password, daily_actions_limit, platformScraperBackup } = req.body || {};
-  const isPlatformBackup = platformScraperBackup === true || platformScraperBackup === 'true' || platformScraperBackup === 1;
-  if (!username || !password) {
-    return res.status(400).json({ ok: false, error: 'username and password are required' });
-  }
-  if (!isSupabaseConfigured()) {
-    return res.status(503).json({ ok: false, error: 'Supabase not configured' });
-  }
-  try {
-    const { connectScraper } = require('./scraper');
-    const { cookies, username: instagramUsername } = await connectScraper(username, password);
-    await savePlatformScraperSession(
-      { cookies },
-      instagramUsername,
-      daily_actions_limit != null ? daily_actions_limit : 500,
-      { forceInsert: isPlatformBackup }
-    );
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('[API] Platform scraper connect error', e);
-    res.status(500).json({ ok: false, error: e.message || 'Login failed' });
   }
 });
 
@@ -1525,6 +2209,7 @@ app.post('/api/control/stop', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Dashboard at http://0.0.0.0:${PORT}`);
+  schedulePoolWorkerReadyRegistration();
   if (shouldAutoScaleSendWorkers()) {
     const min = SCALE_SEND_WORKERS_AUTO_INTERVAL_MS / 60000;
     console.log(
@@ -1532,5 +2217,16 @@ app.listen(PORT, '0.0.0.0', () => {
     );
     setInterval(() => runAutoScaleSendWorkersTick('interval'), SCALE_SEND_WORKERS_AUTO_INTERVAL_MS);
     setTimeout(() => runAutoScaleSendWorkersTick('startup'), 60_000);
+  }
+  if (PROCESS_SCHEDULED_RESPONSES_FALLBACK_ENABLED) {
+    const min = Math.round(PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS / 1000);
+    console.log(
+      `[process-scheduled-responses:fallback] enabled: every ${min}s from VPS dashboard process (backup for missing/broken Supabase cron)`
+    );
+    setInterval(
+      () => triggerProcessScheduledResponsesFallback('interval'),
+      PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS
+    );
+    setTimeout(() => triggerProcessScheduledResponsesFallback('startup'), 20_000);
   }
 });

@@ -13,6 +13,22 @@ const CLIENT_ID_FILE = path.join(process.cwd(), '.cold_dm_client_id');
 let _client = null;
 let _coldDmCampaignsSupportsVoiceNoteColumns = null;
 let _loggedMissingColdDmCampaignVoiceColumns = false;
+const COLD_DM_HARD_MAX_SENDS_PER_DAY = Math.max(
+  1,
+  parseInt(process.env.COLD_DM_MAX_SENDS_PER_DAY || '100', 10) || 100
+);
+const COLD_DM_HARD_MAX_SENDS_PER_HOUR = Math.max(
+  1,
+  parseInt(process.env.COLD_DM_MAX_SENDS_PER_HOUR || '25', 10) || 25
+);
+const COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS = Math.max(
+  0,
+  parseInt(process.env.COLD_DM_MIN_SECONDS_BETWEEN_SENDS || '30', 10) || 30
+);
+const COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS = Math.max(
+  0,
+  parseInt(process.env.COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS || '10', 10) || 10
+);
 
 function noWorkDebugEnabled() {
   return process.env.NO_WORK_DEBUG === '1' || process.env.NO_WORK_DEBUG === 'true';
@@ -204,7 +220,13 @@ function hasValidResolvedSendDelays(minS, maxS) {
 function hasValidCampaignSendDelayConfig(campaign, settings = null) {
   if (!campaign) return false;
   const { minDelaySec, maxDelaySec } = computeEffectiveSendDelaySeconds(campaign, settings);
-  return hasValidResolvedSendDelays(minDelaySec, maxDelaySec);
+  if (!hasValidResolvedSendDelays(minDelaySec, maxDelaySec)) return false;
+  const min = Number(minDelaySec);
+  const max = Number(maxDelaySec);
+  return (
+    min >= COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS &&
+    max >= min + COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS
+  );
 }
 
 function describeCampaignSendDelayConfigProblem(campaign, settings = null) {
@@ -214,8 +236,28 @@ function describeCampaignSendDelayConfigProblem(campaign, settings = null) {
   }
   if (min == null) return 'missing min send delay (campaign min_delay_sec or client min_delay_minutes)';
   if (max == null) return 'missing max send delay (campaign max_delay_sec or client max_delay_minutes)';
+  if (Number(min) < COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS) {
+    return `min_delay (${min}) is lower than ${COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS}s`;
+  }
+  if (Number(max) < Number(min) + COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS) {
+    return `max_delay (${max}) is lower than min_delay + ${COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS}s`;
+  }
   if (Number(max) < Number(min)) return `max_delay (${max}) is lower than min_delay (${min})`;
   return 'invalid send delay settings';
+}
+
+function normalizeColdOutreachDailyLimit(limit) {
+  if (limit == null || limit === '') return COLD_DM_HARD_MAX_SENDS_PER_DAY;
+  const n = Number(limit);
+  if (!Number.isFinite(n) || n <= 0) return COLD_DM_HARD_MAX_SENDS_PER_DAY;
+  return Math.min(n, COLD_DM_HARD_MAX_SENDS_PER_DAY);
+}
+
+function normalizeColdOutreachHourlyLimit(limit) {
+  if (limit == null || limit === '') return COLD_DM_HARD_MAX_SENDS_PER_HOUR;
+  const n = Number(limit);
+  if (!Number.isFinite(n) || n <= 0) return COLD_DM_HARD_MAX_SENDS_PER_HOUR;
+  return Math.min(n, COLD_DM_HARD_MAX_SENDS_PER_HOUR);
 }
 
 /**
@@ -678,7 +720,9 @@ async function getInstagramSessionByIdForClient(clientId, sessionId) {
   try {
     const { data, error } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at')
+      .select(
+        'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
+      )
       .eq('id', sessionId)
       .eq('client_id', clientId)
       .maybeSingle();
@@ -687,7 +731,9 @@ async function getInstagramSessionByIdForClient(clientId, sessionId) {
   } catch (e) {
     const { data, error } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id')
+      .select(
+        'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
+      )
       .eq('id', sessionId)
       .eq('client_id', clientId)
       .maybeSingle();
@@ -703,7 +749,7 @@ async function getSessions(clientId) {
   try {
     const { data, error } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, daily_dm_limit, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, scrape_cooldown_until')
       .eq('client_id', clientId)
       .order('id', { ascending: true });
     if (error) throw error;
@@ -711,7 +757,7 @@ async function getSessions(clientId) {
   } catch (e) {
     const { data, error } = await sb
       .from('cold_dm_instagram_sessions')
-      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh')
+      .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, daily_dm_limit, web_session_needs_refresh, scrape_cooldown_until')
       .eq('client_id', clientId)
       .order('id', { ascending: true });
     if (error) throw error;
@@ -740,7 +786,7 @@ async function getSessionsForCampaign(clientId, campaignId) {
     try {
       const { data: sessions, error: sessErr } = await sb
         .from('cold_dm_instagram_sessions')
-        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh')
+        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, daily_dm_limit, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, scrape_cooldown_until')
         .eq('client_id', clientId)
         .in('id', ids)
         .order('id', { ascending: true });
@@ -749,7 +795,7 @@ async function getSessionsForCampaign(clientId, campaignId) {
     } catch (e) {
       const { data: sessions, error: sessErr } = await sb
         .from('cold_dm_instagram_sessions')
-        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh')
+        .select('id, session_data, instagram_username, proxy_url, proxy_assignment_id, daily_dm_limit, web_session_needs_refresh, scrape_cooldown_until')
         .eq('client_id', clientId)
         .in('id', ids)
         .order('id', { ascending: true });
@@ -785,6 +831,83 @@ function campaignSendLeaseStaleBeforeIso() {
     parseInt(process.env.CAMPAIGN_SEND_LEASE_STALE_SEC || '120', 10) || 120
   );
   return new Date(Date.now() - staleSec * 1000).toISOString();
+}
+
+function getDayBoundsForTimezone(timezone) {
+  const tz = normalizeTimezoneInput(timezone);
+  if (!tz) {
+    const now = new Date();
+    const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000);
+    return { timezone: null, startIso: start.toISOString(), endIso: end.toISOString() };
+  }
+  const todayStr = getTodayInTimezone(tz);
+  const start = utcAtLocalDateAndHM(todayStr, '00:00', tz);
+  const end = getNextMidnightInTimezone(tz);
+  return { timezone: tz, startIso: start.toISOString(), endIso: end.toISOString() };
+}
+
+function getInstagramSessionDailyLimit(sessionRow) {
+  return normalizeColdOutreachDailyLimit(sessionRow?.daily_dm_limit ?? 100);
+}
+
+async function getInstagramSessionDailyUsage(clientId, instagramSessionId, timezone = null) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !instagramSessionId) {
+    return { coldOutreachSent: 0, followUpsSent: 0, totalSent: 0, startIso: null, endIso: null };
+  }
+  const effectiveTimezone = timezone || (await getSettings(clientId).catch(() => null))?.timezone || null;
+  const bounds = getDayBoundsForTimezone(effectiveTimezone);
+  // Authoritative counter: cold_dm_sent_messages has one row per real DM (same counter the dashboard
+  // shows as "sent today"). cold_dm_send_jobs.status='completed' can lag behind (lease mismatch, older
+  // code paths, retries) so we also read it and take max — never undercount, never over-send.
+  const [sentMessagesRes, jobsRes, followUpsRes] = await Promise.all([
+    sb
+      .from('cold_dm_sent_messages')
+      .select('id', { count: 'exact', head: true })
+      .eq('client_id', clientId)
+      .eq('status', 'success')
+      .gte('sent_at', bounds.startIso)
+      .lt('sent_at', bounds.endIso),
+    sb
+      .from('cold_dm_send_jobs')
+      .select('id', { count: 'exact', head: true })
+      .eq('client_id', clientId)
+      .eq('instagram_session_id', instagramSessionId)
+      .eq('status', 'completed')
+      .or('last_error_class.is.null,last_error_class.neq.already_sent')
+      .gte('finished_at', bounds.startIso)
+      .lt('finished_at', bounds.endIso),
+    sb
+      .from('cold_dm_follow_up_queue')
+      .select('id', { count: 'exact', head: true })
+      .eq('client_id', clientId)
+      .eq('vps_session_id', instagramSessionId)
+      .eq('status', 'sent')
+      .gte('sent_at', bounds.startIso)
+      .lt('sent_at', bounds.endIso),
+  ]);
+  if (sentMessagesRes.error) throw sentMessagesRes.error;
+  if (jobsRes.error) throw jobsRes.error;
+  if (followUpsRes.error) throw followUpsRes.error;
+  const sentMessagesTotal = sentMessagesRes.count || 0;
+  const jobsCompleted = jobsRes.count || 0;
+  const followUpsSent = followUpsRes.count || 0;
+  // Cold DMs are recorded in both cold_dm_sent_messages (one row per real outbound) and
+  // cold_dm_send_jobs (queue row; status → completed after send). Send-job rows can lag or
+  // fail to update on lease mismatch, so take the max of the two as the cold count, then
+  // add follow-ups (queue.sent, not present in cold_dm_sent_messages).
+  const coldOutreachSent = Math.max(sentMessagesTotal, jobsCompleted);
+  const totalSent = coldOutreachSent + followUpsSent;
+  return {
+    coldOutreachSent,
+    jobsCompleted,
+    sentMessagesTotal,
+    followUpsSent,
+    totalSent,
+    startIso: bounds.startIso,
+    endIso: bounds.endIso,
+  };
 }
 
 /** Postgres undefined_column or PostgREST "column does not exist" style errors. */
@@ -862,9 +985,27 @@ async function claimInstagramSessionLease(sessionId, workerId, leaseSeconds = 60
   return false;
 }
 
+const CAMPAIGN_SESSION_CLAIM_LOG_THROTTLE_MS = Math.max(
+  1000,
+  parseInt(process.env.CAMPAIGN_SESSION_CLAIM_LOG_THROTTLE_MS || '60000', 10) || 60000
+);
+const campaignSessionClaimLogLast = new Map();
+
+function throttleCampaignSessionClaimLog(key, fingerprint, emit) {
+  const now = Date.now();
+  const prev = campaignSessionClaimLogLast.get(key);
+  if (prev && prev.fingerprint === fingerprint && now - prev.at < CAMPAIGN_SESSION_CLAIM_LOG_THROTTLE_MS) {
+    return;
+  }
+  campaignSessionClaimLogLast.set(key, { fingerprint, at: now });
+  emit();
+}
+
 async function claimInstagramSessionForCampaign(clientId, campaignId, workerId, leaseSeconds = 600) {
   const sessions = await getSessionsForCampaign(clientId, campaignId);
   if (!sessions?.length) return null;
+  const settings = await getSettings(clientId).catch(() => null);
+  const timezone = settings?.timezone || null;
   const now = Date.now();
   const staleMs =
     Math.max(45, parseInt(process.env.INSTAGRAM_SESSION_LEASE_STALE_SEC || '120', 10) || 120) * 1000;
@@ -878,9 +1019,30 @@ async function claimInstagramSessionForCampaign(clientId, campaignId, workerId, 
     return heartbeatStale(s);
   });
   for (const candidate of eligible) {
+    const usage = await getInstagramSessionDailyUsage(clientId, candidate.id, timezone).catch((e) => {
+      console.warn(
+        `[claimInstagramSessionForCampaign] daily usage probe failed client=${clientId} session=${candidate.id}: ${e && e.message ? e.message : e} — refusing to claim (fail-closed)`
+      );
+      return { totalSent: Infinity, coldOutreachSent: 0, followUpsSent: 0, startIso: null, endIso: null };
+    });
+    const dailyLimit = getInstagramSessionDailyLimit(candidate);
+    if (usage && usage.totalSent >= dailyLimit) {
+      const fingerprint = `${usage.totalSent}/${dailyLimit}:${usage.sentMessagesTotal ?? '?'}:${usage.jobsCompleted ?? '?'}:${usage.followUpsSent ?? '?'}`;
+      throttleCampaignSessionClaimLog(`cap:${clientId}:${candidate.id}`, fingerprint, () => {
+        console.log(
+          `[cold-dm] session ${candidate.id} at daily cap — client=${clientId} ${usage.totalSent}/${dailyLimit} ` +
+            `(cold=${usage.sentMessagesTotal ?? usage.jobsCompleted ?? '?'} follow-ups=${usage.followUpsSent ?? '?'}). Waiting for timezone reset.`
+        );
+      });
+      continue;
+    }
     const ok = await claimInstagramSessionLease(candidate.id, workerId, leaseSeconds);
     if (ok) {
-      return candidate;
+      return {
+        ...candidate,
+        account_daily_limit: dailyLimit,
+        account_daily_usage: usage,
+      };
     }
   }
   return null;
@@ -895,8 +1057,23 @@ async function getWaitingInstagramSessionReason(clientId, campaignId) {
   if (!sb || !clientId || !campaignId) return null;
   const sessions = await getSessionsForCampaign(clientId, campaignId);
   if (!sessions?.length) return null;
+  const settings = await getSettings(clientId).catch(() => null);
+  const timezone = settings?.timezone || null;
   if (sessions.some((s) => s?.web_session_needs_refresh === true)) {
     return 'Please reconnect your account in Settings > Integrations > Automation session (outbound).';
+  }
+  const usageStates = await Promise.all(
+    sessions.map(async (session) => {
+      const usage = await getInstagramSessionDailyUsage(clientId, session.id, timezone).catch(() => null);
+      return {
+        usage,
+        dailyLimit: getInstagramSessionDailyLimit(session),
+      };
+    })
+  );
+  if (usageStates.length > 0 && usageStates.every((entry) => entry.usage && entry.usage.totalSent >= entry.dailyLimit)) {
+    const resumeAt = getNextMidnightInTimezone(timezone);
+    return `Account hit daily limit. Sending resumes after ${resumeAt.toLocaleString()}.`;
   }
   const now = Date.now();
   const leased = sessions
@@ -1177,6 +1354,104 @@ async function saveSession(clientId, sessionData, instagramUsername, proxyOpts =
   if (error) throw error;
 }
 
+async function updateInstagramSessionProxy(sessionId, proxyOpts = {}) {
+  const sb = getSupabase();
+  if (!sb || !sessionId) throw new Error('Supabase or sessionId missing');
+  const update = { updated_at: new Date().toISOString() };
+  if (proxyOpts.proxyUrl) update.proxy_url = proxyOpts.proxyUrl;
+  if (proxyOpts.proxyAssignmentId) update.proxy_assignment_id = proxyOpts.proxyAssignmentId;
+  const { error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .update(update)
+    .eq('id', sessionId);
+  if (error) throw error;
+}
+
+async function updateInstagramSessionScrapeCooldown(sessionId, cooldownUntilIso) {
+  const sb = getSupabase();
+  if (!sb || !sessionId) throw new Error('Supabase or sessionId missing');
+  const payload = {
+    scrape_cooldown_until: cooldownUntilIso || null,
+    updated_at: new Date().toISOString(),
+  };
+  const { error } = await sb.from('cold_dm_instagram_sessions').update(payload).eq('id', sessionId);
+  if (error) throw error;
+}
+
+async function getMostRecentInstagramSessionForClient(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const { data, error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .select(
+      'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
+    )
+    .eq('client_id', clientId)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function getInstagramSessionForClientAndUsername(clientId, instagramUsername) {
+  const sb = getSupabase();
+  if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  const u = normalizeInstagramKey(instagramUsername);
+  if (!u) return null;
+  const { data, error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .select(
+      'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, leased_until, leased_by_worker, lease_heartbeat_at, web_session_needs_refresh, instagrapi_state, instagrapi_settings_updated_at, scrape_cooldown_until, updated_at'
+    )
+    .eq('client_id', clientId)
+    .eq('instagram_username', u)
+    .order('updated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function getInstagramSessionForScrapeById(sessionId) {
+  const sb = getSupabase();
+  if (!sb || !sessionId) throw new Error('Supabase or sessionId missing');
+  const { data, error } = await sb
+    .from('cold_dm_instagram_sessions')
+    .select(
+      'id, client_id, session_data, instagram_username, proxy_url, proxy_assignment_id, web_session_needs_refresh, updated_at'
+    )
+    .eq('id', sessionId)
+    .maybeSingle();
+  if (error) throw error;
+  return data || null;
+}
+
+async function serviceSetInstagrapiSettings(instagramSessionId, settingsJson, proxyUrl) {
+  const sb = getSupabase();
+  if (!sb || !instagramSessionId) throw new Error('Supabase or instagramSessionId missing');
+  const { data, error } = await sb.rpc('service_set_instagrapi_settings', {
+    p_instagram_session_id: instagramSessionId,
+    p_settings_json: settingsJson,
+    p_proxy_url: proxyUrl || null,
+  });
+  if (error) throw error;
+  return data === true;
+}
+
+async function serviceSetInstagrapiState(instagramSessionId, state, errorClass = null, errorMessage = null) {
+  const sb = getSupabase();
+  if (!sb || !instagramSessionId) throw new Error('Supabase or instagramSessionId missing');
+  const { data, error } = await sb.rpc('service_set_instagrapi_state', {
+    p_instagram_session_id: instagramSessionId,
+    p_state: state,
+    p_error_class: errorClass,
+    p_error_message: errorMessage,
+  });
+  if (error) throw error;
+  return data === true;
+}
+
 async function alreadySent(clientId, username) {
   const sb = getSupabase();
   if (!sb || !clientId) return false;
@@ -1192,8 +1467,67 @@ async function alreadySent(clientId, username) {
   return !!data;
 }
 
+const COLD_DM_MAX_FOLLOW_UP_STEPS = 5;
+const COLD_DM_MAX_FOLLOW_UP_DELAY_MINUTES = 30 * 24 * 60;
+
+function normalizeColdDmFollowUpsFromSettings(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (let i = 0; i < raw.length && out.length < COLD_DM_MAX_FOLLOW_UP_STEPS; i++) {
+    const item = raw[i];
+    const type = item?.type;
+    const content = typeof item?.content === 'string' ? item.content.trim() : '';
+    const delay = typeof item?.delay_minutes === 'number' ? Math.floor(item.delay_minutes) : NaN;
+    if (type != null && type !== '' && type !== 'text') continue;
+    if (!content || !Number.isFinite(delay) || delay < 1 || delay > COLD_DM_MAX_FOLLOW_UP_DELAY_MINUTES) continue;
+    const id = typeof item?.id === 'string' && item.id.trim() ? item.id.trim() : `cold-fu-${i + 1}`;
+    out.push({ id, content, delay_minutes: delay });
+  }
+  return out;
+}
+
+/** Upsert cold_dm_follow_up_queue rows right after a successful send (edge cron also enqueues; this fixes interleaved worker). */
+async function enqueueColdDmFollowUpsForSentRow(clientId, sentRow) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !sentRow?.id || !sentRow?.sent_at || !sentRow?.username) return;
+  try {
+    const { data: settings, error: stErr } = await sb
+      .from('cold_dm_settings')
+      .select('follow_ups_enabled, follow_ups')
+      .eq('client_id', clientId)
+      .maybeSingle();
+    if (stErr || !settings || settings.follow_ups_enabled === false) return;
+    const items = normalizeColdDmFollowUpsFromSettings(settings.follow_ups);
+    if (!items.length) return;
+    const sentAtMs = new Date(sentRow.sent_at).getTime();
+    if (!Number.isFinite(sentAtMs)) return;
+    const nowIso = new Date().toISOString();
+    const uname = normalizeUsername(sentRow.username);
+    const rows = items.map((item, i) => ({
+      client_id: clientId,
+      source_sent_message_id: sentRow.id,
+      message_group_id: sentRow.message_group_id || null,
+      follow_up_index: i,
+      follow_up_id: item.id,
+      username: uname,
+      instagram_thread_id: sentRow.instagram_thread_id || null,
+      source_sent_at: sentRow.sent_at,
+      scheduled_for: new Date(sentAtMs + item.delay_minutes * 60 * 1000).toISOString(),
+      status: 'pending',
+      updated_at: nowIso,
+    }));
+    const { error: insErr } = await sb.from('cold_dm_follow_up_queue').upsert(rows, {
+      onConflict: 'client_id,source_sent_message_id,follow_up_index',
+      ignoreDuplicates: true,
+    });
+    if (insErr) console.error('[enqueueColdDmFollowUpsForSentRow]', insErr.message);
+  } catch (e) {
+    console.error('[enqueueColdDmFollowUpsForSentRow]', e && e.message ? e.message : e);
+  }
+}
+
 /**
- * @param {{ skipDailyStats?: boolean }} [options] - If skipDailyStats, insert cold_dm_sent_messages only (e.g. pre-send blocklist skip).
+ * @param {{ skipDailyStats?: boolean, instagramThreadId?: string }} [options] - skipDailyStats: insert only. instagramThreadId: stored on sent row for follow-up queue.
  */
 async function logSentMessage(
   clientId,
@@ -1229,8 +1563,20 @@ async function logSentMessage(
   if (messageGroupId) insertPayload.message_group_id = messageGroupId;
   if (messageGroupMessageId) insertPayload.message_group_message_id = messageGroupMessageId;
   if (status === 'failed' && failureReason) insertPayload.failure_reason = failureReason;
-  const { error: insertErr } = await sb.from('cold_dm_sent_messages').insert(insertPayload);
+  if (options && options.instagramThreadId) {
+    insertPayload.instagram_thread_id = String(options.instagramThreadId);
+  }
+  const { data: insertedRows, error: insertErr } = await sb
+    .from('cold_dm_sent_messages')
+    .insert(insertPayload)
+    .select('id, sent_at, username, message_group_id, message_group_message_id, instagram_thread_id');
   if (insertErr) throw insertErr;
+  const insertedRow = Array.isArray(insertedRows) ? insertedRows[0] : null;
+  if (status === 'success' && insertedRow) {
+    await enqueueColdDmFollowUpsForSentRow(clientId, insertedRow).catch((e) => {
+      console.error('[logSentMessage] follow-up enqueue failed:', e && e.message ? e.message : e);
+    });
+  }
   logColdDmMetricsDebug('insert cold_dm_sent_messages ok', {
     clientId,
     username: u,
@@ -1420,6 +1766,63 @@ async function setClientStatusMessage(clientId, message) {
     .from('cold_dm_control')
     .update({ status_message: message == null ? null : String(message).slice(0, 500), status_updated_at: now, updated_at: now })
     .eq('client_id', clientId);
+}
+
+async function insertErrorEvent(clientId, eventType, message, details = {}, opts = {}) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !eventType) return false;
+  const severity = (opts.severity || 'high').toString().slice(0, 24);
+  const source = (opts.source || 'cold_dm_worker').toString().slice(0, 80);
+  const fingerprint = opts.fingerprint != null ? String(opts.fingerprint).slice(0, 240) : null;
+  try {
+    const payload = {
+      client_id: clientId,
+      event_type: String(eventType).slice(0, 120),
+      severity,
+      source,
+      message: message != null ? String(message).slice(0, 2000) : null,
+      fingerprint,
+      details: details && typeof details === 'object' ? details : { detail: String(details || '') },
+      first_seen_at: new Date().toISOString(),
+      last_seen_at: new Date().toISOString(),
+      occurrences: 1,
+    };
+    await sb.from('error_events').insert(payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function pauseClientAndAlert(clientId, statusMessage, eventType, details = {}) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return;
+  const now = new Date().toISOString();
+  try {
+    await sb
+      .from('cold_dm_control')
+      .upsert(
+        {
+          client_id: clientId,
+          pause: 1,
+          status_message: statusMessage != null ? String(statusMessage).slice(0, 500) : null,
+          status_updated_at: now,
+          updated_at: now,
+        },
+        { onConflict: 'client_id' }
+      );
+  } catch {}
+  await insertErrorEvent(
+    clientId,
+    eventType || 'cold_dm_support_required',
+    statusMessage || 'Cold DM paused; support required',
+    details || {},
+    {
+      severity: 'critical',
+      source: 'cold_dm_worker',
+      fingerprint: `cold_dm:${clientId}:${String(eventType || 'support_required')}`.slice(0, 240),
+    }
+  ).catch(() => false);
 }
 
 /**
@@ -1769,18 +2172,24 @@ async function getClientNoWorkResumeAt(clientId) {
     if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, campaignTz)) continue;
     pendingCampaignsInSchedule.push(camp);
   }
-  const blockedDaily = pendingCampaignsInSchedule.find((camp) => camp.daily_send_limit != null && stats.total_sent >= camp.daily_send_limit);
+  const blockedDaily = pendingCampaignsInSchedule.find(
+    (camp) => stats.total_sent >= normalizeColdOutreachDailyLimit(camp.daily_send_limit)
+  );
   if (blockedDaily) {
+    const effectiveDailyLimit = normalizeColdOutreachDailyLimit(blockedDaily.daily_send_limit);
     return {
-      message: `daily limit reached (campaign daily=${blockedDaily.daily_send_limit}, sentToday=${stats.total_sent}, counting=successful sends only)`,
+      message: `daily limit reached (effective daily=${effectiveDailyLimit}, sentToday=${stats.total_sent}, counting=successful sends only)`,
       reason: 'daily_limit',
       resumeAt: getNextMidnightInTimezone(clientTz),
     };
   }
-  const blockedHourly = pendingCampaignsInSchedule.find((camp) => camp.hourly_send_limit != null && hourlySent >= camp.hourly_send_limit);
+  const blockedHourly = pendingCampaignsInSchedule.find(
+    (camp) => hourlySent >= normalizeColdOutreachHourlyLimit(camp.hourly_send_limit)
+  );
   if (blockedHourly) {
+    const effectiveHourlyLimit = normalizeColdOutreachHourlyLimit(blockedHourly.hourly_send_limit);
     return {
-      message: `hourly limit reached (campaign hourly=${blockedHourly.hourly_send_limit}, sentThisHour=${hourlySent}, counting=successful sends only)`,
+      message: `hourly limit reached (effective hourly=${effectiveHourlyLimit}, sentThisHour=${hourlySent}, counting=successful sends only)`,
       reason: 'hourly_limit',
       resumeAt: getNextHourStartInTimezone(clientTz),
     };
@@ -1857,6 +2266,21 @@ async function getRecentSent(clientId, limit = 50) {
   return data || [];
 }
 
+async function getLatestSuccessfulColdDmSentAt(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return null;
+  const { data, error } = await sb
+    .from('cold_dm_sent_messages')
+    .select('sent_at')
+    .eq('client_id', clientId)
+    .eq('status', 'success')
+    .order('sent_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data?.sent_at || null;
+}
+
 async function getSentUsernames(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return new Set();
@@ -1906,13 +2330,7 @@ async function updateSettingsInstagramUsername(clientId, instagramUsername) {
 async function getScraperSession(clientId) {
   const sb = getSupabase();
   if (!sb || !clientId) return null;
-  const { data, error } = await sb
-    .from('cold_dm_scraper_sessions')
-    .select('session_data, instagram_username')
-    .eq('client_id', clientId)
-    .maybeSingle();
-  if (error) throw error;
-  return data;
+  return getMostRecentInstagramSessionForClient(clientId);
 }
 
 async function saveScraperSession(clientId, sessionData, instagramUsername) {
@@ -2506,8 +2924,9 @@ async function createScrapeJob(
   scrapeType = 'followers',
   postUrls = null,
   platformScraperSessionId = null,
+  instagramSessionId = null,
   maxLeads = null,
-  scrapeMethod = 'instagrapi'
+  scrapeMethod = 'puppeteer'
 ) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
@@ -2522,6 +2941,7 @@ async function createScrapeJob(
   if (scrapeType) payload.scrape_type = scrapeType;
   if (postUrls && Array.isArray(postUrls) && postUrls.length) payload.post_urls = postUrls;
   if (platformScraperSessionId) payload.platform_scraper_session_id = platformScraperSessionId;
+  if (instagramSessionId) payload.instagram_session_id = instagramSessionId;
    // max_leads is an optional column on cold_dm_scrape_jobs used by the Python worker
   if (maxLeads != null && !Number.isNaN(Number(maxLeads))) {
     payload.max_leads = Number(maxLeads);
@@ -2694,16 +3114,18 @@ async function cancelScrapeJob(clientId, jobId) {
 async function claimColdDmScrapeJob(workerId, leaseSeconds = 240) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
+  const onlyClientId = getClientId();
   const { data, error } = await sb.rpc('claim_cold_dm_scrape_job', {
     p_worker_id: workerId,
     p_lease_seconds: leaseSeconds,
+    ...(onlyClientId ? { p_client_id: onlyClientId } : {}),
   });
   if (!error) {
     const rows = Array.isArray(data) ? data : data != null ? [data] : [];
     if (rows.length > 0) return rows[0];
     return null;
   }
-  return claimColdDmScrapeJobFallback(workerId, leaseSeconds);
+  return claimColdDmScrapeJobFallback(workerId, leaseSeconds, onlyClientId || null);
 }
 
 async function retryScrapeJob(jobId, errorMessage = null, delaySeconds = 60, workerId = null) {
@@ -2725,16 +3147,16 @@ async function retryScrapeJob(jobId, errorMessage = null, delaySeconds = 60, wor
 }
 
 /** Best-effort claim when RPC is missing or races (no SKIP LOCKED). */
-async function claimColdDmScrapeJobFallback(workerId, leaseSeconds = 240) {
+async function claimColdDmScrapeJobFallback(workerId, leaseSeconds = 240, clientIdFilter = null) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
-  const { data: pending } = await sb
+  let q = sb
     .from('cold_dm_scrape_jobs')
     .select('id, attempt_count')
     .eq('status', 'pending')
-    .order('started_at', { ascending: true })
-    .limit(1)
-    .maybeSingle();
+    .order('started_at', { ascending: true });
+  if (clientIdFilter) q = q.eq('client_id', clientIdFilter);
+  const { data: pending } = await q.limit(1).maybeSingle();
   if (!pending?.id) return null;
   const leaseUntil = new Date(Date.now() + Math.max(30, leaseSeconds) * 1000).toISOString();
   const nowIso = new Date().toISOString();
@@ -2914,6 +3336,7 @@ async function getSendJob(jobId) {
 async function claimColdDmSendJob(workerId, leaseSeconds = 240, campaignIds = null) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
+  const onlyClientId = getClientId();
   const rpcTimeoutMs = Math.max(3000, parseInt(process.env.CLAIM_SEND_JOB_RPC_TIMEOUT_MS || '12000', 10) || 12000);
   const rpcPayload = {
     p_worker_id: workerId,
@@ -2921,6 +3344,9 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240, campaignIds = nu
   };
   if (Array.isArray(campaignIds) && campaignIds.length > 0) {
     rpcPayload.p_campaign_ids = campaignIds;
+  }
+  if (onlyClientId) {
+    rpcPayload.p_client_id = onlyClientId;
   }
   for (let attempt = 0; attempt < 8; attempt++) {
     let data;
@@ -2942,11 +3368,11 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240, campaignIds = nu
         timeoutMs: rpcTimeoutMs,
         error: String(rpcTimeoutErr?.message || rpcTimeoutErr || 'timeout'),
       });
-      return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds);
+      return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds, onlyClientId || null);
     }
     if (error) {
       console.error('[claimColdDmSendJob] RPC error, using fallback:', error.message || error);
-      return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds);
+      return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds, onlyClientId || null);
     }
     const rows = Array.isArray(data) ? data : data != null ? [data] : [];
     const claimed = rows.length > 0 ? rows[0] : null;
@@ -2973,7 +3399,7 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240, campaignIds = nu
           firstJobAvailableAt: pendingCheck[0]?.available_at || null,
           nowIso,
         });
-        return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds);
+        return claimColdDmSendJobFallback(workerId, leaseSeconds, campaignIds, onlyClientId || null);
       }
       return null;
     }
@@ -2995,7 +3421,7 @@ async function claimColdDmSendJob(workerId, leaseSeconds = 240, campaignIds = nu
   return null;
 }
 
-async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240, campaignIds = null) {
+async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240, campaignIds = null, clientIdFilter = null) {
   const sb = getSupabase();
   if (!sb || !workerId) return null;
   const nowIso = new Date().toISOString();
@@ -3004,6 +3430,9 @@ async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240, campaign
     .select('id, client_id, campaign_id, campaign_lead_id, username, attempt_count')
     .in('status', ['pending', 'retry'])
     .lte('available_at', nowIso);
+  if (clientIdFilter) {
+    pendingQuery = pendingQuery.eq('client_id', clientIdFilter);
+  }
   if (Array.isArray(campaignIds) && campaignIds.length > 0) {
     pendingQuery = pendingQuery.in('campaign_id', campaignIds);
   }
@@ -3315,63 +3744,35 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
   }
   if (rows.length === 0) return 0;
   let inserted = 0;
-  // 1) Preferred path: idempotent upsert on unique index.
-  const upsertRes = await sb.from('cold_dm_send_jobs').upsert(rows, {
-    onConflict: 'client_id,idempotency_key',
-    ignoreDuplicates: false,
-  });
-  if (!upsertRes.error) {
-    inserted = rows.length;
-  } else {
-    const upMsg = String(upsertRes.error?.message || '').toLowerCase();
-    const canFallbackInsert =
-      upsertRes.error?.code === '42P10' || // conflict index mismatch
-      upsertRes.error?.code === '42703' || // missing column
-      upMsg === 'bad request' ||
-      upMsg.includes('does not exist');
-    if (!canFallbackInsert) {
-      throw upsertRes.error;
+  // Insert rows individually so we don't depend on a specific conflict-target shape in older databases.
+  // The deterministic idempotency_key still protects us from duplicates at the row level.
+  for (const row of rows) {
+    const r = await sb.from('cold_dm_send_jobs').insert(row);
+    if (!r.error) {
+      inserted += 1;
+      continue;
     }
-    console.error(
-      '[syncSendJobsForCampaign] upsert failed; falling back to insert strategies',
-      JSON.stringify({
-        code: upsertRes.error?.code || null,
-        message: upsertRes.error?.message || String(upsertRes.error),
-        details: upsertRes.error?.details || null,
-      })
-    );
-
-    // 2) Insert with idempotency_key (ignore duplicates manually).
-    let insertedViaIdempotency = 0;
-    for (const row of rows) {
-      const r = await sb.from('cold_dm_send_jobs').insert(row);
-      if (!r.error) {
-        insertedViaIdempotency += 1;
-        continue;
-      }
-      const msg = String(r.error?.message || '').toLowerCase();
-      const duplicate = r.error?.code === '23505' || msg.includes('duplicate key');
-      if (duplicate) continue;
-      // 3) Older schema fallback: minimal row shape (omit payload/priority/idempotency_key).
-      const minimal = {
-        client_id: row.client_id,
-        campaign_id: row.campaign_id,
-        campaign_lead_id: row.campaign_lead_id,
-        username: row.username,
-        status: 'pending',
-        available_at: row.available_at,
-      };
-      const r2 = await sb.from('cold_dm_send_jobs').insert(minimal);
-      if (!r2.error) {
-        insertedViaIdempotency += 1;
-        continue;
-      }
-      const msg2 = String(r2.error?.message || '').toLowerCase();
-      const duplicate2 = r2.error?.code === '23505' || msg2.includes('duplicate key');
-      if (duplicate2) continue;
-      throw r2.error;
+    const msg = String(r.error?.message || '').toLowerCase();
+    const duplicate = r.error?.code === '23505' || msg.includes('duplicate key');
+    if (duplicate) continue;
+    // Older schema fallback: minimal row shape (omit payload/priority/idempotency_key).
+    const minimal = {
+      client_id: row.client_id,
+      campaign_id: row.campaign_id,
+      campaign_lead_id: row.campaign_lead_id,
+      username: row.username,
+      status: 'pending',
+      available_at: row.available_at,
+    };
+    const r2 = await sb.from('cold_dm_send_jobs').insert(minimal);
+    if (!r2.error) {
+      inserted += 1;
+      continue;
     }
-    inserted = insertedViaIdempotency;
+    const msg2 = String(r2.error?.message || '').toLowerCase();
+    const duplicate2 = r2.error?.code === '23505' || msg2.includes('duplicate key');
+    if (duplicate2) continue;
+    throw r2.error;
   }
   console.log(`[syncSendJobsForCampaign] created ${inserted} send job(s) for campaign ${campaignId}`);
   return inserted;
@@ -3581,21 +3982,32 @@ async function buildSendWorkFromJob(jobId) {
   }
   const { data: leadLink } = await sb
     .from('cold_dm_campaign_leads')
-    .select('id, lead_id, status')
+    .select('id, lead_id, status, lead_username, lead_first_name, lead_last_name, lead_display_name')
     .eq('id', job.campaign_lead_id)
     .maybeSingle();
   if (!leadLink || leadLink.status !== 'pending') {
     return { job, disposition: 'cancelled', reason: 'campaign_lead_not_pending' };
   }
-  const { data: lead } = await sb
-    .from('cold_dm_leads')
-    .select('id, username, first_name, last_name, display_name')
-    .eq('id', leadLink.lead_id)
-    .eq('client_id', job.client_id)
-    .maybeSingle();
-  if (!lead?.username) {
+  let lead = null;
+  try {
+    const { data } = await sb
+      .from('cold_dm_leads')
+      .select('id, username, first_name, last_name')
+      .eq('id', leadLink.lead_id)
+      .eq('client_id', job.client_id)
+      .maybeSingle();
+    lead = data || null;
+  } catch {}
+  const leadUsername = normalizeUsername(lead?.username || leadLink.lead_username || '').toLowerCase();
+  if (!leadUsername) {
     return { job, disposition: 'failed', reason: 'missing_lead_row' };
   }
+  const leadData = {
+    username: lead?.username || leadLink.lead_username || null,
+    first_name: lead?.first_name || leadLink.lead_first_name || null,
+    last_name: lead?.last_name || leadLink.lead_last_name || null,
+    display_name: leadLink.lead_display_name || null,
+  };
 
   let messageText = null;
   let messageGroupMessageId = null;
@@ -3655,9 +4067,9 @@ async function buildSendWorkFromJob(jobId) {
     };
   }
   const scrapeBlocklistSet = await getScrapeBlocklistUsernames(job.client_id);
-  const unameNorm = normalizeUsername(lead.username).toLowerCase();
+  const unameNorm = normalizeUsername(leadData.username).toLowerCase();
   if (scrapeBlocklistSet.has(unameNorm)) {
-    return { job, disposition: 'failed', reason: 'blocklist', lead, campaign, messageText, messageGroupMessageId, voiceNotePath, voiceNoteMode };
+    return { job, disposition: 'failed', reason: 'blocklist', lead: leadData, campaign, messageText, messageGroupMessageId, voiceNotePath, voiceNoteMode };
   }
   return {
     job,
@@ -3667,10 +4079,10 @@ async function buildSendWorkFromJob(jobId) {
       campaignLeadId: job.campaign_lead_id,
       campaignId: job.campaign_id,
       leadId: leadLink.lead_id,
-      username: normalizeUsername(lead.username),
-      first_name: lead.first_name ?? null,
-      last_name: lead.last_name ?? null,
-      display_name: lead.display_name ?? null,
+      username: normalizeUsername(leadData.username),
+      first_name: leadData.first_name ?? null,
+      last_name: leadData.last_name ?? null,
+      display_name: leadData.display_name ?? null,
       messageText,
       messageGroupId: campaign.message_group_id || null,
       messageGroupMessageId: messageGroupMessageId || null,
@@ -3934,6 +4346,52 @@ async function getActiveCampaigns(clientId) {
   }
 }
 
+/**
+ * True only when this client has at least one campaign that could send a cold outreach message right now.
+ * Paused clients, completed campaigns, outside-schedule campaigns, capped campaigns, and campaigns with no
+ * pending leads are all treated as not actively sendable, so scraping may proceed once the post-send cooldown clears.
+ */
+async function canClientActivelySendNow(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return false;
+
+  const pause = await getControl(clientId).catch(() => '1');
+  if (pause === '1' || pause === 1) return false;
+
+  const campaigns = await getActiveCampaigns(clientId).catch(() => []);
+  if (!campaigns.length) return false;
+
+  const [stats, hourlySent] = await Promise.all([
+    getDailyStats(clientId).catch(() => ({ total_sent: 0, total_failed: 0 })),
+    getHourlySent(clientId).catch(() => 0),
+  ]);
+
+  for (const camp of campaigns) {
+    if (!hasValidCampaignSendDelayConfig(camp)) continue;
+
+    const { count: pendingCount, error: pendingErr } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', camp.id)
+      .eq('status', 'pending');
+    if (pendingErr || (pendingCount ?? 0) === 0) continue;
+
+    if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, camp.timezone ?? null)) continue;
+
+    const limitState = evaluateCampaignLimitState({
+      sentToday: stats.total_sent,
+      sentThisHour: hourlySent,
+      dailySendLimit: normalizeColdOutreachDailyLimit(camp.daily_send_limit),
+      hourlySendLimit: normalizeColdOutreachHourlyLimit(camp.hourly_send_limit),
+    });
+    if (limitState.blocked) continue;
+
+    return true;
+  }
+
+  return false;
+}
+
 async function getCampaignsMissingSendDelays(clientId, campaignId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) return [];
@@ -4074,6 +4532,43 @@ async function getMostSpecificNoWorkHint(clientId) {
     // active campaign with pending leads was outside its send window (schedule is checked in the worker only).
     const outsideMsg = await getClientOutsideScheduleStatus(clientId);
     if (outsideMsg) return outsideMsg;
+
+    const settings = await getSettings(clientId).catch(() => null);
+    const clientTz = settings?.timezone ?? null;
+    const [stats, hourlySent] = await Promise.all([
+      getDailyStats(clientId).catch(() => ({ total_sent: 0, total_failed: 0 })),
+      getHourlySent(clientId).catch(() => 0),
+    ]);
+    const pendingCampaignsInSchedule = [];
+    for (const camp of campaigns) {
+      const { count: campPending } = await sb
+        .from('cold_dm_campaign_leads')
+        .select('*', { count: 'exact', head: true })
+        .eq('campaign_id', camp.id)
+        .eq('status', 'pending');
+      if ((campPending ?? 0) === 0) continue;
+      if (!isWithinSchedule(camp.schedule_start_time, camp.schedule_end_time, camp.timezone ?? null)) continue;
+      pendingCampaignsInSchedule.push(camp);
+    }
+
+    const blockedDaily = pendingCampaignsInSchedule.find(
+      (camp) => stats.total_sent >= normalizeColdOutreachDailyLimit(camp.daily_send_limit)
+    );
+    if (blockedDaily) {
+      const resumeAt = getNextMidnightInTimezone(clientTz);
+      const resumeText = resumeAt ? ` Next send window opens ${resumeAt.toISOString().slice(0, 16)} UTC.` : '';
+      return `Campaign "${blockedDaily.name || blockedDaily.id}" hit its daily limit.${resumeText}`;
+    }
+
+    const blockedHourly = pendingCampaignsInSchedule.find(
+      (camp) => hourlySent >= normalizeColdOutreachHourlyLimit(camp.hourly_send_limit)
+    );
+    if (blockedHourly) {
+      const resumeAt = getNextHourStartInTimezone(clientTz);
+      const resumeText = resumeAt ? ` Next send window opens ${resumeAt.toISOString().slice(0, 16)} UTC.` : '';
+      return `Campaign "${blockedHourly.name || blockedHourly.id}" hit its hourly limit.${resumeText}`;
+    }
+
     return '';
   }
   return 'No campaigns with pending leads.';
@@ -4104,11 +4599,68 @@ async function getRandomMessageFromGroup(messageGroupId) {
   try {
     const { data, error } = await sb
       .from('cold_dm_message_group_messages')
-      .select('id, message_text, send_voice_note, voice_note_storage_path')
+      .select('id, message_text, send_voice_note, voice_note_storage_path, sort_order, created_at')
       .eq('message_group_id', messageGroupId)
-      .order('sort_order', { ascending: true });
+      .order('sort_order', { ascending: true })
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true });
     if (error || !data || data.length === 0) return null;
-    const row = data[Math.floor(Math.random() * data.length)];
+    let rotationIndex = 0;
+    let canPersistRotation = true;
+    try {
+      const { data: stateRow, error: stateErr } = await sb
+        .from('cold_dm_message_group_rotation_state')
+        .select('next_index')
+        .eq('message_group_id', messageGroupId)
+        .maybeSingle();
+      if (stateErr) {
+        console.warn(`[getRandomMessageFromGroup] rotation state read failed for group=${messageGroupId}: ${stateErr.message || stateErr}`);
+        throw stateErr;
+      }
+      rotationIndex = Math.max(0, Math.floor(Number(stateRow?.next_index ?? 0)));
+    } catch (stateErr) {
+      canPersistRotation = false;
+      if (!globalThis._coldDmRotationWarned) {
+        globalThis._coldDmRotationWarned = true;
+        console.warn(
+          '[getRandomMessageFromGroup] Rotation state table unavailable (missing, RLS, or permissions?). ' +
+          'Falling back to first message for all sends until fixed. See migration 20260421130000_cold_dm_message_group_rotation_state.sql'
+        );
+      }
+    }
+
+    const row = data[rotationIndex % data.length];
+    if (canPersistRotation) {
+      const nextIndex = data.length <= 1 ? 0 : (rotationIndex + 1) % data.length;
+      let upsertOk = false;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const { error: upsertErr } = await sb
+            .from('cold_dm_message_group_rotation_state')
+            .upsert(
+              {
+                message_group_id: messageGroupId,
+                next_index: nextIndex,
+                updated_at: new Date().toISOString(),
+              },
+              { onConflict: 'message_group_id' }
+            );
+          if (upsertErr) throw upsertErr;
+          upsertOk = true;
+          break;
+        } catch (upsertErr) {
+          if (attempt === 0) {
+            console.warn(`[getRandomMessageFromGroup] upsert attempt 1 failed for group=${messageGroupId}: ${upsertErr.message || upsertErr}. Retrying...`);
+            await new Promise(r => setTimeout(r, 100));
+            continue;
+          }
+          console.warn(`[getRandomMessageFromGroup] upsert failed after retry for group=${messageGroupId}: ${upsertErr.message || upsertErr}`);
+        }
+      }
+      if (!upsertOk) {
+        canPersistRotation = false; // prevent future attempts in same process if persistent fail
+      }
+    }
     return {
       id: row.id,
       message_text: row.message_text,
@@ -4116,14 +4668,22 @@ async function getRandomMessageFromGroup(messageGroupId) {
       voice_note_storage_path: row.voice_note_storage_path || null,
     };
   } catch (e) {
+    console.warn(`[getRandomMessageFromGroup] query failed for group=${messageGroupId}: ${e.message || e}. Using first message as fallback.`);
     const { data, error } = await sb
       .from('cold_dm_message_group_messages')
-      .select('id, message_text')
+      .select('id, message_text, send_voice_note, voice_note_storage_path, sort_order, created_at')
       .eq('message_group_id', messageGroupId)
-      .order('sort_order', { ascending: true });
+      .order('sort_order', { ascending: true })
+      .order('created_at', { ascending: true })
+      .order('id', { ascending: true });
     if (error || !data || data.length === 0) return null;
-    const row = data[Math.floor(Math.random() * data.length)];
-    return { id: row.id, message_text: row.message_text, send_voice_note: false, voice_note_storage_path: null };
+    const row = data[0];
+    return {
+      id: row.id,
+      message_text: row.message_text,
+      send_voice_note: row.send_voice_note === true,
+      voice_note_storage_path: row.voice_note_storage_path || null,
+    };
   }
 }
 
@@ -4238,7 +4798,7 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
 
     const { data: leadRows } = await sb
       .from('cold_dm_leads')
-      .select('id, username')
+      .select('id, username, first_name, last_name')
       .eq('client_id', clientId)
       .in('lead_group_id', leadGroupIds);
     dbg.leadRowsCount = leadRows?.length || 0;
@@ -4249,6 +4809,12 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
     }
 
     for (const lead of leadRows) {
+      const leadSnapshot = {
+        username: lead.username || null,
+        first_name: lead.first_name || null,
+        last_name: lead.last_name || null,
+        display_name: null,
+      };
       const { data: existing } = await sb
         .from('cold_dm_campaign_leads')
         .select('id')
@@ -4257,7 +4823,15 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
         .maybeSingle();
       if (!existing) {
         await sb.from('cold_dm_campaign_leads').upsert(
-          { campaign_id: camp.id, lead_id: lead.id, status: 'pending' },
+          {
+            campaign_id: camp.id,
+            lead_id: lead.id,
+            status: 'pending',
+            lead_username: leadSnapshot.username,
+            lead_first_name: leadSnapshot.first_name,
+            lead_last_name: leadSnapshot.last_name,
+            lead_display_name: leadSnapshot.display_name,
+          },
           { onConflict: 'campaign_id,lead_id', ignoreDuplicates: true }
         );
       }
@@ -4268,7 +4842,11 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
     for (;;) {
       const nowIso = new Date().toISOString();
       const basePending = () =>
-        sb.from('cold_dm_campaign_leads').select('id, lead_id').eq('campaign_id', camp.id).eq('status', 'pending');
+        sb
+          .from('cold_dm_campaign_leads')
+          .select('id, lead_id, lead_username, lead_first_name, lead_last_name, lead_display_name')
+          .eq('campaign_id', camp.id)
+          .eq('status', 'pending');
       let { data: pendingRow, error } = await basePending()
         .is('leased_until', null)
         .order('id', { ascending: true })
@@ -4283,24 +4861,35 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
       }
       if (error || !pendingRow?.lead_id) break;
       dbg.pendingCount += 1;
-      const { data: leadData } = await sb
-        .from('cold_dm_leads')
-        .select('username, first_name, last_name, display_name')
-        .eq('id', pendingRow.lead_id)
-        .eq('client_id', clientId)
-        .maybeSingle();
-      if (!leadData?.username) {
+      let leadData = null;
+      try {
+        const { data } = await sb
+          .from('cold_dm_leads')
+          .select('username, first_name, last_name')
+          .eq('id', pendingRow.lead_id)
+          .eq('client_id', clientId)
+          .maybeSingle();
+        leadData = data || null;
+      } catch {}
+      const resolvedUsername = normalizeUsername(leadData?.username || pendingRow.lead_username || '').toLowerCase();
+      if (!resolvedUsername) {
         dbg.skippedMissingLeadRow += 1;
-        await updateCampaignLeadStatus(pendingRow.id, 'failed').catch(() => {});
+        await updateCampaignLeadStatus(pendingRow.id, 'failed', 'missing_lead_snapshot').catch(() => {});
         continue;
       }
-      const unameNorm = normalizeUsername(leadData.username).toLowerCase();
+      const resolvedLead = {
+        username: leadData?.username || pendingRow.lead_username || null,
+        first_name: leadData?.first_name || pendingRow.lead_first_name || null,
+        last_name: leadData?.last_name || pendingRow.lead_last_name || null,
+        display_name: pendingRow.lead_display_name || null,
+      };
+      const unameNorm = normalizeUsername(resolvedLead.username).toLowerCase();
       if (scrapeBlocklistSet.has(unameNorm)) {
         dbg.skippedBlocklist += 1;
         await updateCampaignLeadStatus(pendingRow.id, 'failed', 'blocklist').catch(() => {});
         await logSentMessage(
           clientId,
-          leadData.username,
+          resolvedLead.username,
           messageText || null,
           'failed',
           camp.id,
@@ -4311,14 +4900,14 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
         ).catch((e) => console.error('[getNextPendingCampaignLead] logSentMessage blocklist', e && e.message));
         continue;
       }
-      const sent = await alreadySent(clientId, leadData.username);
+      const sent = await alreadySent(clientId, resolvedLead.username);
       if (sent) {
         dbg.skippedAlreadySent += 1;
         await updateCampaignLeadStatus(pendingRow.id, 'sent').catch(() => {});
         continue;
       }
       clRow = pendingRow;
-      leadRow = leadData;
+      leadRow = resolvedLead;
       break;
     }
     if (!clRow || !leadRow) {
@@ -4328,13 +4917,13 @@ async function getNextPendingCampaignLead(clientId, workerId = null, leaseSecond
     }
 
     const [stats, hourlySent] = await Promise.all([getDailyStats(clientId), getHourlySent(clientId)]);
-    if (camp.daily_send_limit != null && stats.total_sent >= camp.daily_send_limit) {
+    if (stats.total_sent >= normalizeColdOutreachDailyLimit(camp.daily_send_limit)) {
       dbg.blockedBy = 'daily_limit';
       dbg.reason = 'daily_limit_reached';
       campaignDebug.push(dbg);
       continue;
     }
-    if (camp.hourly_send_limit != null && hourlySent >= camp.hourly_send_limit) {
+    if (hourlySent >= normalizeColdOutreachHourlyLimit(camp.hourly_send_limit)) {
       dbg.blockedBy = 'hourly_limit';
       dbg.reason = 'hourly_limit_reached';
       campaignDebug.push(dbg);
@@ -4580,9 +5169,33 @@ async function updateCampaignLeadStatus(campaignLeadId, status, failureReason = 
     if (count === 0) {
       await sb.from('cold_dm_campaigns').update({ status: 'completed', updated_at: new Date().toISOString() }).eq('id', row.campaign_id);
       const { data: camp } = await sb.from('cold_dm_campaigns').select('client_id').eq('id', row.campaign_id).maybeSingle();
-      if (camp?.client_id) await setControl(camp.client_id, 1);
+      if (camp?.client_id) {
+        const { count: activeCampaignsLeft, error: activeCountErr } = await sb
+          .from('cold_dm_campaigns')
+          .select('*', { count: 'exact', head: true })
+          .eq('client_id', camp.client_id)
+          .eq('status', 'active');
+        const stillActive = activeCountErr ? 1 : Number(activeCampaignsLeft ?? 0);
+        if (stillActive === 0) {
+          await setControl(camp.client_id, 1);
+          await setClientStatusMessage(camp.client_id, 'Completed.').catch(() => {});
+        }
+      }
     }
   }
+}
+
+/** Active cold_dm_campaigns rows for this client (status = active). */
+async function countActiveCampaignsForClient(clientId) {
+  const sb = getSupabase();
+  if (!sb || !clientId) return 0;
+  const { count, error } = await sb
+    .from('cold_dm_campaigns')
+    .select('*', { count: 'exact', head: true })
+    .eq('client_id', clientId)
+    .eq('status', 'active');
+  if (error) return 1;
+  return Number(count ?? 0);
 }
 
 module.exports = {
@@ -4601,8 +5214,10 @@ module.exports = {
   getSessions,
   getSessionsForCampaign,
   getWaitingInstagramSessionReason,
+  normalizeSessionDataForPuppeteer,
   claimInstagramSessionLease,
   claimInstagramSessionForCampaign,
+  getInstagramSessionDailyUsage,
   heartbeatInstagramSessionLease,
   releaseInstagramSessionLease,
   releaseAllInstagramSessionLeases,
@@ -4623,8 +5238,11 @@ module.exports = {
   getControl,
   setControl,
   setClientStatusMessage,
+  insertErrorEvent,
+  pauseClientAndAlert,
   getClientStatusMessage,
   getRecentSent,
+  getLatestSuccessfulColdDmSentAt,
   getSentUsernames,
   clearFailedAttempts,
   updateSettingsInstagramUsername,
@@ -4675,6 +5293,8 @@ module.exports = {
   getMessageTemplateById,
   getNextPendingCampaignLead,
   updateCampaignLeadStatus,
+  countActiveCampaignsForClient,
+  canClientActivelySendNow,
   getClientIdsWithPauseZero,
   getDistinctActiveCampaignIdsWithReadySendJobs,
   getClientSendCampaignTurn,
@@ -4691,6 +5311,13 @@ module.exports = {
   getUserAccountName,
   addCampaignLeadsFromGroups,
   reactivateCampaignsWithPendingLeads,
+  getMostRecentInstagramSessionForClient,
+  getInstagramSessionForClientAndUsername,
+  getInstagramSessionForScrapeById,
+  serviceSetInstagrapiSettings,
+  serviceSetInstagrapiState,
+  updateInstagramSessionProxy,
+  updateInstagramSessionScrapeCooldown,
   syncSendJobsForCampaign,
   syncSendJobsForClient,
   buildSendWorkFromJob,

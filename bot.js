@@ -40,6 +40,15 @@ const {
   typeInstagramDmPlainTextInComposer,
   typeInstagramDmPlainTextWithKeyboard,
 } = require('./utils/open-dm-thread');
+const {
+  clickElementNaturally,
+  focusAndTypeNaturally,
+  maybeLightStoryInteraction,
+  naturalScrollPage,
+  organicPause,
+  randomMouseDrift,
+  typeTextNaturally,
+} = require('./utils/human-interaction');
 const { clickInstagramDmSearchResult, formatSearchFailurePageSnippet } = require('./utils/instagram-dm-search');
 const { attachInstagramSendIdCapture } = require('./utils/instagram-dm-network-ids');
 const { applyProxyToLaunchOptions, authenticatePageForProxy } = require('./utils/proxy-puppeteer');
@@ -86,12 +95,45 @@ const SEND_DAILY_LIMIT_DEFER_MS = Math.max(
   5 * 60 * 1000,
   parseInt(process.env.SEND_DAILY_LIMIT_DEFER_MS || String(60 * 60 * 1000), 10) || 60 * 60 * 1000
 );
+const FOLLOW_UP_SESSION_LEASE_SECONDS = Math.max(
+  300,
+  parseInt(process.env.FOLLOW_UP_SESSION_LEASE_SECONDS || '600', 10) || 600
+);
 /** Min interval between identical send-limit logs per campaign (default 10m). */
 const SEND_LIMIT_LOG_THROTTLE_MS = Math.max(
   30_000,
   parseInt(process.env.SEND_LIMIT_LOG_THROTTLE_MS || String(10 * 60 * 1000), 10) || 10 * 60 * 1000
 );
+const SEND_PRESENCE_BROWSE_EVERY = Math.max(
+  1,
+  parseInt(process.env.SEND_PRESENCE_BROWSE_EVERY || '20', 10) || 20
+);
+const COLD_DM_HARD_MAX_SENDS_PER_DAY = Math.max(
+  1,
+  parseInt(process.env.COLD_DM_MAX_SENDS_PER_DAY || '100', 10) || 100
+);
+const COLD_DM_HARD_MAX_SENDS_PER_HOUR = Math.max(
+  1,
+  parseInt(process.env.COLD_DM_MAX_SENDS_PER_HOUR || '25', 10) || 25
+);
+const COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS = Math.max(
+  0,
+  parseInt(process.env.COLD_DM_MIN_SECONDS_BETWEEN_SENDS || '30', 10) || 30
+);
+const COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS = Math.max(
+  0,
+  parseInt(process.env.COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS || '10', 10) || 10
+);
+const SCRAPE_SESSION_COOLDOWN_MS = Math.max(
+  60 * 1000,
+  parseInt(process.env.SCRAPE_SESSION_COOLDOWN_MS || String(5 * 60 * 1000), 10) || 5 * 60 * 1000
+);
+const COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_RETRIES = Math.max(
+  1,
+  parseInt(process.env.COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_RETRIES || '5', 10) || 5
+);
 const sendLimitLogLast = new Map();
+const sendPresenceBatchState = new Map();
 
 function throttleSendLimitLog(key, emit) {
   const now = Date.now();
@@ -99,6 +141,93 @@ function throttleSendLimitLog(key, emit) {
   if (now - prev < SEND_LIMIT_LOG_THROTTLE_MS) return;
   sendLimitLogLast.set(key, now);
   emit();
+}
+
+function getSendPresenceStateKey(instagramSessionId, clientId) {
+  const sid = String(instagramSessionId || '').trim();
+  const cid = String(clientId || '').trim();
+  return sid || cid || 'global';
+}
+
+function shouldBrowseBeforeBatch(key) {
+  const state = sendPresenceBatchState.get(key) || { completedSends: 0, preBrowsedForBatchStart: false };
+  return (
+    state.completedSends > 0 &&
+    state.completedSends % SEND_PRESENCE_BROWSE_EVERY === 0 &&
+    !state.preBrowsedForBatchStart
+  );
+}
+
+function markBrowsedBeforeBatch(key) {
+  const state = sendPresenceBatchState.get(key) || { completedSends: 0, preBrowsedForBatchStart: false };
+  state.preBrowsedForBatchStart = true;
+  sendPresenceBatchState.set(key, state);
+}
+
+function recordCompletedSendAndCheckPostBrowse(key) {
+  const state = sendPresenceBatchState.get(key) || { completedSends: 0, preBrowsedForBatchStart: false };
+  state.completedSends += 1;
+  const shouldBrowseAfter = state.completedSends % SEND_PRESENCE_BROWSE_EVERY === 0;
+  if (shouldBrowseAfter) state.preBrowsedForBatchStart = false;
+  sendPresenceBatchState.set(key, state);
+  return shouldBrowseAfter;
+}
+
+function normalizeColdOutreachDailyLimit(limit) {
+  if (limit == null || limit === '') return COLD_DM_HARD_MAX_SENDS_PER_DAY;
+  const n = Number(limit);
+  if (!Number.isFinite(n) || n <= 0) return COLD_DM_HARD_MAX_SENDS_PER_DAY;
+  return Math.min(n, COLD_DM_HARD_MAX_SENDS_PER_DAY);
+}
+
+function normalizeColdOutreachHourlyLimit(limit) {
+  if (limit == null || limit === '') return COLD_DM_HARD_MAX_SENDS_PER_HOUR;
+  const n = Number(limit);
+  if (!Number.isFinite(n) || n <= 0) return COLD_DM_HARD_MAX_SENDS_PER_HOUR;
+  return Math.min(n, COLD_DM_HARD_MAX_SENDS_PER_HOUR);
+}
+
+function normalizeColdOutreachDelayWindow(minDelaySecRaw, maxDelaySecRaw) {
+  const minDelaySec = Math.max(
+    0,
+    Number(minDelaySecRaw) || 0,
+    COLD_DM_HARD_MIN_SECONDS_BETWEEN_SENDS
+  );
+  const requestedMaxDelaySec = Math.max(0, Number(maxDelaySecRaw) || 0);
+  const maxDelaySec = Math.max(
+    requestedMaxDelaySec,
+    minDelaySec + COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS
+  );
+  return { minDelaySec, maxDelaySec };
+}
+
+function formatDurationShort(ms) {
+  const safeMs = Math.max(0, Number(ms) || 0);
+  const totalSec = Math.max(1, Math.ceil(safeMs / 1000));
+  if (totalSec < 60) return `${totalSec} second${totalSec === 1 ? '' : 's'}`;
+  const min = Math.max(1, Math.round(totalSec / 60));
+  if (min < 60) return `${min} minute${min === 1 ? '' : 's'}`;
+  const hours = Math.floor(min / 60);
+  const mins = min % 60;
+  if (mins === 0) return `${hours} hour${hours === 1 ? '' : 's'}`;
+  return `${hours} hour${hours === 1 ? '' : 's'} ${mins} minute${mins === 1 ? '' : 's'}`;
+}
+
+async function getClientLimitResumeAt(clientId, fallbackMs) {
+  const fallbackDelayMs = Math.max(1000, Number(fallbackMs) || 1000);
+  const fallbackAtIso = new Date(Date.now() + fallbackDelayMs).toISOString();
+  if (!clientId || typeof sb.getClientNoWorkResumeAt !== 'function') {
+    return { resumeAtIso: fallbackAtIso, delayMs: fallbackDelayMs };
+  }
+  const info = await sb.getClientNoWorkResumeAt(clientId).catch(() => null);
+  const resumeAtMs = info?.resumeAt ? new Date(info.resumeAt).getTime() : NaN;
+  if (!Number.isFinite(resumeAtMs) || resumeAtMs <= Date.now()) {
+    return { resumeAtIso: fallbackAtIso, delayMs: fallbackDelayMs };
+  }
+  return {
+    resumeAtIso: new Date(resumeAtMs).toISOString(),
+    delayMs: Math.max(1000, resumeAtMs - Date.now()),
+  };
 }
 
 const COLD_DM_CONCURRENCY_DEBUG =
@@ -417,12 +546,19 @@ async function saveComposeFailureDebugScreenshot(page, username, label = 'compos
 }
 
 /**
- * Full-page screenshot right after a compose-recovery CTA (Continue, Accept, etc.).
- * Not gated on DM_COMPOSE_FAILURE_SCREENSHOT — always written when recovery runs so
- * account-picker / interstitial flows are visible on the VPS (logs/login-debug).
+ * Full-page screenshot after a compose-recovery CTA (Continue, Accept, thread row, etc.).
+ * Gated on DM_COMPOSE_RECOVERY_SCREENSHOT=1|true (default off).
  */
+function wantsComposeRecoveryScreenshot() {
+  return process.env.DM_COMPOSE_RECOVERY_SCREENSHOT === '1' || process.env.DM_COMPOSE_RECOVERY_SCREENSHOT === 'true';
+}
+
+function wantsDmComposeVerboseDiagnostics() {
+  return process.env.DM_COMPOSE_VERBOSE_DIAGNOSTICS === '1' || process.env.DM_COMPOSE_VERBOSE_DIAGNOSTICS === 'true';
+}
+
 async function saveAfterComposeRecoveryScreenshot(page, recoveryClicked, leadUsername) {
-  if (!page) return null;
+  if (!wantsComposeRecoveryScreenshot() || !page) return null;
   try {
     fs.mkdirSync(LOGIN_DEBUG_SCREENSHOT_DIR, { recursive: true });
     const u = String(leadUsername || 'lead').replace(/^@/, '').replace(/[^a-z0-9_-]/gi, '_').slice(0, 40);
@@ -435,6 +571,192 @@ async function saveAfterComposeRecoveryScreenshot(page, recoveryClicked, leadUse
     logger.warn('[compose-recovery] after-CTA screenshot failed: ' + (e.message || e));
     return null;
   }
+}
+
+/**
+ * Instagram shows "View profile" in the broken DM thread pane; clicking it fixes state without blowing away
+ * the floating composer the way a raw profile URL navigation can.
+ */
+async function clickInDmPaneViewProfile(page) {
+  const result = await page
+    .evaluate(() => {
+      const visible = (el) => {
+        try {
+          return !!el && el.offsetParent !== null && (el.offsetWidth > 0 || el.offsetHeight > 0);
+        } catch {
+          return false;
+        }
+      };
+      const norm = (t) => String(t || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const candidates = Array.from(document.querySelectorAll('button, a, div[role="button"], span[role="button"]')).filter(
+        visible
+      );
+      for (const el of candidates) {
+        const t = norm(el.textContent);
+        if (t === 'view profile' || t.includes('view profile')) {
+          const btn = el.closest('button, a, [role="button"]') || el;
+          try {
+            btn.scrollIntoView({ block: 'center' });
+          } catch {}
+          try {
+            btn.click();
+            return { ok: true, label: t.slice(0, 80) };
+          } catch {
+            return { ok: false, label: null, err: 'click failed' };
+          }
+        }
+      }
+      return { ok: false, label: null };
+    })
+    .catch((e) => ({ ok: false, label: null, err: e?.message || String(e) }));
+  return !!result?.ok;
+}
+
+async function recoverInstagramTechnicalErrorViaProfile(page, username) {
+  if (!page) {
+    return { ok: false, reason: 'instagram_technical_error', pageSnippet: 'No page available for recovery.' };
+  }
+
+  const u = normalizeUsername(username);
+  const profileUrl = `https://www.instagram.com/${u}/`;
+  const profilePath = `/${u}/`;
+  logger.log(`[compose-recovery] DM technical error — recovering @${u}`);
+
+  /** Thread pane, profile right column, or floating DM overlay — not the left inbox search box. */
+  const recoveryComposerVisible = async () => {
+    return page
+      .evaluate(() => {
+        const visible = (el) => {
+          try {
+            return !!el && el.offsetParent !== null && (el.offsetWidth > 0 || el.offsetHeight > 0);
+          } catch {
+            return false;
+          }
+        };
+        const messageLike = (el) => {
+          const ph = String(el.getAttribute?.('placeholder') || '').toLowerCase();
+          const aria = String(el.getAttribute?.('aria-label') || '').toLowerCase();
+          const text = String(el.textContent || '').toLowerCase();
+          return (
+            ph.includes('message') ||
+            ph.includes('write') ||
+            aria.includes('message') ||
+            aria.includes('write a message') ||
+            text.includes('message')
+          );
+        };
+        const inDmComposerZone = (el) => {
+          try {
+            const r = el.getBoundingClientRect();
+            const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+            const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+            if (!vw || !vh) return false;
+            const rightish = r.left > vw * 0.3;
+            const lowish = r.top > vh * 0.28;
+            return r.width > 36 && r.height > 14 && rightish && lowish;
+          } catch {
+            return false;
+          }
+        };
+        const candidates = Array.from(
+          document.querySelectorAll('textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]')
+        ).filter(visible);
+        return candidates.some((el) => {
+          if (!inDmComposerZone(el)) return false;
+          try {
+            const r = el.getBoundingClientRect();
+            return messageLike(el) || r.height > 26;
+          } catch {
+            return messageLike(el);
+          }
+        });
+      })
+      .catch(() => false);
+  };
+
+  let composerVisible = await recoveryComposerVisible();
+  if (composerVisible) {
+    await saveAfterComposeRecoveryScreenshot(page, 'recovery-composer-visible-initial', u);
+    return { ok: true, recoveryClicked: 'recovery-composer-visible-initial' };
+  }
+
+  const startUrl = page.url();
+  const onDirect = /\/direct\//i.test(startUrl);
+  if (onDirect) {
+    const clickedVp = await clickInDmPaneViewProfile(page);
+    await delay(clickedVp ? 2400 : 800);
+    await dismissInstagramHomeModals(page, logger).catch(() => {});
+
+    composerVisible = await recoveryComposerVisible();
+    if (composerVisible) {
+      await saveAfterComposeRecoveryScreenshot(page, 'after-in-dm-view-profile', u);
+      return { ok: true, recoveryClicked: 'in-dm-view-profile' };
+    }
+    await delay(1200);
+    composerVisible = await recoveryComposerVisible();
+    if (composerVisible) {
+      await saveAfterComposeRecoveryScreenshot(page, 'after-in-dm-view-profile-wait', u);
+      return { ok: true, recoveryClicked: 'in-dm-view-profile-wait' };
+    }
+  }
+
+  logger.log(`[compose-recovery] profile URL fallback @${u}`);
+  try {
+    await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  } catch {
+    // continue with whatever URL we have
+  }
+  await page
+    .waitForFunction(
+      (path) => location.pathname.toLowerCase().replace(/\/+$/, '/') === path || location.href.toLowerCase().includes(path),
+      { timeout: 10000 },
+      profilePath
+    )
+    .catch(() => {});
+  await page.waitForSelector('header, main, [role="main"]', { timeout: 10000 }).catch(() => {});
+  await dismissInstagramHomeModals(page, logger).catch(() => {});
+  await delay(2200);
+  const isProfilePage = await page
+    .evaluate((path) => location.pathname.toLowerCase().replace(/\/+$/, '/') === path, profilePath)
+    .catch(() => false);
+  if (!isProfilePage) {
+    logger.warn(`[compose-recovery] profile URL failed @${u} url=${page.url()}`);
+    return {
+      ok: false,
+      reason: 'instagram_technical_error',
+      pageSnippet: 'Instagram profile page did not open cleanly during recovery.',
+    };
+  }
+
+  composerVisible = await recoveryComposerVisible();
+  if (composerVisible) {
+    await saveAfterComposeRecoveryScreenshot(page, 'after-profile-url-fallback', u);
+    return { ok: true, recoveryClicked: 'profile-url-fallback' };
+  }
+
+  await delay(2200);
+  await dismissInstagramHomeModals(page, logger).catch(() => {});
+
+  const composerVisibleAfterMessage = await recoveryComposerVisible();
+  if (composerVisibleAfterMessage) {
+    await saveAfterComposeRecoveryScreenshot(page, 'profile-composer-visible-after-settle', u);
+    return { ok: true, recoveryClicked: 'profile-composer-visible-after-settle' };
+  }
+
+  await delay(1200);
+  const composerVisibleAfterWait = await recoveryComposerVisible();
+  if (composerVisibleAfterWait) {
+    await saveAfterComposeRecoveryScreenshot(page, 'profile-composer-visible-after-wait', u);
+    return { ok: true, recoveryClicked: 'profile-composer-visible-after-wait' };
+  }
+
+  logger.warn(`[compose-recovery] recovery failed @${u}`);
+  return {
+    ok: false,
+    reason: 'instagram_technical_error',
+    pageSnippet:
+      'Instagram shows "Something isn\'t working" in the DM pane, and recovery (View profile + profile URL fallback) did not restore a composer.',
+  };
 }
 
 async function logDmSearchFailureDiagnostics(page, username, searchPick) {
@@ -863,25 +1185,393 @@ async function humanDelay() {
 }
 
 async function tinyHumanMouseMove(page) {
-  if (!page || !page.mouse || typeof page.viewport !== 'function') return;
-  const vp = page.viewport() || {};
-  const width = Math.max(800, vp.width || 1200);
-  const height = Math.max(600, vp.height || 900);
-  const start = {
-    x: Math.max(20, Math.min(width - 20, Math.round(width * (0.18 + Math.random() * 0.18)))),
-    y: Math.max(20, Math.min(height - 20, Math.round(height * (0.22 + Math.random() * 0.16)))),
-  };
-  const end = {
-    x: Math.max(20, Math.min(width - 20, Math.round(width * (0.42 + Math.random() * 0.2)))),
-    y: Math.max(20, Math.min(height - 20, Math.round(height * (0.34 + Math.random() * 0.18)))),
-  };
+  await randomMouseDrift(page, { totalDurationMs: randomDelay(180, 420) });
+}
+
+async function doLightInstagramBrowse(page, phase = 'before_send') {
+  if (!page) return;
   try {
-    await page.mouse.move(start.x, start.y, { steps: 5 });
-    await delay(60 + Math.floor(Math.random() * 100));
-    await page.mouse.move(end.x, end.y, { steps: 7 });
-    await delay(80 + Math.floor(Math.random() * 140));
-  } catch {
-    // best-effort only
+    const url = String(page.url() || '').toLowerCase();
+    if (url.includes('/accounts/login')) return;
+    if (!url.includes('instagram.com')) {
+      await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await delay(900);
+    } else if (phase === 'after_send' && !/instagram\.com\/?$/.test(url.replace(/\/+$/, '/'))) {
+      await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await delay(900);
+    }
+    await dismissInstagramHomeModals(page, logger).catch(() => {});
+    await randomMouseDrift(page, { totalDurationMs: randomDelay(150, 320) });
+    await naturalScrollPage(page, {
+      rounds: phase === 'before_send' ? randomDelay(1, 2) : randomDelay(1, 3),
+      pauseMultiplier: phase === 'before_send' ? 0.7 : 0.85,
+    }).catch(() => {});
+    if (Math.random() < (phase === 'before_send' ? 0.28 : 0.35)) {
+      await naturalScrollPage(page, { rounds: 1, direction: 'up', pauseMultiplier: 0.55 }).catch(() => {});
+    }
+    await maybeLightStoryInteraction(page, {
+      openChance: phase === 'before_send' ? 0.08 : 0.12,
+    }).catch(() => {});
+    await organicPause('between_actions', phase === 'before_send' ? 0.8 : 1.0);
+  } catch (e) {
+    logger.warn(`[human-browse:${phase}] ${e.message || e}`);
+  }
+}
+
+function normalizeColdFollowUpItems(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((item, index) => {
+      const content = typeof item?.content === 'string' ? item.content.trim() : '';
+      const delayMinutes = typeof item?.delay_minutes === 'number' ? Math.floor(item.delay_minutes) : NaN;
+      if (!content || !Number.isFinite(delayMinutes) || delayMinutes < 1) return null;
+      return {
+        id: typeof item?.id === 'string' && item.id.trim() ? item.id.trim() : `cold-fu-${index + 1}`,
+        content,
+        delay_minutes: delayMinutes,
+      };
+    })
+    .filter(Boolean);
+}
+
+function coldDmFollowUpDebugEnabled() {
+  return process.env.COLD_DM_FOLLOW_UP_DEBUG === '1' || process.env.COLD_DM_FOLLOW_UP_DEBUG === 'true';
+}
+
+function logColdDmFollowUpDebug(msg) {
+  if (coldDmFollowUpDebugEnabled()) logger.log(`[follow-up-interleave][debug] ${msg}`);
+}
+
+/** Human-readable duration for logs (ms → "45s", "30m", "2d", …). */
+function formatDurationRough(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '0s';
+  const sec = Math.max(1, Math.ceil(ms / 1000));
+  if (sec < 120) return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  if (min < 120) return `${min}m`;
+  const hr = Math.floor(min / 60);
+  if (hr < 48) return `${hr}h`;
+  const d = Math.floor(hr / 24);
+  const remHr = hr % 24;
+  return remHr > 0 ? `${d}d ${remHr}h` : `${d}d`;
+}
+
+/**
+ * Chunked sleep until a target timestamp. Only used when the next queue row is due
+ * within COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_WAIT_MS (same-browser shortcut). Honors
+ * force-exit only; long delays are never slept here — cron delivers those via /api/follow-up/send.
+ */
+async function sleepUntilDue(dueMs, username = '', shouldAbort = () => false) {
+  const now = Date.now();
+  if (dueMs <= now) return;
+  const msLeft = dueMs - now;
+  const chunk = 500;
+  logger.log(
+    `[follow-up-interleave] waiting ${Math.ceil(msLeft / 1000)}s until follow-up due (@${username || '?'})`
+  );
+  const end = dueMs;
+  while (Date.now() < end) {
+    if (shouldAbort()) {
+      logger.warn(`[follow-up-interleave] force exit during follow-up due wait — aborting`);
+      return;
+    }
+    await delay(Math.min(chunk, Math.max(1, end - Date.now())));
+  }
+}
+
+/** Bump a pending follow-up row so pg_cron / workers retry after the session daily cap resets. */
+async function deferColdFollowUpQueueRowForSessionDailyCap(supabase, clientId, rowId) {
+  if (!supabase || !clientId || !rowId) return null;
+  const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
+  const { error } = await supabase
+    .from('cold_dm_follow_up_queue')
+    .update({
+      scheduled_for: preciseResume.resumeAtIso,
+      error_message: 'deferred_session_daily_dm_limit',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', rowId)
+    .eq('status', 'pending');
+  if (error) {
+    logger.warn(`[follow-up-interleave] defer queue row ${rowId} failed: ${error.message || error}`);
+    return null;
+  }
+  return preciseResume.resumeAtIso;
+}
+
+/**
+ * Optional same-session follow-up: after a cold send, if a cold_dm_follow_up_queue row is already due
+ * or becomes due within COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_WAIT_MS, we may wait briefly and send in-browser.
+ * Anything scheduled farther out (minutes, days, …) stays `pending` for Supabase pg_cron
+ * `process-scheduled-responses` → Edge `processColdDmFollowUps` → this host `/api/follow-up/send`.
+ */
+async function maybeRunQueuedColdFollowUpForSession(page, session, options = {}) {
+  const clientId = String(options.clientId || '').trim();
+  if (!page || !session?.id || !clientId) {
+    logColdDmFollowUpDebug('skip: missing page, session.id, or clientId');
+    return { processed: false };
+  }
+  const supabase = typeof sb.getSupabase === 'function' ? sb.getSupabase() : null;
+  if (!supabase) {
+    logColdDmFollowUpDebug('skip: Supabase client not available');
+    return { processed: false };
+  }
+
+  logColdDmFollowUpDebug(`start client=${clientId} session=${session.id} page=${typeof page.url === 'function' ? page.url() : '?'}`);
+
+  const { data: settingsRow, error: settingsErr } = await supabase
+    .from('cold_dm_settings')
+    .select('follow_ups_enabled, follow_ups, follow_up_instagram_session_id')
+    .eq('client_id', clientId)
+    .maybeSingle();
+  if (settingsErr) {
+    logger.warn(`[follow-up-interleave] settings load failed for client ${clientId}: ${settingsErr.message || settingsErr}`);
+    return { processed: false };
+  }
+
+  const settings = settingsRow || {};
+  if (settings.follow_ups_enabled === false) {
+    logColdDmFollowUpDebug('skip: follow_ups_enabled is false');
+    return { processed: false };
+  }
+  const configuredSessionId = (settings.follow_up_instagram_session_id || '').toString().trim();
+  if (configuredSessionId && configuredSessionId !== String(session.id)) {
+    logColdDmFollowUpDebug(
+      `skip: session mismatch (worker session=${session.id} settings.follow_up_instagram_session_id=${configuredSessionId})`
+    );
+    return { processed: false };
+  }
+
+  const followUps = normalizeColdFollowUpItems(settings.follow_ups);
+  if (!followUps.length) {
+    logColdDmFollowUpDebug('skip: no follow-up steps in cold_dm_settings.follow_ups');
+    return { processed: false };
+  }
+
+  const followUpWaitCapMs = Math.max(
+    60_000,
+    parseInt(process.env.COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_WAIT_MS || '', 10) || 15 * 60 * 1000
+  );
+
+  // Session daily cap (cold + follow-ups) from Integrations. The cold send is not `completed` in DB yet
+  // when we interleave, so count it via `pendingColdCompleting` to avoid an 11th outbound on a limit of 10.
+  const pendingColdCompleting = Number(options.pendingColdCompleting) === 1 ? 1 : 0;
+  const sessionDailyCap = normalizeColdOutreachDailyLimit(session.account_daily_limit ?? session.daily_dm_limit ?? 100);
+  const usageForCap =
+    typeof sb.getInstagramSessionDailyUsage === 'function'
+      ? await sb.getInstagramSessionDailyUsage(clientId, session.id).catch((e) => {
+          logger.warn(`[follow-up-interleave] usage probe failed: ${e?.message || e} — treating as over cap`);
+          return { totalSent: Number.POSITIVE_INFINITY };
+        })
+      : null;
+  const trackedOutbound = Number.isFinite(usageForCap?.totalSent) ? Number(usageForCap.totalSent) : Number.POSITIVE_INFINITY;
+  const effectiveOutbound = trackedOutbound + pendingColdCompleting;
+  if (effectiveOutbound >= sessionDailyCap) {
+    const horizonIso = new Date(Date.now() + followUpWaitCapMs + 2000).toISOString();
+    const { data: capRow, error: capErr } = await supabase
+      .from('cold_dm_follow_up_queue')
+      .select('id')
+      .eq('client_id', clientId)
+      .eq('status', 'pending')
+      .lte('scheduled_for', horizonIso)
+      .order('scheduled_for', { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    if (!capErr && capRow?.id) {
+      const resumeIso = await deferColdFollowUpQueueRowForSessionDailyCap(supabase, clientId, capRow.id);
+      if (resumeIso) {
+        logger.log(
+          `[follow-up-interleave] deferred queue row ${capRow.id} to ${resumeIso} (session daily cap ${sessionDailyCap}; ` +
+            `tracked=${trackedOutbound} pendingColdComplete=${pendingColdCompleting})`
+        );
+      }
+    }
+    logColdDmFollowUpDebug(
+      `skip: session daily cap (${sessionDailyCap}) — no room for interleaved follow-up (tracked=${trackedOutbound} pendingCold=${pendingColdCompleting})`
+    );
+    return { processed: false, skippedDueToSessionDailyLimit: true };
+  }
+
+  const { data: nextPending, error: nextErr } = await supabase
+    .from('cold_dm_follow_up_queue')
+    .select('id, username, scheduled_for')
+    .eq('client_id', clientId)
+    .eq('status', 'pending')
+    .order('scheduled_for', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (!nextErr && nextPending?.scheduled_for) {
+    const dueMs = new Date(nextPending.scheduled_for).getTime();
+    const slackMs = 500;
+    const msLeft = dueMs - Date.now() - slackMs;
+    if (msLeft > 0 && msLeft <= followUpWaitCapMs) {
+      const shouldAbort = typeof options.forceExit === 'function' ? options.forceExit : () => false;
+      await sleepUntilDue(dueMs, nextPending.username || '', shouldAbort);
+    } else if (msLeft > followUpWaitCapMs) {
+      logger.log(
+        `[follow-up-interleave] next follow-up for @${nextPending.username || '?'} in ${formatDurationRough(msLeft)} ` +
+          `(>${formatDurationRough(followUpWaitCapMs)} same-session cap). Row stays pending — Supabase pg_cron ` +
+          `process-scheduled-responses invokes cold DM follow-up delivery (VPS /api/follow-up/send) when due.`
+      );
+      logColdDmFollowUpDebug('skip: next follow-up beyond interleave cap (cron path)');
+      return { processed: false };
+    }
+  }
+
+  const dueCutoffIso = new Date(Date.now() + Math.max(0, Number(options.lookAheadMs) || 0)).toISOString();
+  logger.log(
+    `[follow-up-interleave] scan client=${clientId} session=${session.id} cutoff=${dueCutoffIso} configuredSteps=${followUps.length}`
+  );
+  const { data: pendingRows, error: queueErr } = await supabase
+    .from('cold_dm_follow_up_queue')
+    .select('id, client_id, follow_up_index, username, scheduled_for, retry_count')
+    .eq('client_id', clientId)
+    .eq('status', 'pending')
+    .lte('scheduled_for', dueCutoffIso)
+    .order('scheduled_for', { ascending: true })
+    .limit(10);
+  if (queueErr) {
+    logger.warn(`[follow-up-interleave] queue load failed for client ${clientId}: ${queueErr.message || queueErr}`);
+    return { processed: false };
+  }
+
+  const row = Array.isArray(pendingRows) ? pendingRows[0] : null;
+  if (!row?.id) {
+    logColdDmFollowUpDebug(
+      `no row due yet (cutoff=${dueCutoffIso} pendingQueryRows=${Array.isArray(pendingRows) ? pendingRows.length : 0})`
+    );
+    return { processed: false };
+  }
+  logger.log(
+    `[follow-up-interleave] found due row ${row.id} for @${row.username || 'unknown'} scheduled_for=${row.scheduled_for || 'n/a'}`
+  );
+
+  const { data: claimed, error: claimErr } = await supabase.rpc('claim_cold_dm_follow_up_queue_item', {
+    p_queue_id: row.id,
+  });
+  if (claimErr) {
+    logger.warn(`[follow-up-interleave] claim failed for row ${row.id}: ${claimErr.message || claimErr}`);
+    return { processed: false };
+  }
+  if (!claimed) {
+    logColdDmFollowUpDebug(`claim returned empty for row=${row.id} (another worker may have claimed)`);
+    return { processed: false };
+  }
+
+  const followUpItem = followUps[row.follow_up_index];
+  if (!followUpItem?.content) {
+    await supabase
+      .from('cold_dm_follow_up_queue')
+      .update({
+        status: 'cancelled',
+        cancel_reason: 'missing_follow_up_item',
+        cancelled_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', row.id)
+      .eq('status', 'processing');
+    return { processed: false };
+  }
+
+  // Second cap check after claim (row is `processing`); release back to `pending` if cap hit while we waited.
+  const usageAfterWait =
+    typeof sb.getInstagramSessionDailyUsage === 'function'
+      ? await sb.getInstagramSessionDailyUsage(clientId, session.id).catch(() => null)
+      : null;
+  const tracked2 = Number(usageAfterWait?.totalSent) || 0;
+  const effective2 = tracked2 + pendingColdCompleting;
+  if (effective2 >= sessionDailyCap) {
+    const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
+    await supabase
+      .from('cold_dm_follow_up_queue')
+      .update({
+        status: 'pending',
+        scheduled_for: preciseResume.resumeAtIso,
+        error_message: 'deferred_session_daily_dm_limit',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', row.id)
+      .eq('status', 'processing');
+    logger.log(
+      `[follow-up-interleave] re-queued claimed row ${row.id} to ${preciseResume.resumeAtIso} (session cap ${sessionDailyCap}; tracked=${tracked2} pendingCold=${pendingColdCompleting})`
+    );
+    return { processed: false, skippedDueToSessionDailyLimit: true };
+  }
+
+  const uname = normalizeUsername(row.username || '');
+  const [leadRow, senderName, firstNameBlocklist] = await Promise.all([
+    supabase
+      .from('cold_dm_leads')
+      .select('username, first_name, last_name, display_name')
+      .eq('client_id', clientId)
+      .eq('username', uname)
+      .maybeSingle()
+      .then((r) => r.data || null)
+      .catch(() => null),
+    typeof sb.getUserAccountName === 'function' ? sb.getUserAccountName(clientId).catch(() => '') : '',
+    typeof sb.getFirstNameBlocklist === 'function' ? sb.getFirstNameBlocklist(clientId).catch(() => []) : [],
+  ]);
+
+  const textOut = substituteVariables(
+    followUpItem.content,
+    {
+      username: leadRow?.username || uname,
+      first_name: leadRow?.first_name || null,
+      last_name: leadRow?.last_name || null,
+      display_name: leadRow?.display_name || null,
+    },
+    {
+      senderName: senderName || '',
+      firstNameBlocklist: new Set((firstNameBlocklist || []).map((x) => String(x).toLowerCase())),
+    }
+  );
+
+  try {
+    logger.log(
+      `[follow-up-interleave] running queued follow-up for @${uname} index=${row.follow_up_index} retry=${row.retry_count || 0}`
+    );
+    const nav = await navigateToDmThread(page, uname);
+    if (!nav.ok) throw new Error(nav.reason || 'follow_up_nav_failed');
+    const sent = await sendPlainTextInThread(page, textOut);
+    if (!sent.ok) throw new Error(sent.reason || 'follow_up_send_failed');
+    await supabase
+      .from('cold_dm_follow_up_queue')
+      .update({
+        status: 'sent',
+        sent_at: new Date().toISOString(),
+        error_message: null,
+        vps_session_id: session.id,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', row.id)
+      .eq('status', 'processing');
+    return { processed: true, username: uname };
+  } catch (e) {
+    const retryCount = Math.max(0, Number(row.retry_count || 0));
+    const nextRetryCount = retryCount + 1;
+    const shouldRetry = nextRetryCount < COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_RETRIES;
+    const nextAtIso = new Date(Date.now() + 2 * 60 * 1000).toISOString();
+    await supabase
+      .from('cold_dm_follow_up_queue')
+      .update(
+        shouldRetry
+          ? {
+              status: 'pending',
+              scheduled_for: nextAtIso,
+              retry_count: nextRetryCount,
+              error_message: e?.message || 'interleaved_follow_up_failed',
+              updated_at: new Date().toISOString(),
+            }
+          : {
+              status: 'failed',
+              error_message: e?.message || 'interleaved_follow_up_failed',
+              updated_at: new Date().toISOString(),
+            }
+      )
+      .eq('id', row.id)
+      .eq('status', 'processing');
+    logger.warn(`[follow-up-interleave] failed for @${uname}: ${e?.message || e}`);
+    return { processed: false, error: e?.message || String(e) };
   }
 }
 
@@ -1149,14 +1839,28 @@ async function login(page, credentials) {
   page.on('response', respHandler);
 
   logger.log('Login form found, entering credentials...');
-  await userEl.click({ clickCount: 1 }).catch(() => {});
+  await clickElementNaturally(page, userEl, { totalDurationMs: randomDelay(220, 420) }).catch(() => {});
+  await organicPause('micro');
+  await typeTextNaturally(page, username, {
+    minKeyDelay: 45,
+    maxKeyDelay: 120,
+    correctionChance: 0.02,
+    pauseChance: 0.09,
+  });
   await setReactLoginInputValue(userEl, username);
   await userEl.dispose();
-  await humanDelay();
-  await passEl.click({ clickCount: 1 }).catch(() => {});
+  await organicPause('between_actions', 0.7);
+  await clickElementNaturally(page, passEl, { totalDurationMs: randomDelay(220, 420) }).catch(() => {});
+  await organicPause('micro');
+  await typeTextNaturally(page, password, {
+    minKeyDelay: 50,
+    maxKeyDelay: 135,
+    correctionChance: 0.015,
+    pauseChance: 0.08,
+  });
   await setReactLoginInputValue(passEl, password);
   await passEl.dispose();
-  await humanDelay();
+  await organicPause('between_actions', 0.8);
 
   const submitStyle = (process.env.LOGIN_SUBMIT || 'click').toLowerCase();
   let submitMethod = 'click';
@@ -1920,12 +2624,17 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     const retrySearchEl = retryHandle.asElement();
     if (retrySearchEl) {
       const retryMeta = await page.evaluate((el) => ({ tag: el.tagName, type: el.type || '', isCE: !!el.isContentEditable }), retrySearchEl).catch(() => ({}));
-      await retrySearchEl.click({ delay: 50 }).catch(() => {});
-      if (retryMeta.tag === 'INPUT' || retryMeta.tag === 'TEXTAREA') {
-        await retrySearchEl.type(u, { delay: 90 });
+      await clickElementNaturally(page, retrySearchEl, { totalDurationMs: randomDelay(220, 420) }).catch(() => {});
+      await organicPause('compose', 0.45);
+      if (retryMeta.tag === 'INPUT' || retryMeta.tag === 'TEXTAREA' || retryMeta.isCE) {
+        await focusAndTypeNaturally(page, retrySearchEl, u, {
+          clearFirst: true,
+          minKeyDelay: 45,
+          maxKeyDelay: 120,
+        });
       } else {
         await delay(100);
-        await page.keyboard.type(u, { delay: 90 });
+        await typeTextNaturally(page, u, { minKeyDelay: 45, maxKeyDelay: 120 });
       }
       await retrySearchEl.dispose().catch(() => {});
       await retryHandle.dispose().catch(() => {});
@@ -1937,19 +2646,24 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 
   const searchMeta = await page.evaluate((el) => ({ tag: el.tagName, type: el.type || '', isCE: !!el.isContentEditable }), searchEl).catch(() => ({}));
   await tinyHumanMouseMove(page);
-  await searchEl.click({ delay: 50 }).catch(() => {});
+  await clickElementNaturally(page, searchEl, { totalDurationMs: randomDelay(240, 440) }).catch(() => {});
+  await organicPause('compose', 0.45);
 
-  if (searchMeta.tag === 'INPUT' || searchMeta.tag === 'TEXTAREA') {
-    await searchEl.type(u, { delay: 90 });
+  if (searchMeta.tag === 'INPUT' || searchMeta.tag === 'TEXTAREA' || searchMeta.isCE) {
+    await focusAndTypeNaturally(page, searchEl, u, {
+      clearFirst: true,
+      minKeyDelay: 45,
+      maxKeyDelay: 120,
+    });
   } else {
     // contenteditable element: use keyboard typing so React/Instagram gets the right events
     await delay(100);
-    await page.keyboard.type(u, { delay: 90 });
+    await typeTextNaturally(page, u, { minKeyDelay: 45, maxKeyDelay: 120 });
   }
 
   await searchEl.dispose();
   await searchHandle.dispose();
-  await delay(2800);
+  await organicPause('open_dm');
   await dismissInstagramHomeModals(page, logger).catch(() => {});
   await delay(300);
 
@@ -1986,7 +2700,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   if (sidebarDisplayName) {
     logger.log(`[name-extraction] sidebar display name for @${u}: "${sidebarDisplayName}"`);
   }
-  await delay(1500);
+  await organicPause('between_actions');
 
   const openedThread = await page.evaluate(() => {
     const targets = ['button', 'div[role="button"]', 'a', 'span[role="button"]'];
@@ -2017,8 +2731,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     }
     return false;
   });
-  if (openedThread) await delay(2500);
-  await delay(2000);
+  if (openedThread) await organicPause('open_dm');
+  await organicPause('between_actions');
 
   try {
     await page.waitForFunction(
@@ -2035,13 +2749,38 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         });
         if (nextOrChat && nextOrChat.offsetParent) nextOrChat.click();
       });
-      await delay(3000);
+      await organicPause('open_dm');
     }
   }
-  await delay(2000);
+  await organicPause('between_actions');
 
   await dismissInstagramHomeModals(page, logger);
   await delay(600);
+
+  // Hard stop: Instagram sometimes shows a persistent right-pane error ("Something isn't working").
+  // When this happens, continuing to click/type tends to make things worse and can cascade across sends.
+  const igTechnicalError = await page
+    .evaluate(() => {
+      const raw = (document.body && document.body.innerText) ? document.body.innerText : '';
+      const t = raw.toLowerCase();
+      return t.includes("something isn't working") && t.includes('technical error');
+    })
+    .catch(() => false);
+  if (igTechnicalError) {
+    await saveComposeFailureDebugScreenshot(page, u, 'instagram_technical_error').catch(() => {});
+    const recovered = await recoverInstagramTechnicalErrorViaProfile(page, u);
+    if (recovered.ok) {
+      sendOpts.preferSendIcon = true;
+      logger.log(`[compose-recovery] recovered @${u}`);
+    } else {
+      return {
+        ok: false,
+        reason: 'instagram_technical_error',
+        pageSnippet:
+          "Instagram shows \"Something isn't working\" (technical error) in the DM thread pane. Pausing for support.",
+      };
+    }
+  }
 
   const composeSelector = 'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]';
   logger.log('Waiting for compose area...');
@@ -2142,7 +2881,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     else if (bodySnippet.includes('couldn\'t find') || bodySnippet.includes('no results')) noComposeReason = 'user_not_found';
     if (!composeFound) {
       logger.warn('Compose wait failed ' + e.message + (noComposeReason !== 'no_compose' ? ' (page suggests: ' + noComposeReason + ')' : ''));
-      logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+      if (wantsDmComposeVerboseDiagnostics()) {
+        logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+      }
       await saveComposeFailureDebugScreenshot(page, u, noComposeReason || 'compose_missing');
     } else {
       logger.log('Compose recovery succeeded; composer detected after retry action.');
@@ -2850,11 +3591,13 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       if (nameDebug && nameDebug.winningPath === 'thread_identity_mismatch') {
         const diag = await runComposeDiagnostic(page, u).catch(() => ({}));
         logger.warn(`Thread identity mismatch for @${u}; aborting to avoid wrong-thread extraction/send.`);
-        logger.log('Compose diagnostic: ' + JSON.stringify(diag));
-        if (diag.paneScopedSnippet) {
-          logger.log(
-            'Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet
-          );
+        if (wantsDmComposeVerboseDiagnostics()) {
+          logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+          if (diag.paneScopedSnippet) {
+            logger.log(
+              'Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet
+            );
+          }
         }
         return {
           ok: false,
@@ -2945,11 +3688,13 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       fullNameOut = [derivedNames.first_name, derivedNames.last_name].filter(Boolean).join(' ');
     }
     const diag = await runComposeDiagnostic(page, u).catch(() => ({}));
-    logger.log('Compose diagnostic: ' + JSON.stringify(diag));
-    if (diag.paneScopedSnippet) {
-      logger.log(
-        'Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet
-      );
+    if (wantsDmComposeVerboseDiagnostics()) {
+      logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+      if (diag.paneScopedSnippet) {
+        logger.log(
+          'Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet
+        );
+      }
     }
     return {
       ok: composeFound,
@@ -2975,6 +3720,81 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   let textSent = false;
   let voiceSent = false;
   let voiceFailure = null;
+  let preferSendIcon = !!(sendOpts && sendOpts.preferSendIcon === true);
+
+  const clickInstagramTextSendIcon = async () => {
+    const clicked = await page
+      .evaluate(() => {
+        const visible = (el) => {
+          try {
+            return !!el && el.offsetParent !== null && (el.offsetWidth > 0 || el.offsetHeight > 0);
+          } catch {
+            return false;
+          }
+        };
+        const lower = (s) => String(s || '').toLowerCase();
+        const isNotSend = (label, title, text) => {
+          const t = `${label} ${title} ${text}`;
+          return /\blike\b|\blove\b|\bheart\b|\breact\b|\bemoji\b|\bsticker\b|\bgif\b|\bgallery\b|\bmic\b|\bmicrophone\b|\brecord\b/.test(t);
+        };
+        const candidates = Array.from(
+          document.querySelectorAll('button, [role="button"], a[role="button"], div[tabindex="0"], span[tabindex="0"], a[tabindex="0"]')
+        ).filter(visible);
+        const scored = candidates
+          .map((el) => {
+            const label = lower(el.getAttribute && el.getAttribute('aria-label'));
+            const title = lower(el.getAttribute && el.getAttribute('title'));
+            const text = lower(el.textContent || '');
+            const cls = lower(el.className || '');
+            const tid = lower(el.getAttribute && el.getAttribute('data-testid'));
+            const matches =
+              label.includes('send') ||
+              title.includes('send') ||
+              tid.includes('send') ||
+              text === 'send' ||
+              text.includes('send message') ||
+              text.includes('send');
+            if (!matches || isNotSend(label, title, text)) return null;
+            try {
+              const r = el.getBoundingClientRect();
+              if (r.width < 16 || r.height < 16) return null;
+              const inBottomRight = r.bottom > window.innerHeight - 110 && r.right > window.innerWidth - 260;
+              if (!inBottomRight) return null;
+              return { el, score: (r.right + r.bottom) + (cls.includes('send') ? 10 : 0) };
+            } catch {
+              return null;
+            }
+          })
+          .filter(Boolean)
+          .sort((a, b) => b.score - a.score);
+        if (!scored.length) return null;
+        const target = scored[0].el;
+        try {
+          target.scrollIntoView({ block: 'center', inline: 'nearest' });
+        } catch {}
+        try {
+          target.click();
+          return true;
+        } catch {
+          return false;
+        }
+      })
+      .catch(() => false);
+    return !!clicked;
+  };
+
+  const submitTypedText = async () => {
+    await organicPause('compose');
+    await tinyHumanMouseMove(page);
+    if (preferSendIcon && (await clickInstagramTextSendIcon())) {
+      await organicPause('post_send');
+      return true;
+    }
+    if (Math.random() < 0.12) await delay(randomDelay(180, 480));
+    await page.keyboard.press('Enter');
+    await organicPause('post_send');
+    return true;
+  };
 
   const attemptVoiceSend = async () => {
     if (!shouldSendVoice) return;
@@ -2986,6 +3806,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       return;
     }
     try {
+      logger.log(
+        `Voice note flow: preparing mic UI for @${u}` +
+          (sendOpts.preferSendIcon ? ' (profile recovery / send-icon path)' : '')
+      );
       const prep = await prepareVoiceNoteUi(page, { logger });
       if (!prep.ok) {
         voiceFailure = prep.reason || 'voice_mic_not_found';
@@ -3011,13 +3835,17 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 
   if (composeFound) {
     const diag = await runComposeDiagnostic(page, u).catch(() => ({}));
-    logger.log('Compose diagnostic: ' + JSON.stringify(diag));
-    if (diag.paneScopedSnippet) {
-      logger.log('Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet);
+    if (wantsDmComposeVerboseDiagnostics()) {
+      logger.log('Compose diagnostic: ' + JSON.stringify(diag));
+      if (diag.paneScopedSnippet) {
+        logger.log('Compose pane snippet (thread column, same scope as display-name extraction): ' + diag.paneScopedSnippet);
+      }
     }
     noComposeReason = null;
 
-    const composeEl = await page.evaluateHandle(() => {
+    const composeEl = await page.evaluateHandle((preferProfileComposer) => {
+      const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+      const vh = window.innerHeight || document.documentElement.clientHeight || 0;
       const byPlaceholder = (el) => {
         const p = (el.getAttribute && el.getAttribute('placeholder')) || '';
         const a = (el.getAttribute && el.getAttribute('aria-label')) || '';
@@ -3025,32 +3853,63 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         return t.includes('message') || t.includes('add a message') || t.includes('write a message');
       };
       const all = document.querySelectorAll('textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]');
+      const visible = [];
       for (const el of all) {
         if (el.offsetParent === null) continue;
+        visible.push(el);
+      }
+      const scored = visible
+        .map((el) => {
+          let score = 0;
+          const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+          const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+          const role = (el.getAttribute('role') || '').toLowerCase();
+          const tag = (el.tagName || '').toLowerCase();
+          const text = (el.textContent || '').toLowerCase();
+          const rect = el.getBoundingClientRect();
+          if (byPlaceholder(el)) score += 100;
+          if (ph.includes('message') || aria.includes('message') || text.includes('message')) score += 40;
+          if (tag === 'textarea') score += 25;
+          if (tag === 'div' && el.isContentEditable) score += 18;
+          if (role === 'textbox') score += 12;
+          if (preferProfileComposer) {
+            if (vw > 0 && vh > 0) {
+              if (rect.left > vw * 0.45) score += 40;
+              if (rect.top > vh * 0.45) score += 40;
+              if (rect.right > vw * 0.55) score += 20;
+              if (rect.bottom > vh * 0.55) score += 20;
+            }
+          }
+          if (rect.width < 40 || rect.height < 16) score -= 50;
+          return { el, score };
+        })
+        .sort((a, b) => b.score - a.score);
+      if (scored.length && scored[0].score > 0) return scored[0].el;
+      for (const el of visible) {
         if (byPlaceholder(el)) return el;
       }
-      for (const el of all) {
-        if (el.offsetParent !== null) return el;
+      for (const el of visible) {
+        return el;
       }
       return null;
-    });
+    }, !!sendOpts.preferSendIcon);
     const compose = composeEl.asElement();
-  if (compose && shouldSendText) {
-    await delay(500);
-    await tinyHumanMouseMove(page);
-    await compose.click();
-    await saveComposeTypingDebugScreenshot(page, u);
-    await typeInstagramDmPlainTextInComposer(page, compose, msg, {
-      delay: 60 + Math.floor(Math.random() * 40),
-    });
-    await compose.dispose();
-    await composeEl.dispose();
-    await humanDelay();
-    await tinyHumanMouseMove(page);
-    await page.keyboard.press('Enter');
-    await delay(1500);
-    await saveComposePostSendDebugScreenshot(page, u);
-    textSent = true;
+    if (compose && shouldSendText) {
+      await organicPause('compose', 0.55);
+      await tinyHumanMouseMove(page);
+      await clickElementNaturally(page, compose, { totalDurationMs: randomDelay(240, 460) }).catch(() => {});
+      await saveComposeTypingDebugScreenshot(page, u);
+      await typeInstagramDmPlainTextInComposer(page, compose, msg, {
+        minKeyDelay: 50,
+        maxKeyDelay: 125,
+        correctionChance: 0.03,
+        pauseChance: 0.12,
+      });
+      await compose.dispose();
+      await composeEl.dispose();
+      await submitTypedText();
+      await saveComposePostSendDebugScreenshot(page, u);
+      textSent = true;
     } else if (compose) {
       await compose.dispose();
       await composeEl.dispose();
@@ -3082,13 +3941,15 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     return true;
   }, msg) : false;
   if (keyboardSent) {
-    await delay(300);
+    await organicPause('compose', 0.45);
     await saveComposeTypingDebugScreenshot(page, u);
-    await typeInstagramDmPlainTextWithKeyboard(page, msg, { delay: 60 + Math.floor(Math.random() * 40) });
-    await humanDelay();
-    await tinyHumanMouseMove(page);
-    await page.keyboard.press('Enter');
-    await delay(1500);
+    await typeInstagramDmPlainTextWithKeyboard(page, msg, {
+      minKeyDelay: 50,
+      maxKeyDelay: 125,
+      correctionChance: 0.03,
+      pauseChance: 0.12,
+    });
+    await submitTypedText();
     await saveComposePostSendDebugScreenshot(page, u);
     textSent = true;
     await attemptVoiceSend();
@@ -3467,10 +4328,48 @@ async function sendFollowUp(body) {
   if (!session) {
     return fail('Instagram session not found for this client', 404);
   }
+  if (session.scrape_cooldown_until) {
+    const scrapeCooldownUntilMs = new Date(session.scrape_cooldown_until).getTime();
+    if (Number.isFinite(scrapeCooldownUntilMs) && scrapeCooldownUntilMs > Date.now()) {
+      const waitMs = scrapeCooldownUntilMs - Date.now();
+      return fail(
+        `Scraping cooldown active for account safety. Try again in ${formatDurationShort(waitMs)}.`,
+        409
+      );
+    }
+  }
+
+  const sessionDailyCapApi = normalizeColdOutreachDailyLimit(session.account_daily_limit ?? session.daily_dm_limit ?? 100);
+  if (typeof sb.getInstagramSessionDailyUsage === 'function') {
+    const usageApi = await sb.getInstagramSessionDailyUsage(clientId, instagramSessionId).catch((e) => {
+      logger.warn(`[follow-up] usage probe failed: ${e?.message || e} — treating as over cap (fail-closed)`);
+      return { totalSent: Number.POSITIVE_INFINITY };
+    });
+    if (usageApi && usageApi.totalSent >= sessionDailyCapApi) {
+      const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
+      return fail(
+        `Instagram session daily DM limit reached (${usageApi.totalSent}/${sessionDailyCapApi}). Retry after ${preciseResume.resumeAtIso}.`,
+        429
+      );
+    }
+  }
+
   const cookies = session.session_data?.cookies;
   if (!cookies?.length) {
     return fail('Session has no cookies; reconnect Instagram', 400);
   }
+
+  const followUpLeaseWorkerId =
+    correlationId || `follow-up-${clientId}-${instagramSessionId}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const leaseOk = await sb
+    .claimInstagramSessionLease(session.id, followUpLeaseWorkerId, FOLLOW_UP_SESSION_LEASE_SECONDS)
+    .catch(() => false);
+  if (!leaseOk) {
+    return fail('Instagram session is busy; try again in a few minutes', 409);
+  }
+  logger.log(
+    `[follow-up] lease acquired clientId=${clientId} sessionId=${instagramSessionId} recipient=@${recipientUsername}${cLog}`
+  );
 
   const modeLabel = hasAudio ? (hasCaption ? 'voice+caption' : 'voice') : hasMessages ? `messages(${messageLines.length})` : 'text';
   logger.log(
@@ -3536,15 +4435,18 @@ async function sendFollowUp(body) {
 
     const u = normalizeUsername(recipientUsername);
     await tinyHumanMouseMove(page);
+    logger.log(`[follow-up] opening DM thread for @${u}${cLog}`);
     const nav = await navigateToDmThread(page, u);
     if (!nav.ok) {
       const errMsg = followUpReasonToError(nav.reason, nav.pageSnippet);
       return fail(errMsg, 400);
     }
+    logger.log(`[follow-up] DM thread ready for @${u}${cLog}`);
     if (hasAudio) await grantMicrophoneForInstagram(page, logger);
 
     if (textSingle) {
       await tinyHumanMouseMove(page);
+      logger.log(`[follow-up] sending text follow-up to @${u}${cLog}`);
       const sent = await sendPlainTextInThread(page, String(body.text).trim(), { idCapture });
       if (!sent.ok) {
         return fail(followUpReasonToError(sent.reason), 400);
@@ -3562,6 +4464,7 @@ async function sendFollowUp(body) {
       const collectedIds = [];
       for (const line of messageLines) {
         await tinyHumanMouseMove(page);
+        logger.log(`[follow-up] sending message chunk to @${u}${cLog}`);
         const sent = await sendPlainTextInThread(page, line, { idCapture });
         if (!sent.ok) {
           return fail(followUpReasonToError(sent.reason), 400);
@@ -3581,6 +4484,7 @@ async function sendFollowUp(body) {
       const captionIds = [];
       if (hasCaption) {
         await tinyHumanMouseMove(page);
+        logger.log(`[follow-up] sending voice caption to @${u}${cLog}`);
         const cap = await sendPlainTextInThread(page, captionRaw, { idCapture });
         if (!cap.ok) {
           return fail(followUpReasonToError(cap.reason), 400);
@@ -3589,6 +4493,7 @@ async function sendFollowUp(body) {
         await delay(1200);
       }
       await tinyHumanMouseMove(page);
+      logger.log(`[follow-up] sending voice note to @${u}${cLog}`);
       const prep = await prepareVoiceNoteUi(page, { logger });
       if (!prep.ok) {
         return fail(followUpReasonToError(prep.reason || 'voice_mic_not_found'), 400);
@@ -3630,6 +4535,7 @@ async function sendFollowUp(body) {
     logger.warn(`[follow-up] exception clientId=${clientId} recipient=@${recipientUsername} error=${e.message}${cLog}`);
     return { ok: false, error: e.message || 'Send failed', statusCode: 500 };
   } finally {
+    await sb.releaseInstagramSessionLease(session.id, followUpLeaseWorkerId).catch(() => {});
     if (idCapture && typeof idCapture.dispose === 'function') {
       try {
         idCapture.dispose();
@@ -3674,6 +4580,7 @@ async function sendDM(page, username, adapter, options = {}) {
   } = options;
   const sendWorkerId = options.sendWorkerId || null;
   const u = normalizeUsername(username);
+  const sendPresenceKey = getSendPresenceStateKey(options.instagramSessionId, options.clientId);
   const sent = await Promise.resolve(adapter.alreadySent(u));
   if (sent) {
     logger.warn(`Already sent to @${u}, skipping.`);
@@ -3685,8 +4592,12 @@ async function sendDM(page, username, adapter, options = {}) {
     campaignId && typeof sb.getCampaignLimitsById === 'function'
       ? await sb.getCampaignLimitsById(campaignId).catch(() => null)
       : null;
-  const effectiveDailyLimit = freshCampaignLimits ? freshCampaignLimits.daily_send_limit : dailySendLimit;
-  const effectiveHourlyLimit = freshCampaignLimits ? freshCampaignLimits.hourly_send_limit : hourlySendLimit;
+  const effectiveDailyLimit = normalizeColdOutreachDailyLimit(
+    freshCampaignLimits ? freshCampaignLimits.daily_send_limit : dailySendLimit
+  );
+  const effectiveHourlyLimit = normalizeColdOutreachHourlyLimit(
+    freshCampaignLimits ? freshCampaignLimits.hourly_send_limit : hourlySendLimit
+  );
   const stats = await Promise.resolve(adapter.getDailyStats(campaignId, effectiveDailyLimit));
   const hourlySent = await Promise.resolve(adapter.getHourlySent());
   const limitState = evaluateCampaignLimitState({
@@ -3705,8 +4616,17 @@ async function sendDM(page, username, adapter, options = {}) {
   const messageTemplate = messageOverride || adapter.getRandomMessage();
   const resolvedVoicePath = (options.voice_note_path || options.voiceNotePath || VOICE_NOTE_FILE || '').trim();
   const resolvedVoiceMode = (options.voice_note_mode || options.voiceNoteMode || VOICE_NOTE_MODE || 'after_text').trim().toLowerCase();
-  const logSent = (status, finalMsg, failureReason = null) =>
-    adapter.logSentMessage(u, finalMsg != null ? finalMsg : messageTemplate, status, campaignId, messageGroupId, messageGroupMessageId, failureReason);
+  const logSent = (status, finalMsg, failureReason = null, extraOpts = {}) =>
+    adapter.logSentMessage(
+      u,
+      finalMsg != null ? finalMsg : messageTemplate,
+      status,
+      campaignId,
+      messageGroupId,
+      messageGroupMessageId,
+      failureReason,
+      extraOpts
+    );
 
   let lastError;
   const nameFallback = {
@@ -3734,12 +4654,20 @@ async function sendDM(page, username, adapter, options = {}) {
     logger.warn(statusMessage);
     return { ok: false, reason: 'missing_delay_config', statusMessage };
   }
+  const { minDelaySec, maxDelaySec } = normalizeColdOutreachDelayWindow(
+    options.minDelaySec,
+    options.maxDelaySec
+  );
   const sendCooldownMs = randomDelay(
-    Math.max(0, Number(options.minDelaySec)) * 1000,
-    Math.max(0, Number(options.maxDelaySec)) * 1000
+    minDelaySec * 1000,
+    maxDelaySec * 1000
   );
   for (let attempt = 1; attempt <= MAX_SEND_RETRIES; attempt++) {
     try {
+      if (page && shouldBrowseBeforeBatch(sendPresenceKey)) {
+        await doLightInstagramBrowse(page, 'before_send');
+        markBrowsedBeforeBatch(sendPresenceKey);
+      }
       if (page && instagramSessionId) {
         try {
           const pu = page.url() || '';
@@ -3762,8 +4690,16 @@ async function sendDM(page, username, adapter, options = {}) {
         preferThreadName,
       });
       if (result.ok) {
+        const shouldBrowseAfterBatch = recordCompletedSendAndCheckPostBrowse(sendPresenceKey);
+        if (page && shouldBrowseAfterBatch) {
+          await doLightInstagramBrowse(page, 'after_send');
+        }
         const finalMessage = result.finalMessage != null ? result.finalMessage : (resolvedVoiceMode === 'voice_only' ? '' : messageTemplate);
-        await Promise.resolve(logSent('success', finalMessage));
+        await Promise.resolve(
+          logSent('success', finalMessage, null, {
+            instagramThreadId: result.instagramThreadId || undefined,
+          })
+        );
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'sent', null, sendWorkerId).catch(() => {});
         if (options.clientId && (result.display_name || result.first_name || result.last_name) && typeof sb.upsertLeadIdentity === 'function') {
           sb.upsertLeadIdentity(options.clientId, u, {
@@ -3814,6 +4750,7 @@ async function sendDM(page, username, adapter, options = {}) {
         'account_private',
         'rate_limited',
         'messages_restricted',
+        'instagram_technical_error',
         'voice_note_failed',
         'voice_mic_not_found',
         'voice_permission_denied',
@@ -3823,6 +4760,19 @@ async function sendDM(page, username, adapter, options = {}) {
         'ffmpeg_missing',
       ];
       if (terminalReasons.includes(result.reason)) {
+        if (result.reason === 'instagram_technical_error' && options.clientId && sb.pauseClientAndAlert) {
+          const statusMsg =
+            "Sending paused: Instagram DM thread shows \"Something isn't working\" (technical error). Support required to restore sending.";
+          await sb
+            .pauseClientAndAlert(options.clientId, statusMsg, 'cold_dm_instagram_technical_error', {
+              username: u,
+              campaignId: campaignId || null,
+              campaignLeadId: campaignLeadId || null,
+              instagramSessionId: instagramSessionId || null,
+              pageSnippet: result.pageSnippet || null,
+            })
+            .catch(() => {});
+        }
         await Promise.resolve(logSent('failed', result.finalMessage, result.reason));
         if (campaignLeadId) await sb.updateCampaignLeadStatus(campaignLeadId, 'failed', result.reason, sendWorkerId).catch(() => {});
         const detail = result.pageSnippet ? ` ${result.pageSnippet}` : '';
@@ -3871,18 +4821,20 @@ async function sendDM(page, username, adapter, options = {}) {
 }
 
 function evaluateCampaignLimitState({ sentToday, sentThisHour, dailySendLimit, hourlySendLimit }) {
-  if (dailySendLimit != null && sentToday >= dailySendLimit) {
+  const effectiveDailyLimit = normalizeColdOutreachDailyLimit(dailySendLimit);
+  const effectiveHourlyLimit = normalizeColdOutreachHourlyLimit(hourlySendLimit);
+  if (effectiveDailyLimit != null && sentToday >= effectiveDailyLimit) {
     return {
       blocked: true,
       reason: 'daily_limit',
-      statusMessage: `daily limit reached (campaign daily=${dailySendLimit}, sentToday=${sentToday}, counting=successful sends only)`,
+      statusMessage: `daily limit reached (effective daily=${effectiveDailyLimit}, sentToday=${sentToday}, counting=successful sends only)`,
     };
   }
-  if (hourlySendLimit != null && sentThisHour >= hourlySendLimit) {
+  if (effectiveHourlyLimit != null && sentThisHour >= effectiveHourlyLimit) {
     return {
       blocked: true,
       reason: 'hourly_limit',
-      statusMessage: `hourly limit reached (campaign hourly=${hourlySendLimit}, sentThisHour=${sentThisHour}, counting=successful sends only)`,
+      statusMessage: `hourly limit reached (effective hourly=${effectiveHourlyLimit}, sentThisHour=${sentThisHour}, counting=successful sends only)`,
     };
   }
   return { blocked: false, reason: null, statusMessage: null };
@@ -3913,11 +4865,11 @@ async function buildAdapterForClient(clientId) {
   const minDelayMs = (settings?.min_delay_minutes ?? 5) * 60 * 1000;
   const maxDelayMs = (settings?.max_delay_minutes ?? 30) * 60 * 1000;
   const adapter = {
-    dailyLimit: Math.min(settings?.daily_send_limit ?? 100, 200),
+    dailyLimit: normalizeColdOutreachDailyLimit(settings?.daily_send_limit ?? 100),
     maxPerHour: settings?.max_sends_per_hour ?? 20,
     alreadySent: (u) => sb.alreadySent(clientId, u),
-    logSentMessage: (u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason) =>
-      sb.logSentMessage(clientId, u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason),
+    logSentMessage: (u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason, extraOpts) =>
+      sb.logSentMessage(clientId, u, msg, status, campaignId, messageGroupId, messageGroupMessageId, failureReason, extraOpts || {}),
     getDailyStats: async (campaignId = null, campaignDailyLimit = null) => {
       if (campaignId && campaignDailyLimit != null && Number.isFinite(Number(campaignDailyLimit))) {
         const limits = await sb.getCampaignLimitsById(campaignId).catch(() => null);
@@ -3989,44 +4941,51 @@ async function runBotMultiTenant() {
   let leasedSessionIdForSignal = null;
   /** Campaign currently leased by this worker (one at a time). */
   let leasedCampaignIdForSignal = null;
+  /** Dashboard Stop / PM2 SIGINT: finish current send + follow-up delivery; skip long cosmetic sleeps, then exit between jobs. */
+  let sendWorkerGracefulShutdown = false;
+  /** Second signal: immediate exit (leases best-effort). */
+  let sendWorkerForceExit = false;
   /** Concurrency debug signal: only log claim when client changes. */
   let lastClaimedClientIdForDebug = null;
-  process.once('SIGTERM', () => {
-    void (async () => {
-      const sid = leasedSessionIdForSignal;
-      if (sid) {
-        logger.warn('[send-worker] SIGTERM: releasing Instagram session lease');
-        await sb.releaseInstagramSessionLease(sid, SEND_WORKER_ID).catch(() => {});
-        leasedSessionIdForSignal = null;
+
+  async function drainSleep(ms, label) {
+    if (!ms || ms < 1) return;
+    const chunk = 500;
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      if (sendWorkerForceExit) return;
+      if (sendWorkerGracefulShutdown) {
+        logger.log(
+          `[send-worker] drain: skipping "${label}" (${Math.max(0, Math.ceil((end - Date.now()) / 1000))}s left) — shutdown requested`
+        );
+        return;
       }
-      const campaignId = leasedCampaignIdForSignal;
-      if (campaignId) {
-        logger.warn('[send-worker] SIGTERM: releasing campaign send lease');
-        await sb.releaseCampaignSendLease(campaignId, SEND_WORKER_ID).catch(() => {});
-        leasedCampaignIdForSignal = null;
-      }
-      await sb.releaseAllCampaignSendLeases(SEND_WORKER_ID).catch(() => {});
-      process.exit(0);
-    })();
-  });
-  process.once('SIGINT', () => {
-    void (async () => {
-      const sid = leasedSessionIdForSignal;
-      if (sid) {
-        logger.warn('[send-worker] SIGINT: releasing Instagram session lease');
-        await sb.releaseInstagramSessionLease(sid, SEND_WORKER_ID).catch(() => {});
-        leasedSessionIdForSignal = null;
-      }
-      const campaignId = leasedCampaignIdForSignal;
-      if (campaignId) {
-        logger.warn('[send-worker] SIGINT: releasing campaign send lease');
-        await sb.releaseCampaignSendLease(campaignId, SEND_WORKER_ID).catch(() => {});
-        leasedCampaignIdForSignal = null;
-      }
-      await sb.releaseAllCampaignSendLeases(SEND_WORKER_ID).catch(() => {});
-      process.exit(0);
-    })();
-  });
+      await delay(Math.min(chunk, Math.max(1, end - Date.now())));
+    }
+  }
+
+  function onSendWorkerShutdownSignal(sig) {
+    if (sendWorkerForceExit) return;
+    if (sendWorkerGracefulShutdown) {
+      sendWorkerForceExit = true;
+      logger.warn(`[send-worker] ${sig} again — forcing exit`);
+      void (async () => {
+        await sb.releaseAllCampaignSendLeases(SEND_WORKER_ID).catch(() => {});
+        await sb.releaseAllInstagramSessionLeases().catch(() => {});
+        process.exit(sig === 'SIGINT' ? 130 : 0);
+      })();
+      return;
+    }
+    sendWorkerGracefulShutdown = true;
+    logger.warn(
+      `[send-worker] ${sig}: graceful drain — finishing in-flight cold send and any follow-up due within the short interleave window ` +
+        `(see COLD_DM_INTERLEAVE_FOLLOW_UP_MAX_WAIT_MS). Campaign cooldown sleeps are skipped. ` +
+        `Follow-ups scheduled later are delivered by Supabase cron → /api/follow-up/send, not by holding this process.`
+    );
+  }
+
+  process.on('SIGTERM', () => onSendWorkerShutdownSignal('SIGTERM'));
+  process.on('SIGINT', () => onSendWorkerShutdownSignal('SIGINT'));
 
   function proxyKeyForSession(session) {
     return session && session.proxy_url ? String(session.proxy_url).trim() : '';
@@ -4288,6 +5247,13 @@ async function runBotMultiTenant() {
   for (;;) {
     await sb.workerHeartbeat(SEND_WORKER_ID, 'send', { pid: process.pid }).catch(() => {});
 
+    if (sendWorkerGracefulShutdown && !sendWorkerForceExit) {
+      logger.log('[send-worker] graceful shutdown: leaving main loop (current job finished; leases released in finally)');
+      await invalidateSendWorkerBrowser('graceful shutdown');
+      await sb.releaseAllCampaignSendLeases(SEND_WORKER_ID).catch(() => {});
+      process.exit(0);
+    }
+
     let pinnedCampaignIdsForClaim = null;
     /** When true, pinning is on but we must not claim without p_campaign_ids (avoids duplicate workers on one campaign/session). */
     let pinForcedIdle = false;
@@ -4324,6 +5290,12 @@ async function runBotMultiTenant() {
     }
 
     if (pinForcedIdle) {
+      if (sendWorkerGracefulShutdown) {
+        logger.log('[send-worker] graceful shutdown: exiting during campaign-pin idle');
+        await invalidateSendWorkerBrowser('graceful shutdown');
+        await sb.releaseAllCampaignSendLeases(SEND_WORKER_ID).catch(() => {});
+        process.exit(0);
+      }
       throttlePinIdleLog(`[send-worker] ${pinForcedIdleDetail}`);
       await delay(randomDelay(20000, 40000));
       continue;
@@ -4590,8 +5562,12 @@ async function runBotMultiTenant() {
       work.campaignId && typeof sb.getCampaignLimitsById === 'function'
         ? await sb.getCampaignLimitsById(work.campaignId).catch(() => null)
         : null;
-    const effDailyEarly = campaignLimitsEarly?.daily_send_limit ?? work.dailySendLimit;
-    const effHourlyEarly = campaignLimitsEarly?.hourly_send_limit ?? work.hourlySendLimit;
+    const effDailyEarly = normalizeColdOutreachDailyLimit(
+      campaignLimitsEarly?.daily_send_limit ?? work.dailySendLimit
+    );
+    const effHourlyEarly = normalizeColdOutreachHourlyLimit(
+      campaignLimitsEarly?.hourly_send_limit ?? work.hourlySendLimit
+    );
     try {
       const statsEarly = await adapter.getDailyStats(work.campaignId, effDailyEarly);
       const hourlyEarly = await adapter.getHourlySent();
@@ -4604,10 +5580,10 @@ async function runBotMultiTenant() {
       if (limEarly.blocked) {
         const msg = limEarly.statusMessage || limEarly.reason;
         const isDaily = limEarly.reason === 'daily_limit';
-        const deferMs = isDaily
+        const fallbackDeferMs = isDaily
           ? SEND_DAILY_LIMIT_DEFER_MS
           : randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
-        const untilIso = new Date(Date.now() + deferMs).toISOString();
+        const { resumeAtIso: untilIso, delayMs: deferMs } = await getClientLimitResumeAt(clientId, fallbackDeferMs);
         throttleSendLimitLog(`early:${work.campaignId}:${limEarly.reason}`, () => {
           logger.warn(msg);
           logger.log(
@@ -4649,15 +5625,27 @@ async function runBotMultiTenant() {
       return null;
     });
     if (!session) {
-      logger.warn(`No Instagram session available for campaign ${work.campaignId}, waiting.`);
       const waitingReason =
         (await sb.getWaitingInstagramSessionReason(clientId, work.campaignId).catch(() => null)) ||
         'Waiting for an available Instagram session…';
+      const isDailyCapWait = /daily limit/i.test(waitingReason);
+      throttleSendLimitLog(
+        isDailyCapWait
+          ? `waiting_session:daily_cap:${work.campaignId}`
+          : `waiting_session:${work.campaignId}`,
+        () => {
+          if (isDailyCapWait) {
+            logger.log(`[send-worker] ${waitingReason}`);
+          } else {
+            logger.warn(`No Instagram session available for campaign ${work.campaignId}, waiting.`);
+          }
+        }
+      );
       await sb.setClientStatusMessage(clientId, waitingReason).catch(() => {});
       await sb.updateSendJob(claimedJob.id, {
         status: 'retry',
         available_at: new Date(Date.now() + randomDelay(15, 45) * 1000).toISOString(),
-        last_error_class: 'waiting_for_session',
+        last_error_class: isDailyCapWait ? 'account_daily_limit' : 'waiting_for_session',
         last_error_message: waitingReason,
       }, SEND_WORKER_ID).catch(() => {});
       await releaseClaimedCampaignLease(claimedJob.campaign_id);
@@ -4667,6 +5655,77 @@ async function runBotMultiTenant() {
     leasedSessionIdForSignal = session.id;
     leasedCampaignIdForSignal = work.campaignId;
     await sb.updateSendJob(claimedJob.id, { instagram_session_id: session.id }, SEND_WORKER_ID).catch(() => {});
+
+    if (session.scrape_cooldown_until) {
+      const scrapeCooldownUntilMs = new Date(session.scrape_cooldown_until).getTime();
+      if (Number.isFinite(scrapeCooldownUntilMs) && scrapeCooldownUntilMs > Date.now()) {
+        const waitMs = scrapeCooldownUntilMs - Date.now();
+        const statusMsg = `Scraping cooldown active for account safety. Sending resumes in ${formatDurationShort(waitMs)}.`;
+        await sb.setClientStatusMessage(clientId, statusMsg).catch(() => {});
+        await sb.updateSendJob(
+          claimedJob.id,
+          {
+            status: 'retry',
+            available_at: new Date(scrapeCooldownUntilMs).toISOString(),
+            last_error_class: 'scrape_cooldown',
+            last_error_message: statusMsg,
+          },
+          SEND_WORKER_ID
+        ).catch(() => {});
+        await releaseClaimedCampaignLease(claimedJob.campaign_id);
+        await sb.releaseInstagramSessionLease(session.id, SEND_WORKER_ID).catch(() => {});
+        leasedSessionIdForSignal = null;
+        leasedCampaignIdForSignal = null;
+        await delay(400);
+        continue;
+      }
+    }
+
+    const accountDailyLimit = normalizeColdOutreachDailyLimit(session.account_daily_limit ?? session.daily_dm_limit ?? 100);
+    // Fail-closed: if the usage probe throws we assume cap hit (so bugs never *over*-send).
+    const accountDailyUsage =
+      typeof sb.getInstagramSessionDailyUsage === 'function'
+        ? await sb.getInstagramSessionDailyUsage(clientId, session.id).catch((e) => {
+            logger.warn(
+              `[send-worker] account daily usage probe failed session=${session.id}: ${e?.message || e} — treating as over cap (fail-closed).`
+            );
+            return { totalSent: Number.POSITIVE_INFINITY };
+          })
+        : null;
+    if (accountDailyUsage) {
+      logger.log(
+        `[send-worker] account usage session=${session.id} limit=${accountDailyLimit} ` +
+          `total=${accountDailyUsage.totalSent} sentMessages=${accountDailyUsage.sentMessagesTotal ?? '?'} ` +
+          `jobsCompleted=${accountDailyUsage.jobsCompleted ?? accountDailyUsage.coldOutreachSent ?? '?'} ` +
+          `followUpsSent=${accountDailyUsage.followUpsSent ?? '?'}`
+      );
+    }
+    if (accountDailyUsage && accountDailyUsage.totalSent >= accountDailyLimit) {
+      const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
+      const msg = 'Account hit daily limit';
+      logger.log(
+        `[send-worker] ${msg.toLowerCase()} for session=${session.id} totalSent=${accountDailyUsage.totalSent}/${accountDailyLimit}; retrying after reset.`
+      );
+      await sb.setClientStatusMessage(clientId, msg).catch(() => {});
+      await sb.updateSendJob(
+        claimedJob.id,
+        {
+          status: 'retry',
+          available_at: preciseResume.resumeAtIso,
+          last_error_class: 'account_daily_limit',
+          last_error_message: msg,
+        },
+        SEND_WORKER_ID
+      ).catch(() => {});
+      await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, preciseResume.resumeAtIso).catch(() => {});
+      await releaseClaimedCampaignLease(claimedJob.campaign_id);
+      await sb.releaseInstagramSessionLease(session.id, SEND_WORKER_ID).catch(() => {});
+      leasedSessionIdForSignal = null;
+      leasedCampaignIdForSignal = null;
+      await delay(400);
+      continue;
+    }
+
     const leaseHeartbeatMs = Math.max(30000, Math.min(60000, Math.floor((SEND_LEASE_SECONDS * 1000) / 2)));
     let leaseHeartbeatTimer = null;
     let sendJobHeartbeatTimer = null;
@@ -4757,8 +5816,8 @@ async function runBotMultiTenant() {
         messageGroupMessageId: work.messageGroupMessageId,
         dailySendLimit: work.dailySendLimit,
         hourlySendLimit: work.hourlySendLimit,
-        minDelaySec: work.minDelaySec,
-        maxDelaySec: work.maxDelaySec,
+        minDelaySec: normalizeColdOutreachDelayWindow(work.minDelaySec, work.maxDelaySec).minDelaySec,
+        maxDelaySec: normalizeColdOutreachDelayWindow(work.minDelaySec, work.maxDelaySec).maxDelaySec,
         first_name: work.first_name,
         last_name: work.last_name,
         display_name: work.display_name,
@@ -4803,29 +5862,35 @@ async function runBotMultiTenant() {
       let delayMs;
       let sendJobStatus = 'completed';
       let sendJobUpdates = {};
+      let handledSendCooldownInline = false;
       if (!sendResult.ok && sendResult.reason === 'hourly_limit') {
-        delayMs = randomDelay(55 * 60 * 1000, 60 * 60 * 1000);
+        const preciseResume = await getClientLimitResumeAt(clientId, randomDelay(55 * 60 * 1000, 60 * 60 * 1000));
+        delayMs = preciseResume.delayMs;
         const msg = sendResult.statusMessage || 'hourly limit reached';
         throttleSendLimitLog(`postSend:hourly:${work.campaignId}`, () => {
-          logger.log(`${msg}. Sleeping ${Math.round(delayMs / 60000)} minutes until window resets.`);
+          logger.log(`${msg}. Sleeping ${Math.round(delayMs / 60000)} minutes until the hourly window resets.`);
         });
-        sb.setClientStatusMessage(clientId, `${msg}. Next send in ~60 min.`).catch(() => {});
+        sb.setClientStatusMessage(clientId, `${msg}. Next send when the hourly window resets.`).catch(() => {});
         sendJobStatus = 'retry';
         sendJobUpdates = {
-          available_at: new Date(Date.now() + delayMs).toISOString(),
+          available_at: preciseResume.resumeAtIso,
           last_error_class: 'hourly_limit',
           last_error_message: msg,
         };
       } else if (!sendResult.ok && sendResult.reason === 'daily_limit') {
-        delayMs = SEND_DAILY_LIMIT_DEFER_MS;
+        if (page) {
+          await doLightInstagramBrowse(page, 'after_send').catch(() => {});
+        }
+        const preciseResume = await getClientLimitResumeAt(clientId, SEND_DAILY_LIMIT_DEFER_MS);
+        delayMs = preciseResume.delayMs;
         const msg = sendResult.statusMessage || 'daily limit reached';
         throttleSendLimitLog(`postSend:daily:${work.campaignId}`, () => {
-          logger.log(`${msg}. Rechecking in ~${Math.round(delayMs / 60000)} minutes.`);
+          logger.log(`${msg}. Rechecking when the timezone day resets.`);
         });
         sb.setClientStatusMessage(clientId, msg).catch(() => {});
         sendJobStatus = 'retry';
         sendJobUpdates = {
-          available_at: new Date(Date.now() + delayMs).toISOString(),
+          available_at: preciseResume.resumeAtIso,
           last_error_class: 'daily_limit',
           last_error_message: msg,
         };
@@ -4883,21 +5948,90 @@ async function runBotMultiTenant() {
             'Instagram unreachable (proxy/VPN tunnel failed). Sending paused — fix connectivity and press Start.'
         ).catch(() => {});
       } else {
-        delayMs = sendResult.cooldownMs != null ? sendResult.cooldownMs : randomDelay(work.minDelaySec * 1000, work.maxDelaySec * 1000);
+        const normalizedDelayWindow = normalizeColdOutreachDelayWindow(work.minDelaySec, work.maxDelaySec);
+        delayMs =
+          sendResult.cooldownMs != null
+            ? sendResult.cooldownMs
+            : randomDelay(normalizedDelayWindow.minDelaySec * 1000, normalizedDelayWindow.maxDelaySec * 1000);
         const delaySec = Math.max(1, Math.ceil(delayMs / 1000));
-        const minSec = Math.max(0, Number(work.minDelaySec) || 0);
-        const maxSec = Math.max(0, Number(work.maxDelaySec) || 0);
-        logger.log(`Campaign cooldown from settings ${minSec}-${maxSec}s. Next send in ${delaySec} sec.`);
-        const cooldownStatus = sendResult.ok
-          ? `Campaign cooldown: last DM sent. Next send in ~${delaySec}s (random delay between ${minSec}s and ${maxSec}s from campaign settings).`
-          : `Campaign cooldown: spacing sends ~${delaySec}s (${minSec}s–${maxSec}s from campaign settings) before retry.`;
-        sb.setClientStatusMessage(clientId, cooldownStatus).catch(() => {});
+        const minSec = normalizedDelayWindow.minDelaySec;
+        const maxSec = normalizedDelayWindow.maxDelaySec;
+        let activeCampaignsLeft = 1;
+        if (sendResult.ok) {
+          activeCampaignsLeft = await sb.countActiveCampaignsForClient(clientId).catch(() => 1);
+        }
+        if (sendResult.ok && activeCampaignsLeft === 0) {
+          logger.log(
+            `Campaign cooldown ${delaySec}s applied to send jobs only (no active campaigns; dashboard status set to Completed.)`
+          );
+          sb.setClientStatusMessage(clientId, 'Completed.').catch(() => {});
+        } else {
+          logger.log(`Campaign cooldown from settings ${minSec}-${maxSec}s. Next send in ${delaySec} sec.`);
+          const cooldownStatus = sendResult.ok
+            ? `Campaign cooldown: last DM sent. Next send in ~${delaySec}s (random delay between ${minSec}s and ${maxSec}s from campaign settings).`
+            : `Campaign cooldown: spacing sends ~${delaySec}s (${minSec}s-${maxSec}s from campaign settings) before retry.`;
+          sb.setClientStatusMessage(clientId, cooldownStatus).catch(() => {});
+        }
         if (!sendResult.ok) {
           sendJobStatus = 'failed';
           sendJobUpdates = {
             last_error_class: sendResult.reason || 'send_failed',
             last_error_message: sendResult.reason || 'send_failed',
           };
+        }
+
+        if (sendResult.ok && delayMs > 1000 && page && session) {
+          handledSendCooldownInline = true;
+          const cooldownWindowStart = Date.now();
+          logger.log(
+            `[follow-up-interleave] cold send ok — checking follow-up queue first (then remaining campaign cooldown to ${delaySec}s total)`
+          );
+
+          const interleaved = await maybeRunQueuedColdFollowUpForSession(page, session, {
+            clientId,
+            lookAheadMs: 0,
+            pendingColdCompleting: 1,
+            forceExit: () => sendWorkerForceExit,
+          }).catch((e) => {
+            logger.warn(`[follow-up-interleave] check failed: ${e?.message || e}`);
+            return { processed: false, error: e?.message || String(e) };
+          });
+
+          if (interleaved?.processed) {
+            const afterFollowUpDelayMs = randomDelay(
+              normalizedDelayWindow.minDelaySec * 1000,
+              normalizedDelayWindow.maxDelaySec * 1000
+            );
+            logger.log(
+              `[follow-up-interleave] sent queued follow-up for @${interleaved.username || 'unknown'}; inter-send spacing ${Math.max(
+                1,
+                Math.ceil(afterFollowUpDelayMs / 1000)
+              )}s`
+            );
+            sb
+              .setClientStatusMessage(
+                clientId,
+                `Queued follow-up sent. Waiting ${Math.max(
+                  1,
+                  Math.ceil(afterFollowUpDelayMs / 1000)
+                )} sec before the next cold outreach send.`
+              )
+              .catch(() => {});
+            await drainSleep(afterFollowUpDelayMs, 'inter-send spacing after follow-up');
+          }
+
+          const elapsedMs = Date.now() - cooldownWindowStart;
+          const remainderMs = Math.max(0, delayMs - elapsedMs);
+          if (remainderMs > 500) {
+            logger.log(
+              `[follow-up-interleave] campaign cooldown remainder ${Math.ceil(remainderMs / 1000)}s (${Math.ceil(
+                elapsedMs / 1000
+              )}s already used in ${delaySec}s window)`
+            );
+            await drainSleep(remainderMs, 'campaign cooldown remainder');
+          }
+
+          delayMs = 0;
         }
       }
       await sb.updateSendJob(claimedJob.id, { status: sendJobStatus, ...sendJobUpdates }, SEND_WORKER_ID).catch(() => {});
@@ -4916,12 +6050,12 @@ async function runBotMultiTenant() {
         await delay(500);
       } else {
         const isSendCooldown = sendJobStatus === 'completed' || sendJobStatus === 'failed';
-        if (isSendCooldown && delayMs > 1000 && work && work.campaignId) {
+        if (!handledSendCooldownInline && isSendCooldown && delayMs > 1000 && work && work.campaignId) {
           const cooldownUntilIso = new Date(Date.now() + delayMs).toISOString();
           await sb.deferCampaignPendingJobs(work.campaignId, claimedJob.id, cooldownUntilIso).catch(() => {});
           await delay(500);
         } else {
-          await delay(Math.min(delayMs, 1500));
+          await drainSleep(Math.min(delayMs, 1500), 'send job tail delay');
         }
       }
     } catch (e) {

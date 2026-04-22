@@ -1,13 +1,8 @@
 /**
  * Instagram scraper module – legacy Puppeteer implementation.
  *
- * NOTE: The preferred path for high-volume, stable scraping is now the Python
- * instagrapi worker (spawned from /api/scraper/start). This file remains as
- * an optional fallback and for platform scraper login.
- *
- * If you re-enable JS scraping, avoid UI scrolling and use the GraphQL/private
- * APIs below. ALWAYS verify the latest query_hash/doc_id values via DevTools:
- *   // CHECK NETWORK TAB FOR LATEST DOC_ID / query_hash
+ * This is the browser-based follower/following scraper used for the per-client
+ * flow. Keep it conservative and keep the session/proxy tied to the client row.
  */
 require('dotenv').config();
 const puppeteer = require('puppeteer-extra');
@@ -15,8 +10,6 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const path = require('path');
 const fs = require('fs');
 const {
-  saveScraperSession,
-  createScrapeJob,
   updateScrapeJob,
   retryScrapeJob,
   getScrapeJob,
@@ -25,12 +18,10 @@ const {
   getConversationParticipantUsernames,
   getSentUsernames,
   getScrapeBlocklistUsernames,
-  getPlatformScraperSessionById,
-  reservePlatformScraperSessionForWorker,
-  describePlatformScraperPoolForLogs,
-  normalizePlatformSessionRowForPuppeteer,
+  getMostRecentInstagramSessionForClient,
+  normalizeSessionDataForPuppeteer,
   recordScraperActions,
-  markPlatformScraperWebNeedsRefresh,
+  markInstagramSessionWebNeedsRefresh,
 } = require('./database/supabase');
 const logger = require('./utils/logger');
 const { applyInstagramWebStorageFromSessionData } = require('./utils/instagram-web-storage');
@@ -43,10 +34,19 @@ const {
 } = require('./utils/puppeteer-chrome-launch');
 const {
   dismissInstagramPopups,
-  ensurePoolScraperInstagramWebSession,
   detectInstagramPasswordReauthScreen,
-  instagramPoolOneTapLoginChooserVisible,
 } = require('./utils/instagram-modals');
+const {
+  clickElementNaturally,
+  chance,
+  idleMouseDrift,
+  maybeLightStoryInteraction,
+  moveMouseToElement,
+  naturalScrollPage,
+  organicPause,
+  randomMouseDrift,
+  viewStoriesNaturally,
+} = require('./utils/human-interaction');
 
 /** Log + persist failure (early returns used to only update the DB, so PM2 showed nothing after "claimed job"). */
 async function failScrapeJob(jobId, errorMessage) {
@@ -54,25 +54,24 @@ async function failScrapeJob(jobId, errorMessage) {
   await updateScrapeJob(jobId, { status: 'failed', error_message: errorMessage });
 }
 
-async function poolScraperPageLooksLoggedOut(page) {
+async function scraperPageLooksLoggedOut(page) {
   if (!page) return false;
   const u = page.url() || '';
   if (u.includes('/accounts/login')) return true;
   return detectInstagramPasswordReauthScreen(page);
 }
 
-/** Clear pinned pool session so the next claim can use another scraper; flag row for admin toast. */
-async function requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, logPrefix) {
-  const msg =
-    'Pool scraper Instagram web session logged out. Job re-queued for another scraper — reconnect this account in Platform scrapers.';
+/** Mark the per-client Instagram session as needing refresh and requeue the scrape job. */
+async function requeueScrapeJobForLoggedOutInstagramSession(jobId, instagramSessionId, logPrefix) {
+  const msg = 'Instagram web session logged out. Reconnect the sender session and retry scraping.';
   logger.warn(`[Scraper] ${logPrefix} ${msg}`);
-  if (platformSessionId) await markPlatformScraperWebNeedsRefresh(platformSessionId).catch(() => {});
+  if (instagramSessionId) await markInstagramSessionWebNeedsRefresh(instagramSessionId).catch(() => {});
   await updateScrapeJob(jobId, {
     status: 'retry',
     available_at: new Date().toISOString(),
     error_message: msg,
     last_error_class: 'session_logged_out',
-    platform_scraper_session_id: null,
+    instagram_session_id: null,
   });
 }
 
@@ -100,57 +99,39 @@ async function finalizeScrapeJobNormalExit(jobId, scrapedCount) {
 }
 
 /**
- * Scrapes use only the shared platform pool (cold_dm_platform_scraper_sessions), not per-client cold_dm_scraper_sessions.
- * Optionally re-reserves from the pool when the job points at a row with no Puppeteer cookies.
+ * Use the client's current Instagram session row. This is the same session the sender uses.
  */
-async function resolvePuppeteerSessionForScrapeJob(jobId, leaseOptions) {
+async function resolvePuppeteerSessionForScrapeJob(clientId, jobId) {
   const job = await getScrapeJob(jobId);
+  const igSession = await getMostRecentInstagramSessionForClient(clientId).catch(() => null);
+  const normalized = normalizeSessionDataForPuppeteer(igSession?.session_data);
   let session = null;
-  let platformSessionId = null;
-
-  if (job?.platform_scraper_session_id) {
-    const platformSession = await getPlatformScraperSessionById(job.platform_scraper_session_id);
-    const normalized = normalizePlatformSessionRowForPuppeteer(platformSession);
-    if (normalized) {
-      session = normalized;
-      platformSessionId = job.platform_scraper_session_id;
-    }
+  if (igSession && normalized) {
+    session = {
+      id: igSession.id,
+      client_id: igSession.client_id,
+      instagram_username: igSession.instagram_username,
+      proxy_url: igSession.proxy_url || null,
+      proxy_assignment_id: igSession.proxy_assignment_id || null,
+      web_session_needs_refresh: igSession.web_session_needs_refresh ?? null,
+      session_data: normalized,
+    };
   }
 
-  if (!session && leaseOptions?.workerId) {
-    const sec = Math.max(60, parseInt(leaseOptions.leaseSec || process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
-    const reserved = await reservePlatformScraperSessionForWorker(leaseOptions.workerId, sec);
-    const normalizedReserved = normalizePlatformSessionRowForPuppeteer({
-      session_data: reserved?.session_data,
-      instagram_username: reserved?.instagram_username,
-    });
-    if (reserved && normalizedReserved) {
-      session = {
-        session_data: normalizedReserved.session_data,
-        instagram_username: normalizedReserved.instagram_username,
-      };
-      platformSessionId = reserved.id;
-      await updateScrapeJob(jobId, { platform_scraper_session_id: reserved.id });
-    }
-  }
-
-  if (leaseOptions && platformSessionId) {
-    leaseOptions.platformSessionId = platformSessionId;
-  }
-
-  return { job, session, platformSessionId };
+  return { job, session, instagramSessionId: session?.id || null };
 }
 
 puppeteer.use(StealthPlugin());
 
-const SCRAPE_DELAY_MIN_MS = 2000;
-const SCRAPE_DELAY_MAX_MS = 5000;
-const SCROLL_PAUSE_MS = 1500;
-const LOAD_WAIT_MS = 4000;
+const SCRAPE_DELAY_MIN_MS = 900;
+const SCRAPE_DELAY_MAX_MS = 2200;
+const LOAD_WAIT_MS = 1800;
 const LOAD_WAIT_RETRIES = 3;
-const SCROLL_CHUNK_PX = 300;
 const SCROLL_CHUNKS_PER_ITER = 8;
-const SCROLL_CHUNK_DELAY_MS = 600;
+const SCRAPE_SESSION_COOLDOWN_MS = Math.max(
+  60 * 1000,
+  parseInt(process.env.SCRAPE_SESSION_COOLDOWN_MS || String(5 * 60 * 1000), 10) || 5 * 60 * 1000
+);
 /** false | true | 'new' — set SCRAPER_HEADLESS=new for Chromium new headless. */
 const HEADLESS = resolveHeadlessMode(process.env.SCRAPER_HEADLESS, true);
 const SCRAPER_PERSIST_PROFILES =
@@ -159,14 +140,14 @@ const SCRAPER_PERSIST_PROFILES =
   (String(process.env.PUPPETEER_PERSIST_SCRAPER_PROFILES).toLowerCase() !== '0' &&
     String(process.env.PUPPETEER_PERSIST_SCRAPER_PROFILES).toLowerCase() !== 'false');
 
-function buildScraperBrowserLaunchOptions(platformSessionId, proxyUrl) {
+function buildScraperBrowserLaunchOptions(instagramSessionId, proxyUrl) {
   const launchOpts = {
     headless: HEADLESS,
     args: [...baseChromeArgs()],
   };
-  if (SCRAPER_PERSIST_PROFILES && platformSessionId) {
-    assignPersistentUserDataDir(launchOpts, `scrape-pool-${platformSessionId}`);
-    logger.log(`[Scraper] Persistent Chrome profile: scrape-pool-${platformSessionId}`);
+  if (SCRAPER_PERSIST_PROFILES && instagramSessionId) {
+    assignPersistentUserDataDir(launchOpts, `scrape-client-${instagramSessionId}`);
+    logger.log(`[Scraper] Persistent Chrome profile: scrape-client-${instagramSessionId}`);
   }
   applyProxyToLaunchOptions(launchOpts, proxyUrl || null);
   return launchOpts;
@@ -253,6 +234,556 @@ async function connectScraper(instagramUsername, instagramPassword) {
   }
 }
 
+async function getInstagramListScrollTargetHandle(page) {
+  return page.evaluateHandle(() => {
+    function countProfileLinks(el) {
+      let c = 0;
+      for (const a of el.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]')) {
+        const href = (a.getAttribute('href') || '').trim();
+        const m = href.match(/^\/([^/?#]+)(?:\/|\?|#|$)/) || href.match(/instagram\.com\/([A-Za-z0-9._]{2,30})(?:\/|\?|#|$)/i);
+        if (m && /^[a-z0-9._]{2,30}$/i.test(m[1])) c++;
+      }
+      return c;
+    }
+
+    let dialog = null;
+    let bestCount = 0;
+    for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+      const count = countProfileLinks(d);
+      if (count > bestCount && count >= 5) {
+        bestCount = count;
+        dialog = d;
+      }
+    }
+    if (bestCount < 5) {
+      for (const d of document.querySelectorAll('div')) {
+        if (d.clientHeight < 80) continue;
+        const count = countProfileLinks(d);
+        if (count > bestCount && count >= 10) {
+          bestCount = count;
+          dialog = d;
+        }
+      }
+    }
+    if (!dialog) return null;
+
+    let scrollTarget = null;
+    let bestScore = -1;
+    for (const el of [dialog, ...dialog.querySelectorAll('div')]) {
+      const hasOverflow = el.scrollHeight > el.clientHeight + 16;
+      if (!hasOverflow || el.clientHeight <= 80) continue;
+      const score = countProfileLinks(el) * 1000 + (el.scrollHeight - el.clientHeight);
+      if (score > bestScore) {
+        bestScore = score;
+        scrollTarget = el;
+      }
+    }
+    return scrollTarget || dialog;
+  });
+}
+
+async function tryOpenProfileList(page, target, kind) {
+  return page.evaluate((targetUsername, listKind) => {
+    const lower = (s) => (s || '').toLowerCase();
+    const wantFollowing = listKind === 'following';
+
+    const links = Array.from(document.querySelectorAll('a[href*="/followers"], a[href*="/following"]'));
+    const picked = links.find((a) => {
+      const href = lower(a.getAttribute('href') || '');
+      if (wantFollowing) {
+        return href.includes(`/${targetUsername}/following`) || (href.includes('/following') && !href.includes('/followers'));
+      }
+      return href.includes(`/${targetUsername}/followers`) || (href.includes('/followers') && !href.includes('/following'));
+    });
+    if (picked) {
+      picked.click();
+      return true;
+    }
+
+    const candidates = Array.from(document.querySelectorAll('a, span, div, button, [role="button"]'));
+    const needle = wantFollowing ? 'following' : 'followers';
+    const statsLike = candidates.find((el) => {
+      const text = (el.textContent || '').trim();
+      const l = lower(text);
+      return l.includes(needle) && /\d/.test(text);
+    });
+    if (statsLike) {
+      const clickable = statsLike.closest('a, button, [role="button"]') || statsLike;
+      if (clickable && clickable instanceof HTMLElement) {
+        clickable.click();
+        return true;
+      }
+    }
+
+    const roleButtons = Array.from(document.querySelectorAll('[role="button"], button, a'));
+    for (const btn of roleButtons) {
+      const t = lower(btn.textContent || '');
+      if (wantFollowing) {
+        if (t.includes('following') || /\d+\s*following/.test(t)) {
+          btn.click();
+          return true;
+        }
+      } else if (t.includes('followers') || /\d+\s*followers/.test(t)) {
+        btn.click();
+        return true;
+      }
+    }
+
+    return false;
+  }, target, kind);
+}
+
+async function getInstagramListModalSnapshot(page) {
+  return page.evaluate(() => {
+    function countProfileLinks(el) {
+      let c = 0;
+      for (const a of el.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]')) {
+        const href = (a.getAttribute('href') || '').trim();
+        const m = href.match(/^\/([^/?#]+)(?:\/|\?|#|$)/) || href.match(/instagram\.com\/([A-Za-z0-9._]{2,30})(?:\/|\?|#|$)/i);
+        if (m && /^[a-z0-9._]{2,30}$/i.test(m[1])) c++;
+      }
+      return c;
+    }
+
+    let dialog = null;
+    let bestCount = 0;
+    for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+      const count = countProfileLinks(d);
+      if (count > bestCount && count >= 5) {
+        bestCount = count;
+        dialog = d;
+      }
+    }
+    if (bestCount < 5) {
+      for (const d of document.querySelectorAll('div')) {
+        if (d.clientHeight < 80) continue;
+        const count = countProfileLinks(d);
+        if (count > bestCount && count >= 10) {
+          bestCount = count;
+          dialog = d;
+        }
+      }
+    }
+    if (!dialog) return null;
+
+    let scrollTarget = null;
+    let bestScore = -1;
+    for (const el of [dialog, ...dialog.querySelectorAll('div')]) {
+      const hasOverflow = el.scrollHeight > el.clientHeight + 16;
+      if (!hasOverflow || el.clientHeight <= 80) continue;
+      const score = countProfileLinks(el) * 1000 + (el.scrollHeight - el.clientHeight);
+      if (score > bestScore) {
+        bestScore = score;
+        scrollTarget = el;
+      }
+    }
+
+    const target = scrollTarget || dialog;
+    return {
+      scrollTop: Math.round(target.scrollTop || 0),
+      remaining: Math.max(0, Math.round((target.scrollHeight || 0) - (target.clientHeight || 0) - (target.scrollTop || 0))),
+      linkCount: countProfileLinks(target),
+    };
+  }).catch(() => null);
+}
+
+async function getVisibleInstagramListUsernameHandles(page, scrollTargetHandle, limit = 4) {
+  if (!scrollTargetHandle) return [];
+  const anchors = await scrollTargetHandle.$$('a[href^="/"], a[href*="instagram.com/"]').catch(() => []);
+  const picked = [];
+  const seen = new Set();
+  try {
+    for (const anchor of anchors) {
+      const href = await anchor.evaluate((el) => el.getAttribute('href') || '').catch(() => '');
+      const match =
+        href.match(/^\/([^/?#]+)(?:\/|\?|#|$)/) ||
+        href.match(/instagram\.com\/([A-Za-z0-9._]{2,30})(?:\/|\?|#|$)/i);
+      const username = (match && match[1] ? match[1] : '').toLowerCase();
+      if (!username || seen.has(username)) {
+        await anchor.dispose().catch(() => {});
+        continue;
+      }
+      const box = await anchor.boundingBox().catch(() => null);
+      if (!box || box.width < 8 || box.height < 8 || box.y < 0 || box.y > 760) {
+        await anchor.dispose().catch(() => {});
+        continue;
+      }
+      seen.add(username);
+      picked.push(anchor);
+      if (picked.length >= limit) break;
+    }
+  } finally {
+    for (const anchor of anchors) {
+      if (!picked.includes(anchor)) await anchor.dispose().catch(() => {});
+    }
+  }
+  return picked;
+}
+
+async function maybeHoverVisibleInstagramUsernames(page, scrollTargetHandle, opts = {}) {
+  if (!scrollTargetHandle || Math.random() >= (opts.probability ?? 0.35)) return false;
+  const handles = await getVisibleInstagramListUsernameHandles(page, scrollTargetHandle, randomDelay(2, 4));
+  if (!handles.length) return false;
+  try {
+    for (const handle of handles) {
+      await moveMouseToElement(page, handle, { totalDurationMs: randomDelay(320, 900) }).catch(() => {});
+      await delay(randomDelay(1200, 3600));
+    }
+    return true;
+  } finally {
+    for (const handle of handles) await handle.dispose().catch(() => {});
+  }
+}
+
+async function humanScrollInstagramListModal(page, opts = {}) {
+  if (!page) return false;
+  const targetHandleRef = await getInstagramListScrollTargetHandle(page).catch(() => null);
+  const targetHandle = targetHandleRef?.asElement ? targetHandleRef.asElement() : null;
+  if (!targetHandle) {
+    await targetHandleRef?.dispose?.().catch(() => {});
+    return false;
+  }
+  try {
+    const beforeTop = await targetHandle.evaluate((el) => el.scrollTop).catch(() => 0);
+    await moveMouseToElement(page, targetHandle, { totalDurationMs: randomDelay(220, 560) }).catch(() => {});
+    if (Math.random() < 0.3) {
+      await clickElementNaturally(page, targetHandle, { totalDurationMs: randomDelay(180, 360) }).catch(() => {});
+    }
+    if (Math.random() < 0.45) {
+      await randomMouseDrift(page, { totalDurationMs: randomDelay(320, 880) }).catch(() => {});
+    }
+    await maybeHoverVisibleInstagramUsernames(page, targetHandle, { probability: 0.42 }).catch(() => {});
+    const rounds = Math.max(1, opts.rounds || randomDelay(2, 4));
+    let moved = false;
+    for (let i = 0; i < rounds; i++) {
+      const stepResult = await targetHandle.evaluate(
+        async (el, config) => {
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+          let didMove = false;
+          for (let step = 0; step < config.steps; step++) {
+            const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+            if (maxScroll <= 0) break;
+            const remaining = Math.max(0, maxScroll - el.scrollTop);
+            if (remaining <= 3) break;
+            const prev = el.scrollTop;
+            const delta = Math.min(remaining, config.baseStep + Math.round(Math.random() * config.stepVariance));
+            el.scrollTop = Math.min(maxScroll, prev + delta);
+            if (Math.abs(el.scrollTop - prev) > 1) didMove = true;
+            await sleep(config.stepPauseMin + Math.round(Math.random() * (config.stepPauseMax - config.stepPauseMin)));
+          }
+          return { didMove, top: Math.round(el.scrollTop || 0) };
+        },
+        {
+          steps: randomDelay(5, 10),
+          baseStep: randomDelay(90, 180),
+          stepVariance: randomDelay(30, 110),
+          stepPauseMin: 140,
+          stepPauseMax: 360,
+        }
+      ).catch(() => ({ didMove: false, top: beforeTop }));
+      if (stepResult.didMove) moved = true;
+      if (Math.random() < 0.25) {
+        await randomMouseDrift(page, { totalDurationMs: randomDelay(260, 720) }).catch(() => {});
+      }
+      await maybeHoverVisibleInstagramUsernames(page, targetHandle, { probability: 0.25 }).catch(() => {});
+      await organicPause('scroll', 0.8);
+    }
+    const afterTop = await targetHandle.evaluate((el) => el.scrollTop).catch(() => beforeTop);
+    return moved || Math.abs(afterTop - beforeTop) > 2;
+  } finally {
+    await targetHandle.dispose().catch(() => {});
+    await targetHandleRef.dispose().catch(() => {});
+  }
+}
+
+async function pushInstagramListModalAndWaitForLoad(page, opts = {}) {
+  if (!page) return { moved: false, loadedMore: false, exhausted: false };
+
+  const maxWaitMs = opts.maxWaitMs ?? randomDelay(2500, 5000);
+  const bottomOffsetPx = opts.bottomOffsetPx ?? randomDelay(120, 260);
+
+  const before = await page.evaluate(() => {
+    function countProfileLinks(el) {
+      let c = 0;
+      for (const a of el.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]')) {
+        const href = (a.getAttribute('href') || '').trim();
+        const m =
+          href.match(/^\/([^/?#]+)(?:\/|\?|#|$)/) ||
+          href.match(/instagram\.com\/([A-Za-z0-9._]{2,30})(?:\/|\?|#|$)/i);
+        if (m && /^[a-z0-9._]{2,30}$/i.test(m[1])) c++;
+      }
+      return c;
+    }
+
+    function rootHasSpinner(root) {
+      return !!root.querySelector('svg[aria-label*="Loading" i], [role="progressbar"]');
+    }
+
+    let dialog = null;
+    let bestCount = 0;
+    for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
+      const count = countProfileLinks(d);
+      if (count > bestCount && count >= 5) {
+        bestCount = count;
+        dialog = d;
+      }
+    }
+    if (!dialog) return null;
+
+    let target = null;
+    let bestScore = -1;
+    for (const el of [dialog, ...dialog.querySelectorAll('div')]) {
+      const hasOverflow = el.scrollHeight > el.clientHeight + 16;
+      if (!hasOverflow || el.clientHeight <= 80) continue;
+      const score = countProfileLinks(el) * 1000 + (el.scrollHeight - el.clientHeight);
+      if (score > bestScore) {
+        bestScore = score;
+        target = el;
+      }
+    }
+    target = target || dialog;
+
+    return {
+      scrollTop: target.scrollTop || 0,
+      scrollHeight: target.scrollHeight || 0,
+      clientHeight: target.clientHeight || 0,
+      linkCount: countProfileLinks(target),
+      spinner: rootHasSpinner(target),
+    };
+  }).catch(() => null);
+
+  if (!before) return { moved: false, loadedMore: false, exhausted: true };
+
+  const targetHandleRef = await getInstagramListScrollTargetHandle(page).catch(() => null);
+  const targetHandle = targetHandleRef?.asElement ? targetHandleRef.asElement() : null;
+  if (!targetHandle) {
+    await targetHandleRef?.dispose?.().catch(() => {});
+    return { moved: false, loadedMore: false, exhausted: true };
+  }
+
+  try {
+    await moveMouseToElement(page, targetHandle, { totalDurationMs: randomDelay(180, 420) }).catch(() => {});
+
+    const pushResult = await targetHandle.evaluate((el, offsetPx) => {
+      const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+      const prev = el.scrollTop || 0;
+      const target = Math.max(0, maxScroll - offsetPx);
+      el.scrollTop = target;
+      return {
+        prev,
+        now: el.scrollTop || 0,
+        maxScroll,
+      };
+    }, bottomOffsetPx).catch(() => null);
+
+    const moved = !!pushResult && Math.abs((pushResult.now || 0) - (pushResult.prev || 0)) > 2;
+
+    const start = Date.now();
+    let loadedMore = false;
+    let exhausted = false;
+
+    while (Date.now() - start < maxWaitMs) {
+      await delay(randomDelay(400, 850));
+
+      const after = await targetHandle.evaluate((el) => {
+        function countProfileLinks(root) {
+          let c = 0;
+          for (const a of root.querySelectorAll('a[href^="/"], a[href*="instagram.com/"]')) {
+            const href = (a.getAttribute('href') || '').trim();
+            const m =
+              href.match(/^\/([^/?#]+)(?:\/|\?|#|$)/) ||
+              href.match(/instagram\.com\/([A-Za-z0-9._]{2,30})(?:\/|\?|#|$)/i);
+            if (m && /^[a-z0-9._]{2,30}$/i.test(m[1])) c++;
+          }
+          return c;
+        }
+
+        function rootHasSpinner(root) {
+          return !!root.querySelector('svg[aria-label*="Loading" i], [role="progressbar"]');
+        }
+
+        return {
+          scrollTop: el.scrollTop || 0,
+          scrollHeight: el.scrollHeight || 0,
+          clientHeight: el.clientHeight || 0,
+          linkCount: countProfileLinks(el),
+          spinner: rootHasSpinner(el),
+        };
+      }).catch(() => null);
+
+      if (!after) break;
+
+      if (after.scrollHeight > before.scrollHeight + 20 || after.linkCount > before.linkCount) {
+        loadedMore = true;
+        break;
+      }
+
+      const remaining = Math.max(0, after.scrollHeight - after.clientHeight - after.scrollTop);
+      if (remaining <= 5 && !after.spinner) {
+        exhausted = true;
+      }
+    }
+
+    return { moved, loadedMore, exhausted };
+  } finally {
+    await targetHandle.dispose().catch(() => {});
+    await targetHandleRef.dispose().catch(() => {});
+  }
+}
+
+async function closeInstagramListModal(page) {
+  const closeHandle = await page
+    .$([
+      '[role="dialog"] button[aria-label="Close"]',
+      '[role="dialog"] svg[aria-label="Close"]',
+      '[role="dialog"] [role="button"][aria-label*="close" i]',
+    ].join(', '))
+    .catch(() => null);
+  if (closeHandle) {
+    try {
+      await clickElementNaturally(page, closeHandle, { totalDurationMs: randomDelay(220, 520) }).catch(() => {});
+      await delay(randomDelay(900, 2200));
+      return true;
+    } finally {
+      await closeHandle.dispose().catch(() => {});
+    }
+  }
+  await page.keyboard.press('Escape').catch(() => {});
+  await delay(randomDelay(900, 2200));
+  return true;
+}
+
+async function maybeRefreshInstagramListModal(page, cleanTarget, listKind, logger, reason) {
+  if (!chance(0.6)) return false;
+  logger.log(`[Scraper] Refreshing ${listKind} modal after stall: ${reason}`);
+  await closeInstagramListModal(page).catch(() => {});
+  await delay(randomDelay(5000, 11000));
+  await dismissInstagramPopups(page, logger).catch(() => {});
+  const reopened = await tryOpenProfileList(page, cleanTarget, listKind).catch(() => false);
+  if (!reopened) return false;
+  await delay(randomDelay(4000, 9000));
+  await humanScrollInstagramListModal(page, { rounds: randomDelay(1, 2) }).catch(() => false);
+  return true;
+}
+
+async function runScrapeWarmupPattern(page, patternName) {
+  if (patternName === 'stories-first') {
+    await randomMouseDrift(page, { totalDurationMs: randomDelay(260, 620) });
+    await maybeLightStoryInteraction(page, { openChance: 0.18 }).catch(() => {});
+    await organicPause('between_actions', 1.9);
+    await naturalScrollPage(page, { rounds: randomDelay(2, 4), pauseMultiplier: 0.85 });
+    await organicPause('between_actions', 1.4);
+    await randomMouseDrift(page, { totalDurationMs: randomDelay(260, 540) });
+    return;
+  }
+
+  if (patternName === 'idle-heavy') {
+    await idleMouseDrift(page, { durationMs: randomDelay(9000, 18000) }).catch(() => {});
+    await naturalScrollPage(page, { rounds: randomDelay(1, 3), pauseMultiplier: 0.75 });
+    if (Math.random() < 0.45) {
+      await naturalScrollPage(page, { rounds: 1, direction: 'up', pauseMultiplier: 0.55 });
+    }
+    await maybeLightStoryInteraction(page, { openChance: 0.1 }).catch(() => {});
+    return;
+  }
+
+  await organicPause('between_actions', 1.6);
+  for (let i = 0; i < 2 + Math.floor(Math.random() * 2); i++) {
+    await randomMouseDrift(page, { totalDurationMs: randomDelay(180, 420) });
+    await naturalScrollPage(page, { rounds: randomDelay(2, 4), pauseMultiplier: 0.9 });
+    if (Math.random() < 0.35) {
+      await naturalScrollPage(page, { rounds: 1, direction: 'up', pauseMultiplier: 0.6 });
+    }
+    await maybeLightStoryInteraction(page, { openChance: 0.12 }).catch(() => {});
+    await organicPause('between_actions', 1.8);
+  }
+}
+
+async function getVisibleHandles(page, selector, limit) {
+  const handles = await page.$$(selector).catch(() => []);
+  const picked = [];
+  try {
+    for (const handle of handles) {
+      const box = await handle.boundingBox().catch(() => null);
+      if (!box || box.width < 12 || box.height < 12 || box.y < 0 || box.y > 760) {
+        await handle.dispose().catch(() => {});
+        continue;
+      }
+      picked.push(handle);
+      if (picked.length >= limit) break;
+    }
+  } finally {
+    for (const handle of handles) {
+      if (!picked.includes(handle)) await handle.dispose().catch(() => {});
+    }
+  }
+  return picked;
+}
+
+async function maybeBrowseProfilePosts(page) {
+  if (!chance(randomDelay(15, 25) / 100)) return;
+  await naturalScrollPage(page, { rounds: randomDelay(2, 4), pauseMultiplier: 0.8 }).catch(() => {});
+  await delay(randomDelay(4000, 9000));
+  const postHandles = await getVisibleHandles(page, 'a[href*="/p/"], a[href*="/reel/"]', randomDelay(1, 2));
+  try {
+    for (const postHandle of postHandles) {
+      await moveMouseToElement(page, postHandle, { totalDurationMs: randomDelay(420, 1100) }).catch(() => {});
+      await delay(randomDelay(5000, 12000));
+    }
+  } finally {
+    for (const handle of postHandles) await handle.dispose().catch(() => {});
+  }
+}
+
+async function maybeBrowseProfileComments(page) {
+  if (!chance(0.18)) return;
+  const postHandles = await getVisibleHandles(page, 'a[href*="/p/"], a[href*="/reel/"]', 1);
+  if (!postHandles.length) return;
+  try {
+    await clickElementNaturally(page, postHandles[0], { totalDurationMs: randomDelay(260, 620) }).catch(() => {});
+    await delay(randomDelay(2500, 5000));
+    const commentHandles = await getVisibleHandles(
+      page,
+      '[role="dialog"] ul ul span, [role="dialog"] h1 ~ div span',
+      randomDelay(1, 2)
+    );
+    try {
+      for (const commentHandle of commentHandles) {
+        await moveMouseToElement(page, commentHandle, { totalDurationMs: randomDelay(420, 980) }).catch(() => {});
+        await delay(randomDelay(3500, 9000));
+      }
+    } finally {
+      for (const handle of commentHandles) await handle.dispose().catch(() => {});
+    }
+    await closeInstagramListModal(page).catch(() => {});
+  } finally {
+    for (const handle of postHandles) await handle.dispose().catch(() => {});
+  }
+}
+
+async function maybeIdleOnProfile(page) {
+  if (!chance(0.28)) return;
+  await idleMouseDrift(page, {
+    durationMs: randomDelay(20000, 60000),
+    segmentDurationMs: randomDelay(700, 2200),
+  }).catch(() => {});
+}
+
+async function maybeBrowseTargetProfile(page) {
+  if (chance(0.42)) {
+    await viewStoriesNaturally(page, {
+      minStories: 2,
+      maxStories: 4,
+      minViewMs: 8000,
+      maxViewMs: 20000,
+    }).catch(() => {});
+    await delay(randomDelay(3000, 7000));
+  }
+  await maybeBrowseProfilePosts(page).catch(() => {});
+  await maybeBrowseProfileComments(page).catch(() => {});
+  await maybeIdleOnProfile(page).catch(() => {});
+}
+
 /**
  * Run follower or following list scrape in the background. Call from API without awaiting.
  * Loads scraper session, navigates to profile, paginates the modal list, upserts leads.
@@ -276,32 +807,29 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     const sec = Math.max(60, parseInt(leaseOptions.leaseSec || process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
     leaseHbTimer = setInterval(() => {
       sbMod.heartbeatScrapeJobLease(leaseOptions.jobId, leaseOptions.workerId, sec).catch(() => {});
-      if (leaseOptions.platformSessionId) {
-        sbMod.heartbeatPlatformScraperSessionLease(leaseOptions.platformSessionId, leaseOptions.workerId, sec).catch(() => {});
-      }
     }, Math.min(120000, Math.max(30000, sec * 250)));
   }
 
   let browser;
   let page = null;
+  let scrapedSessionId = null;
   try {
-    const { job, session, platformSessionId } = await resolvePuppeteerSessionForScrapeJob(jobId, leaseOptions);
+    const { job, session, instagramSessionId } = await resolvePuppeteerSessionForScrapeJob(clientId, jobId);
+    scrapedSessionId = instagramSessionId || null;
     if (!session?.session_data?.cookies?.length) {
       const n = Array.isArray(session?.session_data?.cookies) ? session.session_data.cookies.length : 0;
-      const poolHint = await describePlatformScraperPoolForLogs().catch(() => '');
       logger.error(
-        `[Scraper] Job ${jobId} no Puppeteer cookies: clientId=${clientId} ` +
-          `job.platform_scraper_session_id=${job?.platform_scraper_session_id ?? 'null'} ` +
-          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}. ${poolHint}`
+        `[Scraper] Job ${jobId} no Puppeteer cookies on current Instagram session: clientId=${clientId} ` +
+          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}`
       );
       await retryScrapeJob(
         jobId,
-        'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.',
+        'No current Instagram session with usable Puppeteer cookies.',
         60
       ).catch(async () => {
         await failScrapeJob(
           jobId,
-          'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.'
+          'No current Instagram session with usable Puppeteer cookies.'
         );
       });
       return;
@@ -309,7 +837,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     logger.log(`[Scraper] Job ${jobId} session OK; launching browser for ${listKind} scrape`);
 
-    browser = await puppeteer.launch(buildScraperBrowserLaunchOptions(platformSessionId, session.proxy_url));
+    browser = await puppeteer.launch(buildScraperBrowserLaunchOptions(instagramSessionId, session.proxy_url));
     page = await browser.newPage();
     await authenticatePageForProxy(page, session.proxy_url || null);
     const useMobile = process.env.SCRAPER_USE_MOBILE === '1' || process.env.SCRAPER_USE_MOBILE === 'true';
@@ -328,8 +856,8 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     await applyInstagramWebStorageFromSessionData(page, session.session_data, logger);
     await delay(randomDelay(1500, 3500));
 
-    if (await poolScraperPageLooksLoggedOut(page)) {
-      await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'follower scrape home');
+    if (await scraperPageLooksLoggedOut(page)) {
+      await requeueScrapeJobForLoggedOutInstagramSession(jobId, instagramSessionId, 'follower scrape home');
       return;
     }
 
@@ -337,23 +865,12 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     await dismissInstagramPopups(page, logger).catch(() => {});
 
     logger.log('[Scraper] Warming session before scrape...');
-    await delay(3000 + Math.floor(Math.random() * 5000));
-    for (let i = 0; i < 2 + Math.floor(Math.random() * 2); i++) {
-      await page.evaluate(() => window.scrollTo(0, 200 + Math.random() * 500));
-      await delay(8000 + Math.floor(Math.random() * 15000));
-    }
-    const liked = await page.evaluate(() => {
-      const likeBtns = Array.from(document.querySelectorAll('[aria-label="Like"], svg[aria-label="Like"]')).slice(0, 2);
-      for (const btn of likeBtns) {
-        const el = btn.closest('button') || btn.closest('[role="button"]') || btn;
-        if (el && el.offsetParent) {
-          el.click();
-          return true;
-        }
-      }
-      return false;
-    });
-    if (liked) await delay(5000 + Math.floor(Math.random() * 10000));
+    const warmupPatterns = ['baseline', 'stories-first', 'idle-heavy'];
+    const chosenWarmup = warmupPatterns[randomDelay(0, warmupPatterns.length - 1)];
+    logger.log(`[Scraper] Warmup pattern: ${chosenWarmup}`);
+    await runScrapeWarmupPattern(page, chosenWarmup).catch(() => {});
+    await randomMouseDrift(page, { totalDurationMs: randomDelay(180, 380) });
+    await organicPause('between_actions', 1.2);
     logger.log('[Scraper] Warm behaviour done.');
 
     const source = `${listKind}:${targetUsername}`;
@@ -364,10 +881,16 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       waitUntil: LIST_SCRAPE_NAV_WAIT_UNTIL,
       timeout: SCRAPER_NAV_TIMEOUT_MS,
     });
-    await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
+    await organicPause('between_actions', 1.7);
 
     // Dismiss cookies, account-switcher "Continue", notifications, and terms dialogs.
     await dismissInstagramPopups(page, logger).catch(() => {});
+    await naturalScrollPage(page, { rounds: randomDelay(1, 2), pauseMultiplier: 0.8 }).catch(() => {});
+    if (Math.random() < 0.28) {
+      await naturalScrollPage(page, { rounds: 1, direction: 'up', pauseMultiplier: 0.55 }).catch(() => {});
+    }
+    await maybeBrowseTargetProfile(page).catch(() => {});
+    await delay(randomDelay(8000, 18000));
 
     if (await instagramListProfilePageLooksBroken(page)) {
       await recoverBlankInstagramProfilePage(
@@ -428,68 +951,6 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       );
     } else {
       logger.log('[Scraper] Could not parse stat count from profile; using max_leads only');
-    }
-
-    async function tryOpenProfileList(page, target, kind) {
-      return page.evaluate((targetUsername, listKind) => {
-        const lower = (s) => (s || '').toLowerCase();
-        const wantFollowing = listKind === 'following';
-
-        const links = Array.from(document.querySelectorAll('a[href*="/followers"], a[href*="/following"]'));
-        const picked = links.find((a) => {
-          const href = lower(a.getAttribute('href') || '');
-          if (wantFollowing) {
-            return (
-              href.includes(`/${targetUsername}/following`) ||
-              (href.includes('/following') && !href.includes('/followers'))
-            );
-          }
-          return (
-            href.includes(`/${targetUsername}/followers`) ||
-            (href.includes('/followers') && !href.includes('/following'))
-          );
-        });
-        if (picked) {
-          picked.click();
-          return true;
-        }
-
-        const candidates = Array.from(
-          document.querySelectorAll('a, span, div, button, [role="button"]')
-        );
-        const needle = wantFollowing ? 'following' : 'followers';
-        const statsLike = candidates.find((el) => {
-          const text = (el.textContent || '').trim();
-          const l = lower(text);
-          return l.includes(needle) && /\d/.test(text);
-        });
-        if (statsLike) {
-          const clickable =
-            statsLike.closest('a, button, [role="button"]') || statsLike;
-          if (clickable && clickable instanceof HTMLElement) {
-            clickable.click();
-            return true;
-          }
-        }
-
-        const roleButtons = Array.from(
-          document.querySelectorAll('[role="button"], button, a')
-        );
-        for (const btn of roleButtons) {
-          const t = lower(btn.textContent || '');
-          if (wantFollowing) {
-            if (t.includes('following') || /\d+\s*following/.test(t)) {
-              btn.click();
-              return true;
-            }
-          } else if (t.includes('followers') || /\d+\s*followers/.test(t)) {
-            btn.click();
-            return true;
-          }
-        }
-
-        return false;
-      }, target, kind);
     }
 
     let profileListOpened = await tryOpenProfileList(page, cleanTarget, listKind);
@@ -582,42 +1043,7 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
 
     logger.log(`[Scraper] ${listKind === 'following' ? 'Following' : 'Followers'} modal opened, extracting...`);
     await delay(randomDelay(2500, 5000));
-    await page.evaluate(() => {
-      function countProfileLinks(el) {
-        let c = 0;
-        for (const a of el.querySelectorAll('a[href^="/"]')) {
-          const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-          if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-        }
-        return c;
-      }
-      let best = null;
-      let bestCount = 0;
-      for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-        const count = countProfileLinks(d);
-        if (count > bestCount && count >= 5) {
-          bestCount = count;
-          best = d;
-        }
-      }
-          if (bestCount < 5) {
-            for (const d of document.querySelectorAll('div')) {
-              if (d.clientHeight < 80) continue;
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 10) {
-                bestCount = count;
-                best = d;
-              }
-            }
-          }
-      if (best) {
-        best.focus();
-        for (let i = 0; i < 3; i++) {
-          best.dispatchEvent(new WheelEvent('wheel', { deltaY: 200, bubbles: true }));
-        }
-      }
-    });
-    await delay(1500);
+    await humanScrollInstagramListModal(page, { rounds: randomDelay(1, 2) }).catch(() => false);
 
     const saveLoginHandled = await page.evaluate(function () {
       const dialogs = document.querySelectorAll('[role="dialog"]');
@@ -667,15 +1093,26 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       'developer', 'about', 'blog', 'jobs', 'help', 'api', 'privacy', 'terms',
     ]);
     let scrollCount = 0;
+    let lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
+    let stuckModalCount = 0;
+    let loopIter = 0;
+    let exhaustedConfirmCount = 0;
+    let detachedFrameRetryUsed = false;
 
     while (true) {
+      loopIter++;
+      logger.log(
+        `[Scraper][Loop ${loopIter}] Start: total=${newInsertsTotal} noNew=${noNewCount}/${MAX_NO_NEW} scrollCount=${scrollCount}`
+      );
       const jobCheck = await getScrapeJob(jobId);
       if (jobCheck && jobCheck.status === 'cancelled') {
         logger.log('[Scraper] Job cancelled');
         break;
       }
 
-      const batchResult = await page.evaluate(() => {
+      let batchResult;
+      try {
+        batchResult = await page.evaluate(() => {
         const leads = [];
         let root = document.body;
         let bestCount = 0;
@@ -776,7 +1213,35 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           }
         }
         return { leads: deduped };
-      });
+        });
+      } catch (batchErr) {
+        const msg = String(batchErr?.message || batchErr || "");
+        if (/detached frame/i.test(msg) && !detachedFrameRetryUsed) {
+          detachedFrameRetryUsed = true;
+          logger.warn(`[Scraper] Detached frame in scrape loop; attempting one recovery retry: ${msg}`);
+          const refreshed = await maybeRefreshInstagramListModal(
+            page,
+            cleanTarget,
+            listKind,
+            logger,
+            "detached_frame_recover"
+          ).catch(() => false);
+          if (refreshed) {
+            lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
+            await delay(randomDelay(1800, 3600));
+            continue;
+          }
+          await closeInstagramListModal(page).catch(() => {});
+          await delay(randomDelay(1200, 2600));
+          const reopened = await tryOpenProfileList(page, cleanTarget, listKind).catch(() => false);
+          if (reopened) {
+            lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
+            await delay(randomDelay(1500, 3200));
+            continue;
+          }
+        }
+        throw batchErr;
+      }
 
       const batch = batchResult.leads || [];
 
@@ -809,6 +1274,9 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       if (quotaStatus && newLeads.length > quotaStatus.remaining) {
         newLeads = newLeads.slice(0, quotaStatus.remaining);
       }
+      logger.log(
+        `[Scraper][Loop ${loopIter}] Extracted=${batch.length} candidates; after filters=${newLeads.length}; quotaRemaining=${quotaStatus?.remaining ?? 'n/a'}`
+      );
       for (const lead of newLeads) {
         const u = (typeof lead === 'string' ? lead : lead.username).trim().replace(/^@/, '').toLowerCase();
         seenUsernames.add(u);
@@ -823,6 +1291,16 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
           `[Scraper] Batch: +${batchInserted} new row(s) (${newLeads.length} passed filters), job total ${newInsertsTotal}`
         );
         scrapedSinceCooldown += batchInserted;
+        if (chance(0.06)) {
+          const batchPauseMs = randomDelay(45000, 90000);
+          const driftMs = Math.min(batchPauseMs, randomDelay(12000, 26000));
+          logger.log(`[Scraper] Taking a long post-batch pause for ${Math.round(batchPauseMs / 1000)}s.`);
+          await idleMouseDrift(page, {
+            durationMs: driftMs,
+            segmentDurationMs: randomDelay(700, 1800),
+          }).catch(() => {});
+          await delay(Math.max(0, batchPauseMs - driftMs));
+        }
         if (!effectiveMax && COOLDOWN_CHUNK > 0 && scrapedSinceCooldown >= COOLDOWN_CHUNK) {
           const pauseMs = randomDelay(COOLDOWN_MIN_MS, COOLDOWN_MAX_MS);
           logger.log(
@@ -855,271 +1333,121 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
       scrollCount++;
       let weGotMoreFromWaitRetry = false;
 
-      const scrollIncrementally = () =>
-        page.evaluate((chunkPx) => {
-          function countProfileLinks(el) {
-            let c = 0;
-            for (const a of el.querySelectorAll('a[href^="/"]')) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-            }
-            return c;
-          }
-          let dialog = null;
-          let bestCount = 0;
-          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-            const count = countProfileLinks(d);
-            if (count > bestCount && count >= 5) {
-              bestCount = count;
-              dialog = d;
-            }
-          }
-          if (bestCount < 5) {
-            for (const d of document.querySelectorAll('div')) {
-              if (d.clientHeight < 80) continue;
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 10) {
-                bestCount = count;
-                dialog = d;
-              }
-            }
-          }
-          if (!dialog) return { scrolled: false };
-          let scrollTarget = null;
-          let maxLinks = 0;
-          for (const div of dialog.querySelectorAll('div')) {
-            const links = div.querySelectorAll('a[href^="/"]');
-            const hasOverflow = div.scrollHeight > div.clientHeight;
-            const isTallEnough = div.clientHeight > 80;
-            if (links.length > maxLinks && hasOverflow && isTallEnough) {
-              maxLinks = links.length;
-              scrollTarget = div;
-            }
-          }
-          if (!scrollTarget && dialog.scrollHeight > dialog.clientHeight) scrollTarget = dialog;
-          if (!scrollTarget) {
-            for (const div of dialog.querySelectorAll('div')) {
-              if (div.scrollHeight > div.clientHeight && div.clientHeight > 80) {
-                scrollTarget = div;
-                break;
-              }
-            }
-          }
-          if (!scrollTarget) {
-            maxLinks = 0;
-            for (const div of dialog.querySelectorAll('div')) {
-              const links = div.querySelectorAll('a[href^="/"]');
-              if (links.length > maxLinks && div.clientHeight > 80) {
-                maxLinks = links.length;
-                scrollTarget = div;
-              }
-            }
-          }
-          const scrollables = [];
-          if (scrollTarget) scrollables.push(scrollTarget);
-          for (const div of dialog.querySelectorAll('div')) {
-            if (div.scrollHeight > div.clientHeight && div.clientHeight > 80 && !scrollables.includes(div)) {
-              scrollables.push(div);
-            }
-          }
-          let didScroll = false;
-          for (const el of scrollables) {
-            if (!el) continue;
-            const prev = el.scrollTop;
-            el.scrollBy(0, chunkPx);
-            if (el.scrollTop !== prev) {
-              didScroll = true;
-              break;
-            }
-          }
-          if (!didScroll && scrollTarget) {
-            const prevTop = scrollTarget.scrollTop;
-            scrollTarget.focus();
-            scrollTarget.dispatchEvent(new WheelEvent('wheel', { deltaY: chunkPx, bubbles: true, cancelable: true }));
-            if (scrollTarget.scrollTop !== prevTop) didScroll = true;
-          }
-          return { scrolled: didScroll };
-        }, SCROLL_CHUNK_PX);
-
       let anyScrollThisIter = false;
-      for (let c = 0; c < SCROLL_CHUNKS_PER_ITER; c++) {
-        const result = await scrollIncrementally();
-        if (result.scrolled) anyScrollThisIter = true;
-        await delay(SCROLL_CHUNK_DELAY_MS);
-      }
+      let loadedMoreThisIter = false;
+      let exhaustedThisIter = false;
 
-      if (!anyScrollThisIter) {
-        const scrollIntoViewResult = await page.evaluate(() => {
-          function countProfileLinks(el) {
-            let c = 0;
-            for (const a of el.querySelectorAll('a[href^="/"]')) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-            }
-            return c;
-          }
-          let root = null;
-          let bestCount = 0;
-          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-            const count = countProfileLinks(d);
-            if (count > bestCount && count >= 5) {
-              bestCount = count;
-              root = d;
-            }
-          }
-          if (bestCount < 5) {
-            for (const d of document.querySelectorAll('div')) {
-              if (d.clientHeight < 80) continue;
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 10) {
-                bestCount = count;
-                root = d;
-              }
-            }
-          }
-          if (!root) return false;
-          const links = root.querySelectorAll('a[href^="/"]');
-          const lastLink = links[links.length - 1];
-          if (lastLink) {
-            lastLink.scrollIntoView({ block: 'end', behavior: 'instant' });
-            return true;
-          }
-          return false;
-        });
-        if (scrollIntoViewResult) await delay(1500);
-        const wheelScrolled = await page.evaluate(() => {
-          function countProfileLinks(el) {
-            let c = 0;
-            for (const a of el.querySelectorAll('a[href^="/"]')) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-            }
-            return c;
-          }
-          let dialog = null;
-          let bestCount = 0;
-          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-            const count = countProfileLinks(d);
-            if (count > bestCount && count >= 5) {
-              bestCount = count;
-              dialog = d;
-            }
-          }
-          if (bestCount < 5) {
-            for (const d of document.querySelectorAll('div')) {
-              if (d.clientHeight < 80) continue;
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 10) {
-                bestCount = count;
-                dialog = d;
-              }
-            }
-          }
-          if (!dialog) return false;
-          dialog.focus();
-          const targets = [dialog, ...dialog.querySelectorAll('div')].filter((el) => el.clientHeight > 80);
-          for (const el of targets) {
-            el.dispatchEvent(new WheelEvent('wheel', { deltaY: 400, bubbles: true }));
-          }
-          return true;
-        });
-        if (wheelScrolled) await delay(800);
-        await page.evaluate(() => {
-          function countProfileLinks(el) {
-            let c = 0;
-            for (const a of el.querySelectorAll('a[href^="/"]')) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-            }
-            return c;
-          }
-          let dialog = null;
-          let bestCount = 0;
-          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-            const count = countProfileLinks(d);
-            if (count > bestCount && count >= 5) {
-              bestCount = count;
-              dialog = d;
-            }
-          }
-          if (bestCount < 5) {
-            for (const d of document.querySelectorAll('div')) {
-              if (d.clientHeight < 80) continue;
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 10) {
-                bestCount = count;
-                dialog = d;
-              }
-            }
-          }
-          if (dialog) dialog.focus();
-        });
-        for (let k = 0; k < 4; k++) {
-          await page.keyboard.press('PageDown');
-          await delay(400);
+      for (let batchIndex = 0; batchIndex < 3; batchIndex++) {
+        const scrolled = await humanScrollInstagramListModal(page, { rounds: randomDelay(1, 2) }).catch(() => false);
+        if (scrolled) anyScrollThisIter = true;
+
+        const loadResult = await pushInstagramListModalAndWaitForLoad(page, {
+          maxWaitMs: randomDelay(2500, 4500),
+          bottomOffsetPx: randomDelay(120, 240),
+        }).catch(() => ({ moved: false, loadedMore: false, exhausted: false }));
+
+        if (loadResult.moved) anyScrollThisIter = true;
+        if (loadResult.loadedMore) {
+          loadedMoreThisIter = true;
+          break;
         }
-        const { scrolled: kbdScrolled } = await page.evaluate(() => {
-          function countProfileLinks(el) {
-            let c = 0;
-            for (const a of el.querySelectorAll('a[href^="/"]')) {
-              const m = (a.getAttribute('href') || '').match(/^\/([^/?#]+)/);
-              if (m && m[1].length >= 2 && m[1].length <= 30 && /^[a-z0-9._]+$/.test(m[1].toLowerCase())) c++;
-            }
-            return c;
-          }
-          let dialog = null;
-          let bestCount = 0;
-          for (const d of document.querySelectorAll('[role="dialog"], div[role="presentation"], div[role="menu"]')) {
-            const count = countProfileLinks(d);
-            if (count > bestCount && count >= 5) {
-              bestCount = count;
-              dialog = d;
-            }
-          }
-          if (bestCount < 5) {
-            for (const d of document.querySelectorAll('div')) {
-              if (d.clientHeight < 80) continue;
-              const count = countProfileLinks(d);
-              if (count > bestCount && count >= 10) {
-                bestCount = count;
-                dialog = d;
-              }
-            }
-          }
-          if (!dialog) return { scrolled: false };
-          let anyScroll = false;
-          for (const el of [dialog, ...dialog.querySelectorAll('div')]) {
-            if (el.scrollHeight > el.clientHeight && el.clientHeight > 80) {
-              const prev = el.scrollTop;
-              el.scrollTop = el.scrollHeight;
-              if (el.scrollTop !== prev) anyScroll = true;
-            }
-          }
-          return { scrolled: anyScroll };
-        });
-        if (kbdScrolled) anyScrollThisIter = true;
+        if (loadResult.exhausted) {
+          exhaustedThisIter = true;
+        }
+        logger.log(
+          `[Scraper][Loop ${loopIter}] Scroll chunk ${batchIndex + 1}/3: scrolled=${!!scrolled} moved=${!!loadResult.moved} loadedMore=${!!loadResult.loadedMore} exhausted=${!!loadResult.exhausted}`
+        );
+
+        if (batchIndex < 2 && Math.random() < 0.35) {
+          await randomMouseDrift(page, { totalDurationMs: randomDelay(250, 700) }).catch(() => {});
+        }
+
+        await delay(randomDelay(1200, 2800));
       }
 
-      if (!anyScrollThisIter) {
+      if (!loadedMoreThisIter && exhaustedThisIter) {
+        exhaustedConfirmCount++;
+        const belowTarget = !!effectiveMax && newInsertsTotal < effectiveMax;
+        logger.log(
+          `[Scraper][Loop ${loopIter}] Exhaustion signal ${exhaustedConfirmCount}/3 (belowTarget=${belowTarget} total=${newInsertsTotal}${effectiveMax ? `/${effectiveMax}` : ''})`
+        );
+        if (belowTarget && exhaustedConfirmCount < 3) {
+          const refreshed = await maybeRefreshInstagramListModal(
+            page,
+            cleanTarget,
+            listKind,
+            logger,
+            `exhausted_confirm=${exhaustedConfirmCount}`
+          );
+          if (refreshed) {
+            lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
+            await delay(randomDelay(3500, 8000));
+            continue;
+          }
+          await delay(randomDelay(1800, 3500));
+          continue;
+        }
+        logger.log('[Scraper] Followers/following modal appears exhausted after bottom-push load checks.');
+        if (hadNoNewThisIter) noNewCount++;
+        break;
+      }
+
+      if (!anyScrollThisIter && !loadedMoreThisIter) {
         let loadRetries = 0;
         while (loadRetries < LOAD_WAIT_RETRIES) {
-          await delay(LOAD_WAIT_MS);
-          for (let c = 0; c < SCROLL_CHUNKS_PER_ITER; c++) {
-            const { scrolled } = await scrollIncrementally();
-            if (scrolled) anyScrollThisIter = true;
-            await delay(SCROLL_CHUNK_DELAY_MS);
-          }
-          if (anyScrollThisIter) {
+          const retryResult = await pushInstagramListModalAndWaitForLoad(page, {
+            maxWaitMs: randomDelay(3000, 5000),
+            bottomOffsetPx: randomDelay(100, 220),
+          }).catch(() => ({ moved: false, loadedMore: false, exhausted: false }));
+
+          if (retryResult.moved) anyScrollThisIter = true;
+          if (retryResult.loadedMore) {
             weGotMoreFromWaitRetry = true;
+            loadedMoreThisIter = true;
             break;
           }
+          if (retryResult.exhausted) {
+            exhaustedThisIter = true;
+            break;
+          }
+          logger.log(
+            `[Scraper][Loop ${loopIter}] Retry ${loadRetries + 1}/${LOAD_WAIT_RETRIES}: moved=${!!retryResult.moved} loadedMore=${!!retryResult.loadedMore} exhausted=${!!retryResult.exhausted}`
+          );
+
           loadRetries++;
+          await delay(randomDelay(800, 1800));
         }
-        if (!anyScrollThisIter) {
-          logger.log(`[Scraper] No more scrollable content after ${LOAD_WAIT_RETRIES} retries.`);
+
+        if (!anyScrollThisIter && !loadedMoreThisIter && exhaustedThisIter) {
+          logger.log(`[Scraper] No more scrollable content after ${LOAD_WAIT_RETRIES} bottom-load retries.`);
           if (hadNoNewThisIter) noNewCount++;
           break;
         }
+      }
+
+      const modalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
+      const snapshotLooksStuck =
+        hadNoNewThisIter &&
+        modalSnapshot &&
+        lastModalSnapshot &&
+        modalSnapshot.scrollTop === lastModalSnapshot.scrollTop &&
+        modalSnapshot.linkCount === lastModalSnapshot.linkCount &&
+        modalSnapshot.remaining === lastModalSnapshot.remaining;
+      if (snapshotLooksStuck) stuckModalCount++;
+      else if (anyScrollThisIter || !hadNoNewThisIter) stuckModalCount = 0;
+      lastModalSnapshot = modalSnapshot;
+
+      if (
+        (stuckModalCount >= 2 || (!anyScrollThisIter && hadNoNewThisIter)) &&
+        (await maybeRefreshInstagramListModal(page, cleanTarget, listKind, logger, `stuck=${stuckModalCount}`))
+      ) {
+        logger.log(
+          `[Scraper][Loop ${loopIter}] Modal refresh triggered (stuckModalCount=${stuckModalCount}, hadNoNew=${hadNoNewThisIter})`
+        );
+        stuckModalCount = 0;
+        lastModalSnapshot = await getInstagramListModalSnapshot(page).catch(() => null);
+        await delay(randomDelay(12000, 35000));
+        continue;
       }
 
       if (hadNoNewThisIter && !weGotMoreFromWaitRetry && scrollCount >= 3) {
@@ -1131,8 +1459,12 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         );
         break;
       }
+      if (loadedMoreThisIter || anyScrollThisIter) exhaustedConfirmCount = 0;
+      logger.log(
+        `[Scraper][Loop ${loopIter}] End: hadNoNew=${hadNoNewThisIter} noNew=${noNewCount}/${MAX_NO_NEW} anyScroll=${anyScrollThisIter} loadedMore=${loadedMoreThisIter} exhausted=${exhaustedThisIter} stuckModalCount=${stuckModalCount} retryLoadHit=${weGotMoreFromWaitRetry}`
+      );
 
-      await delay(randomDelay(SCRAPE_DELAY_MIN_MS, SCRAPE_DELAY_MAX_MS));
+      await organicPause('between_actions', 1.6);
     }
 
     await finalizeScrapeJobNormalExit(jobId, newInsertsTotal);
@@ -1145,15 +1477,19 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
         waitUntil: 'domcontentloaded',
         timeout: SCRAPER_NAV_TIMEOUT_MS,
       });
-      await delay(3000 + Math.floor(Math.random() * 5000));
-      await page.evaluate(() => window.scrollTo(0, 200));
-      await delay(5000 + Math.floor(Math.random() * 8000));
+      await organicPause('between_actions', 1.5);
+      await randomMouseDrift(page, { totalDurationMs: randomDelay(160, 360) });
+      await naturalScrollPage(page, { rounds: randomDelay(2, 4), pauseMultiplier: 0.85 });
+      await maybeLightStoryInteraction(page, { openChance: 0.1 }).catch(() => {});
+      await organicPause('between_actions', 1.5);
       logger.log('[Scraper] Post-scrape warm done.');
     } catch (e) {
-      logger.warn('[Scraper] Post-scrape warm skipped: ' + e.message);
+      const msg = String(e?.message || e || '');
+      if (/detached frame/i.test(msg)) logger.log('[Scraper] Post-scrape warm skipped: frame detached after job completion.');
+      else logger.warn('[Scraper] Post-scrape warm skipped: ' + msg);
     }
-    if (platformSessionId && newInsertsTotal > 0) {
-      await recordScraperActions(platformSessionId, newInsertsTotal).catch(() => {});
+    if (instagramSessionId && newInsertsTotal > 0) {
+      await recordScraperActions(instagramSessionId, newInsertsTotal).catch(() => {});
     }
   } catch (err) {
     logger.error(`[Scraper] ${listKind === 'following' ? 'Following' : 'Follower'} scrape failed`, err);
@@ -1169,6 +1505,12 @@ async function runFollowerScrape(clientId, jobId, targetUsername, options = {}) 
     }
   } finally {
     if (leaseHbTimer) clearInterval(leaseHbTimer);
+    if (scrapedSessionId) {
+      const cooldownUntilIso = new Date(Date.now() + SCRAPE_SESSION_COOLDOWN_MS).toISOString();
+      await require('./database/supabase')
+        .updateInstagramSessionScrapeCooldown(scrapedSessionId, cooldownUntilIso)
+        .catch((e) => logger.warn('[Scraper] failed setting scrape cooldown: ' + (e.message || e)));
+    }
     if (browser) await browser.close().catch(() => {});
   }
 }
@@ -1468,11 +1810,10 @@ async function instagramMobilePostLooksLikeLoggedOutGuest(page) {
   }
 }
 
-/** Pool scraper cannot scrape until this is false (login path, password, one-tap chooser, or guest signup shell). */
-async function poolScraperWebSessionBlocksWork(page, usernameHint) {
+/** Comment scrape cannot run until the page is a real logged-in post/profile view. */
+async function scraperWebSessionBlocksWork(page, usernameHint) {
   if (!page) return true;
-  if (await poolScraperPageLooksLoggedOut(page)) return true;
-  if (await instagramPoolOneTapLoginChooserVisible(page, usernameHint)) return true;
+  if (await scraperPageLooksLoggedOut(page)) return true;
   if (await instagramMobilePostLooksLikeLoggedOutGuest(page)) return true;
   return false;
 }
@@ -1523,9 +1864,6 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     const sec = Math.max(60, parseInt(leaseOptions.leaseSec || process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
     leaseHbTimer = setInterval(() => {
       sbMod.heartbeatScrapeJobLease(leaseOptions.jobId, leaseOptions.workerId, sec).catch(() => {});
-      if (leaseOptions.platformSessionId) {
-        sbMod.heartbeatPlatformScraperSessionLease(leaseOptions.platformSessionId, leaseOptions.workerId, sec).catch(() => {});
-      }
     }, Math.min(120000, Math.max(30000, sec * 250)));
   }
 
@@ -1536,29 +1874,22 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
   let browser;
   let page = null;
-  let platformSessionId = null;
   try {
-    const { session, platformSessionId: resolvedPlatformId } = await resolvePuppeteerSessionForScrapeJob(
-      jobId,
-      leaseOptions
-    );
-    platformSessionId = resolvedPlatformId;
+    const { session, instagramSessionId } = await resolvePuppeteerSessionForScrapeJob(clientId, jobId);
     if (!session?.session_data?.cookies?.length) {
       const n = Array.isArray(session?.session_data?.cookies) ? session.session_data.cookies.length : 0;
-      const poolHint = await describePlatformScraperPoolForLogs().catch(() => '');
       logger.error(
-        `[Scraper] Job ${jobId} no Puppeteer cookies: clientId=${clientId} ` +
-          `job.platform_scraper_session_id=${job?.platform_scraper_session_id ?? 'null'} ` +
-          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}. ${poolHint}`
+        `[Scraper] Job ${jobId} no Puppeteer cookies on current Instagram session: clientId=${clientId} ` +
+          `session_row=${session ? 'yes' : 'no'} cookie_count=${n}`
       );
       await retryScrapeJob(
         jobId,
-        'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.',
+        'No current Instagram session with usable Puppeteer cookies.',
         60
       ).catch(async () => {
         await failScrapeJob(
           jobId,
-          'No platform scraper with a valid session (cold_dm_platform_scraper_sessions). Per-client cold_dm_scraper_sessions is not used.'
+          'No current Instagram session with usable Puppeteer cookies.'
         );
       });
       return;
@@ -1566,7 +1897,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
 
     logger.log(`[Scraper] Job ${jobId} session OK; launching browser for comment scrape`);
 
-    browser = await puppeteer.launch(buildScraperBrowserLaunchOptions(platformSessionId, session.proxy_url));
+    browser = await puppeteer.launch(buildScraperBrowserLaunchOptions(instagramSessionId, session.proxy_url));
     page = await browser.newPage();
     await authenticatePageForProxy(page, session.proxy_url || null);
     await applyMobileEmulation(page);
@@ -1579,7 +1910,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
     await applyInstagramWebStorageFromSessionData(page, session.session_data, logger);
     await delay(randomDelay(1500, 3500));
 
-    const poolEstablishedHome = await ensurePoolScraperInstagramWebSession(page, logger, preferredIgUser, jobId);
+    const sessionEstablishedHome = await ensurePoolScraperInstagramWebSession(page, logger, preferredIgUser, jobId);
 
     await commentScrapeDebugScreenshot(
       page,
@@ -1590,8 +1921,8 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       'after-home-session-check'
     );
 
-    if (!poolEstablishedHome || (await poolScraperWebSessionBlocksWork(page, preferredIgUser))) {
-      await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape home');
+    if (!sessionEstablishedHome || (await scraperWebSessionBlocksWork(page, preferredIgUser))) {
+      await requeueScrapeJobForLoggedOutInstagramSession(jobId, instagramSessionId, 'comment scrape home');
       return;
     }
 
@@ -1641,14 +1972,14 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       for (let guestRetry = 0; guestRetry < 2; guestRetry++) {
         if (!(await instagramMobilePostLooksLikeLoggedOutGuest(page))) break;
         logger.warn(
-          '[Scraper] Post page looks like logged-out guest UI; re-establishing pool session from home' +
+          '[Scraper] Post page looks like logged-out guest UI; re-establishing session from home' +
             (guestRetry ? ' (retry)' : '')
         );
         await page.goto('https://www.instagram.com/', { waitUntil: 'networkidle2', timeout: SCRAPER_NAV_TIMEOUT_MS });
         await delay(1500 + Math.floor(Math.random() * 900));
-        const poolOkGuest = await ensurePoolScraperInstagramWebSession(page, logger, scraperUsername, jobId);
-        if (!poolOkGuest || (await poolScraperWebSessionBlocksWork(page, scraperUsername))) {
-          await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape after guest retry');
+        const sessionOkGuest = await ensurePoolScraperInstagramWebSession(page, logger, scraperUsername, jobId);
+        if (!sessionOkGuest || (await scraperWebSessionBlocksWork(page, scraperUsername))) {
+          await requeueScrapeJobForLoggedOutInstagramSession(jobId, instagramSessionId, 'comment scrape after guest retry');
           return;
         }
         await page.goto(normalizedUrl, { waitUntil: 'networkidle2', timeout: SCRAPER_NAV_TIMEOUT_MS });
@@ -1657,7 +1988,7 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       }
 
       if (await instagramMobilePostLooksLikeLoggedOutGuest(page)) {
-        await requeueScrapeJobForLoggedOutPlatformSession(jobId, platformSessionId, 'comment scrape post still guest');
+        await requeueScrapeJobForLoggedOutInstagramSession(jobId, instagramSessionId, 'comment scrape post still guest');
         return;
       }
 
@@ -1937,11 +2268,13 @@ async function runCommentScrape(clientId, jobId, postUrls, options = {}) {
       await delay(5000 + Math.floor(Math.random() * 8000));
       logger.log('[Scraper] Post-scrape warm done.');
     } catch (e) {
-      logger.warn('[Scraper] Post-scrape warm skipped: ' + e.message);
+      const msg = String(e?.message || e || '');
+      if (/detached frame/i.test(msg)) logger.log('[Scraper] Post-scrape warm skipped: frame detached after job completion.');
+      else logger.warn('[Scraper] Post-scrape warm skipped: ' + msg);
     }
 
-    if (platformSessionId && leadsInsertedTotal > 0) {
-      await recordScraperActions(platformSessionId, leadsInsertedTotal).catch(() => {});
+    if (instagramSessionId && leadsInsertedTotal > 0) {
+      await recordScraperActions(instagramSessionId, leadsInsertedTotal).catch(() => {});
     }
 
     await finalizeScrapeJobNormalExit(jobId, leadsInsertedTotal);

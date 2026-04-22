@@ -5,13 +5,16 @@
 const logger = require('./logger');
 const { clickInstagramDmSearchResult, formatSearchFailurePageSnippet } = require('./instagram-dm-search');
 const { gotoInstagramDirectNew } = require('./goto-instagram-direct-new');
+const {
+  clickElementNaturally,
+  delay,
+  focusAndTypeNaturally,
+  organicPause,
+  typeTextNaturally,
+} = require('./human-interaction');
 
-function delay(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-async function humanDelay() {
-  await delay(500 + Math.floor(Math.random() * 1500));
+async function humanDelay(kind = 'between_actions') {
+  await organicPause(kind);
 }
 
 /**
@@ -19,31 +22,18 @@ async function humanDelay() {
  * Use Shift+Enter between lines; caller sends with Enter once.
  */
 async function typeInstagramDmPlainTextInComposer(page, composeHandle, msg, delayOpts) {
-  const lines = String(msg).split('\n');
-  const d = delayOpts || { delay: 60 };
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].length) await composeHandle.type(lines[i], d);
-    if (i < lines.length - 1) {
-      await page.keyboard.down('Shift');
-      await page.keyboard.press('Enter');
-      await page.keyboard.up('Shift');
-      await delay(50 + Math.floor(Math.random() * 40));
-    }
-  }
+  await focusAndTypeNaturally(page, composeHandle, String(msg), {
+    ...delayOpts,
+    shiftEnterNewlines: true,
+    clearFirst: false,
+  });
 }
 
 async function typeInstagramDmPlainTextWithKeyboard(page, msg, delayOpts) {
-  const lines = String(msg).split('\n');
-  const d = delayOpts || { delay: 60 };
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].length) await page.keyboard.type(lines[i], d);
-    if (i < lines.length - 1) {
-      await page.keyboard.down('Shift');
-      await page.keyboard.press('Enter');
-      await page.keyboard.up('Shift');
-      await delay(50 + Math.floor(Math.random() * 40));
-    }
-  }
+  await typeTextNaturally(page, String(msg), {
+    ...delayOpts,
+    shiftEnterNewlines: true,
+  });
 }
 
 async function navigateToDmThread(page, u) {
@@ -151,18 +141,23 @@ async function navigateToDmThread(page, u) {
   }
 
   const searchMeta = await page.evaluate((el) => ({ tag: el.tagName, type: el.type || '', isCE: !!el.isContentEditable }), searchEl).catch(() => ({}));
-  await searchEl.click({ delay: 50 }).catch(() => {});
+  await clickElementNaturally(page, searchEl, { totalDurationMs: 260 }).catch(() => {});
+  await organicPause('compose', 0.45);
 
-  if (searchMeta.tag === 'INPUT' || searchMeta.tag === 'TEXTAREA') {
-    await searchEl.type(u, { delay: 90 });
+  if (searchMeta.tag === 'INPUT' || searchMeta.tag === 'TEXTAREA' || searchMeta.isCE) {
+    await focusAndTypeNaturally(page, searchEl, u, {
+      clearFirst: true,
+      minKeyDelay: 45,
+      maxKeyDelay: 120,
+    });
   } else {
     await delay(100);
-    await page.keyboard.type(u, { delay: 90 });
+    await typeTextNaturally(page, u, { minKeyDelay: 45, maxKeyDelay: 120 });
   }
 
   await searchEl.dispose();
   await searchHandle.dispose();
-  await delay(2800);
+  await humanDelay('open_dm');
 
   const searchPick = await clickInstagramDmSearchResult(page, u).catch((e) => ({
     ok: false,
@@ -207,8 +202,8 @@ async function navigateToDmThread(page, u) {
     }
     return false;
   });
-  if (openedThread) await delay(2500);
-  await delay(2000);
+  if (openedThread) await humanDelay('open_dm');
+  await humanDelay('between_actions');
 
   try {
     await page.waitForFunction(
@@ -225,10 +220,10 @@ async function navigateToDmThread(page, u) {
         });
         if (nextOrChat && nextOrChat.offsetParent) nextOrChat.click();
       });
-      await delay(3000);
+      await humanDelay('open_dm');
     }
   }
-  await delay(2000);
+  await humanDelay('between_actions');
 
   const composeSelector = 'textarea, div[contenteditable="true"], p[contenteditable="true"], [contenteditable="true"], [role="textbox"]';
   try {
@@ -279,15 +274,15 @@ async function sendPlainTextInThread(page, text, options = {}) {
     await composeEl.dispose();
     return { ok: false, reason: 'no_compose' };
   }
-  await delay(400);
-  await compose.click();
+  await organicPause('compose', 0.6);
+  await clickElementNaturally(page, compose, { totalDurationMs: 240 });
   await typeInstagramDmPlainTextInComposer(page, compose, msg, { delay: 55 + Math.floor(Math.random() * 35) });
   await compose.dispose();
   await composeEl.dispose();
-  await humanDelay();
+  await humanDelay('compose');
   const sendT0 = Date.now();
   await page.keyboard.press('Enter');
-  await delay(1500);
+  await humanDelay('post_send');
   let instagramMessageId;
   if (idCapture && typeof idCapture.waitForOneIdAfter === 'function') {
     try {

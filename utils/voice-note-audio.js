@@ -4,7 +4,38 @@
 
 const { spawn, spawnSync } = require('child_process');
 const fs = require('fs');
+const path = require('path');
 const { DEFAULT_CHROME_FAKE_MIC_WAV } = require('./chrome-fake-mic');
+
+/**
+ * Minimal valid PCM WAV (48 kHz stereo s16le, 1 s silence) without ffmpeg — used when lavfi/ffmpeg fails on VPS.
+ */
+function writeSilentWavPlaceholderPcm48kStereo1s(outPath) {
+  const sampleRate = 48000;
+  const numChannels = 2;
+  const bitsPerSample = 16;
+  const durationSec = 1;
+  const blockAlign = numChannels * (bitsPerSample / 8);
+  const byteRate = sampleRate * blockAlign;
+  const numSamples = Math.floor(sampleRate * durationSec);
+  const dataSize = numSamples * blockAlign;
+  const buf = Buffer.alloc(44 + dataSize);
+  buf.write('RIFF', 0);
+  buf.writeUInt32LE(36 + dataSize, 4);
+  buf.write('WAVE', 8);
+  buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(numChannels, 22);
+  buf.writeUInt32LE(sampleRate, 24);
+  buf.writeUInt32LE(byteRate, 28);
+  buf.writeUInt16LE(blockAlign, 32);
+  buf.writeUInt16LE(bitsPerSample, 34);
+  buf.write('data', 36);
+  buf.writeUInt32LE(dataSize, 40);
+  fs.mkdirSync(path.dirname(outPath), { recursive: true });
+  fs.writeFileSync(outPath, buf);
+}
 
 function ffmpegBin() {
   return process.env.FFMPEG_PATH || process.env.FFMPEG_BIN || 'ffmpeg';
@@ -200,8 +231,22 @@ function ensureChromeFakeMicPlaceholder(logger = null, outputPath = DEFAULT_CHRO
     ],
     { encoding: 'utf8', timeout: 5000 }
   );
-  if (result.status !== 0 && logger && typeof logger.warn === 'function') {
-    logger.warn(`[voice] Could not create placeholder ${outputPath}: ${result.stderr || ''}`);
+  if (result.status === 0 && fs.existsSync(outputPath)) return;
+  try {
+    writeSilentWavPlaceholderPcm48kStereo1s(outputPath);
+    if (logger && typeof logger.log === 'function') {
+      logger.log(`[voice] Wrote silent WAV placeholder (ffmpeg unavailable or failed) → ${outputPath}`);
+    }
+  } catch (e) {
+    if (logger && typeof logger.warn === 'function') {
+      const hint = [result.stderr, result.stdout, result.error && result.error.message]
+        .filter(Boolean)
+        .join(' ')
+        .slice(0, 400);
+      logger.warn(
+        `[voice] Could not create placeholder ${outputPath} (ffmpeg status=${result.status ?? 'n/a'}): ${hint || e.message || e}`
+      );
+    }
   }
 }
 
