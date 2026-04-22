@@ -88,6 +88,49 @@ const COOKIE_NAME = 'cold_dm_api';
 const cookieSecure =
   process.env.COLD_DM_COOKIE_SECURE === '1' || process.env.COLD_DM_COOKIE_SECURE === 'true';
 
+function envCheckSnapshot(req) {
+  const auth = req.headers.authorization;
+  const bearer = typeof auth === 'string' ? auth.replace(/^Bearer\s+/i, '').trim() : '';
+  const xApiKey = (req.headers['x-api-key'] || '').toString().trim();
+  const cookieKey = req.cookies && req.cookies[COOKIE_NAME] ? String(req.cookies[COOKIE_NAME]).trim() : '';
+  const presentedKey = getPresentedApiKey(req);
+
+  const supabaseUrl = (process.env.SUPABASE_URL || '').trim();
+  const serviceRoleLen = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim().length;
+  const edgeSecretLen = (process.env.EDGE_INTERNAL_FUNCTION_SECRET || '').trim().length;
+  const coldDmApiKeyLen = (process.env.COLD_DM_API_KEY || '').trim().length;
+
+  return {
+    presented: {
+      hasKey: Boolean(presentedKey),
+      keyLen: presentedKey ? String(presentedKey).length : 0,
+      sources: {
+        bearer: bearer.length > 0,
+        xApiKey: xApiKey.length > 0,
+        cookie: cookieKey.length > 0,
+      },
+    },
+    server: {
+      apiKeyConfigured: API_KEY.length > 0,
+      apiKeyLen: API_KEY.length,
+      apiKeysMapCount: Object.keys(API_KEY_CLIENT_MAP).length,
+      pinnedClientId: Boolean((process.env.COLD_DM_CLIENT_ID || '').trim()),
+    },
+    env: {
+      supabaseUrlPresent: supabaseUrl.length > 0,
+      supabaseUrl: supabaseUrl ? supabaseUrl.replace(/\/$/, '') : '',
+      supabaseServiceRoleKeyLen: serviceRoleLen,
+      edgeInternalSecretLen: edgeSecretLen,
+      coldDmApiKeyLen,
+    },
+    process: {
+      cwd: process.cwd(),
+      node: process.version,
+      pm2: process.env.pm_id != null,
+    },
+  };
+}
+
 // Dashboard HTML: set HttpOnly cookie from server env so the browser never types or sees the API key in JS/repo.
 app.get('/', (req, res) => {
   if (API_KEY) {
@@ -117,6 +160,15 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
 });
 app.use('/api', apiLimiter);
+
+// Debug helper: confirms what env/headers the running VPS process sees at runtime.
+// Enable with COLD_DM_DEBUG_AUTH=1 and hit GET /api/internal/env-check.
+app.get('/api/internal/env-check', (req, res) => {
+  if ((process.env.COLD_DM_DEBUG_AUTH || '').trim() !== '1') {
+    return res.status(404).json({ ok: false });
+  }
+  return res.json({ ok: true, ...envCheckSnapshot(req) });
+});
 
 const followUpLimiter = rateLimit({
   windowMs: 60 * 1000,
@@ -174,6 +226,7 @@ function requireScopedClientId(req, res) {
 
 app.use('/api', (req, res, next) => {
   if (req.path === '/health') return next();
+  if (req.path === '/internal/env-check') return next();
   if (req.path === '/internal/scale-send-workers') return next();
   const key = getPresentedApiKey(req);
   if (!key) {
@@ -339,7 +392,9 @@ async function triggerProcessScheduledResponsesFallback(reason = 'interval') {
   const bearer = getProcessScheduledResponsesBearer();
   if (!supabaseUrl || !bearer) {
     logger.warn(
-      '[process-scheduled-responses:fallback] disabled at runtime: SUPABASE_URL or auth secret missing on VPS'
+      `[process-scheduled-responses:fallback] disabled at runtime: missing env (SUPABASE_URL=${
+        supabaseUrl ? 'set' : 'missing'
+      } auth_secret_len=${String(bearer || '').length})`
     );
     return;
   }
