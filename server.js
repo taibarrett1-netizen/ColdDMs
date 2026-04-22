@@ -3,6 +3,7 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const { exec, spawn } = require('child_process');
 const multer = require('multer');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
@@ -66,6 +67,7 @@ const envPath = path.join(projectRoot, '.env');
 const leadsPath = path.join(projectRoot, process.env.LEADS_CSV || 'leads.csv');
 const voiceNotesDir = path.join(projectRoot, 'voice-notes');
 const followUpScreenshotsDir = path.join(projectRoot, 'follow-up-screenshots');
+const PROCESS_BOOT_ID = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
@@ -251,6 +253,105 @@ function requireScopedClientId(req, res) {
   return clientId;
 }
 
+function getHealthPayload() {
+  const assignedClientId = getClientId();
+  return {
+    ok: true,
+    bootId: PROCESS_BOOT_ID,
+    poolMode: process.env.COLD_DM_POOL_MODE === '1' || process.env.COLD_DM_POOL_MODE === 'true',
+    assignedClientIdPresent: Boolean(assignedClientId),
+  };
+}
+
+async function fetchTextWithTimeout(url, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return '';
+    return String(await res.text().catch(() => '')).trim();
+  } catch {
+    return '';
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function notifyPoolWorkerReady(reason = 'startup') {
+  const isPoolMode = process.env.COLD_DM_POOL_MODE === '1' || process.env.COLD_DM_POOL_MODE === 'true';
+  if (!isPoolMode) return true;
+  if (getClientId()) return true;
+
+  const supabaseUrl = (process.env.SUPABASE_URL || '').replace(/\/$/, '');
+  const bearer =
+    (process.env.EDGE_INTERNAL_FUNCTION_SECRET || '').trim() ||
+    (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  if (!supabaseUrl || !bearer) {
+    console.warn(
+      `[pool-worker-ready] skip reason=${reason} missing env (SUPABASE_URL=${supabaseUrl ? 'set' : 'missing'} bearer=${
+        bearer ? 'set' : 'missing'
+      })`
+    );
+    return false;
+  }
+
+  const [dropletIdRaw, publicIp] = await Promise.all([
+    fetchTextWithTimeout('http://169.254.169.254/metadata/v1/id', 3000),
+    fetchTextWithTimeout('http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address', 3000),
+  ]);
+  const dropletId = Number(dropletIdRaw);
+  if (!Number.isFinite(dropletId) || dropletId <= 0 || !publicIp) {
+    console.warn(
+      `[pool-worker-ready] metadata unavailable reason=${reason} dropletId=${dropletIdRaw || 'missing'} publicIp=${
+        publicIp || 'missing'
+      }`
+    );
+    return false;
+  }
+
+  try {
+    const res = await fetch(`${supabaseUrl}/functions/v1/cold-dm-vps-proxy`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${bearer}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'poolWorkerReady',
+        dropletId,
+        publicIp,
+      }),
+    });
+    if (!res.ok) {
+      const bodyPreview = String(await res.text().catch(() => '')).replace(/\s+/g, ' ').trim().slice(0, 300);
+      console.warn(
+        `[pool-worker-ready] callback failed reason=${reason} status=${res.status} body=${bodyPreview || 'n/a'}`
+      );
+      return false;
+    }
+    console.log(`[pool-worker-ready] callback ok reason=${reason} dropletId=${dropletId} publicIp=${publicIp}`);
+    return true;
+  } catch (e) {
+    console.warn(`[pool-worker-ready] callback exception reason=${reason} error=${e?.message || e}`);
+    return false;
+  }
+}
+
+function schedulePoolWorkerReadyRegistration() {
+  const isPoolMode = process.env.COLD_DM_POOL_MODE === '1' || process.env.COLD_DM_POOL_MODE === 'true';
+  if (!isPoolMode) return;
+
+  const runAfter = (reason, delayMs) => {
+    setTimeout(async () => {
+      if (getClientId()) return;
+      const ok = await notifyPoolWorkerReady(reason);
+      if (!ok && !getClientId()) runAfter('retry', 30000);
+    }, delayMs);
+  };
+
+  runAfter('startup', 5000);
+}
+
 app.use('/api', (req, res, next) => {
   if (req.path === '/health') return next();
   if (req.path === '/internal/env-check') return next();
@@ -312,13 +413,13 @@ app.post('/api/admin/assign-client', (req, res) => {
   }
   // IMPORTANT: respond before restarting. Restarting the process can kill this request mid-flight,
   // which makes the Edge function hang/timeout even though the assignment succeeded.
-  res.json({ ok: true, clientId, restarting: true });
+  res.json({ ok: true, clientId, restarting: true, bootIdBeforeRestart: PROCESS_BOOT_ID });
   setTimeout(() => {
-    const cmd = `${getPuppeteerDepsInstallCommand()} && pm2 restart ig-dm-dashboard`;
+    const cmd = 'pm2 restart ig-dm-dashboard --update-env';
     exec(cmd, { maxBuffer: 4 * 1024 * 1024 }, (err) => {
       if (err) console.error('[API] assign-client pm2 restart failed', err);
     });
-  }, 250);
+  }, 50);
 });
 
 const { registerAdminLabRoutes } = require('./admin_lab/http');
@@ -798,7 +899,7 @@ function readCachedStatus(cacheKey) {
 
 // --- API: health (for proxy/dashboard connectivity check; no DB or pm2) ---
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true });
+  res.json(getHealthPayload());
 });
 
 // --- API: status & stats ---
@@ -2053,6 +2154,7 @@ app.post('/api/control/stop', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Dashboard at http://0.0.0.0:${PORT}`);
+  schedulePoolWorkerReadyRegistration();
   if (shouldAutoScaleSendWorkers()) {
     const min = SCALE_SEND_WORKERS_AUTO_INTERVAL_MS / 60000;
     console.log(
