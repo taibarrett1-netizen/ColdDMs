@@ -1325,6 +1325,15 @@ function cleanupExpiredScraper2FA() {
 // If it does not reach 2FA (e.g. straight login or email-code checkpoint), connect is rejected.
 app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
   const { username, password, clientId } = req.body || {};
+  const reqId = require('crypto').randomBytes(6).toString('hex');
+  const startedAt = Date.now();
+  const safeUser = String(username || '').trim().replace(/^@/, '').toLowerCase();
+  const safeClient = String(clientId || '').trim();
+  console.log(
+    `[API] instagram_connect:start id=${reqId} clientId=${safeClient ? safeClient.slice(0, 8) : 'missing'} user=${
+      safeUser || 'missing'
+    }`
+  );
   if (req.authClientId && clientId && String(clientId) !== req.authClientId) {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
@@ -1356,11 +1365,20 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
     try {
       proxyMeta = await getOrResolveColdDmProxyUrl(clientId, igKey);
     } catch (pe) {
+      console.error(
+        `[API] instagram_connect:proxy_failed id=${reqId} afterMs=${Date.now() - startedAt}`,
+        pe
+      );
       return res.status(503).json({
         ok: false,
         error: pe instanceof Error ? pe.message : String(pe) || 'Could not allocate proxy (check Decodo API and credits)',
       });
     }
+    console.log(
+      `[API] instagram_connect:proxy_ok id=${reqId} afterMs=${Date.now() - startedAt} proxy=${
+        proxyMeta.proxyUrl ? 'set' : 'missing'
+      } assignmentId=${proxyMeta.proxyAssignmentId ? String(proxyMeta.proxyAssignmentId).slice(0, 8) : 'n/a'}`
+    );
     const allowNoProxy =
       process.env.COLD_DM_ALLOW_NO_PROXY === '1' || process.env.COLD_DM_ALLOW_NO_PROXY === 'true';
     if (!allowNoProxy && !proxyMeta.proxyUrl) {
@@ -1371,7 +1389,15 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
         code: 'proxy_not_configured',
       });
     }
+    console.log(
+      `[API] instagram_connect:puppeteer_start id=${reqId} afterMs=${Date.now() - startedAt}`
+    );
     const result = await connectInstagram(username, password, null, { proxyUrl: proxyMeta.proxyUrl });
+    console.log(
+      `[API] instagram_connect:puppeteer_done id=${reqId} afterMs=${Date.now() - startedAt} twoFactor=${
+        result?.twoFactorRequired ? '1' : '0'
+      } emailVerify=${result?.emailVerificationRequired ? '1' : '0'}`
+    );
     if (result.twoFactorRequired) {
       cleanupExpired2FA();
       const pendingId = require('crypto').randomBytes(16).toString('hex');
@@ -1384,6 +1410,12 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
         proxyUrl: proxyMeta.proxyUrl,
         proxyAssignmentId: proxyMeta.proxyAssignmentId,
       });
+      console.log(
+        `[API] instagram_connect:two_factor_required id=${reqId} afterMs=${Date.now() - startedAt} pending2FAId=${pendingId.slice(
+          0,
+          8
+        )}`
+      );
       return res.status(200).json({
         ok: false,
         code: 'two_factor_required',
@@ -1393,6 +1425,9 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
     }
     if (result.emailVerificationRequired) {
       if (result.browser) result.browser.close().catch(() => {});
+      console.log(
+        `[API] instagram_connect:email_verification_required id=${reqId} afterMs=${Date.now() - startedAt}`
+      );
       return res.status(400).json({
         ok: false,
         code: 'two_factor_required_for_connect',
@@ -1406,13 +1441,21 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
       proxyAssignmentId: proxyMeta.proxyAssignmentId,
     });
     await updateSettingsInstagramUsername(clientId, result.username).catch(() => {});
+    console.log(
+      `[API] instagram_connect:success id=${reqId} afterMs=${Date.now() - startedAt} user=${String(
+        result.username || ''
+      )
+        .trim()
+        .replace(/^@/, '')
+        .toLowerCase()}`
+    );
     return res.status(200).json({
       ok: true,
       username: result.username,
       message: 'Connected. Existing Instagram session was restored.',
     });
   } catch (e) {
-    console.error('[API] Instagram connect failed', e);
+    console.error(`[API] instagram_connect:failed id=${reqId} afterMs=${Date.now() - startedAt}`, e);
     if (e.code === 'TWO_FACTOR_REQUIRED') {
       return res.status(200).json({ ok: false, code: 'two_factor_required', message: e.message || 'Enter the 6-digit code from your app or WhatsApp.' });
     }
