@@ -957,14 +957,29 @@ function upsertEnvKey(key, value) {
   fs.writeFileSync(envPath, out.join('\n').replace(/\n+$/g, '\n') + '\n', 'utf8');
 }
 
+function deleteEnvKey(key) {
+  const k = String(key || '').trim();
+  if (!k) return;
+  if (!fs.existsSync(envPath)) return;
+  const existing = fs.readFileSync(envPath, 'utf8');
+  const lines = existing.split('\n');
+  const out = lines.filter((line) => {
+    const m = line.match(/^([^#=]+)=(.*)$/);
+    if (!m) return true;
+    return m[1].trim() !== k;
+  });
+  fs.writeFileSync(envPath, out.join('\n').replace(/\n+$/g, '\n') + '\n', 'utf8');
+}
+
 function writeEnv(obj) {
-  const lines = [];
+  // IMPORTANT: do not overwrite the entire .env. It contains secrets used by the worker
+  // (SUPABASE_URL, service keys, proxy creds, API key), and we only allow editing a safe subset.
   for (const key of ENV_KEYS) {
-    if (obj[key] !== undefined && obj[key] !== '') {
-      lines.push(`${key}=${String(obj[key]).trim()}`);
-    }
+    if (obj[key] === undefined) continue;
+    const v = String(obj[key] ?? '').trim();
+    if (!v) deleteEnvKey(key);
+    else upsertEnvKey(key, v);
   }
-  fs.writeFileSync(envPath, lines.join('\n') + '\n', 'utf8');
 }
 
 app.get('/api/settings', (req, res) => {
@@ -978,10 +993,9 @@ app.post('/api/settings', (req, res) => {
   const env = readEnv();
   const body = req.body || {};
   for (const key of ENV_KEYS) {
-    if (body[key] !== undefined) {
-      if (key === 'INSTAGRAM_PASSWORD' && body[key] === '********') continue;
-      env[key] = body[key];
-    }
+    if (body[key] === undefined) continue;
+    if (key === 'INSTAGRAM_PASSWORD' && body[key] === '********') continue;
+    env[key] = body[key];
   }
   writeEnv(env);
   res.json({ ok: true });
