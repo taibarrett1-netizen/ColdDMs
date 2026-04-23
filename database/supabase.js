@@ -3028,6 +3028,22 @@ async function createScrapeJob(
 ) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  let normalizedLeadGroupId = leadGroupId || null;
+  if (normalizedLeadGroupId) {
+    const { data: leadGroupRow, error: leadGroupErr } = await sb
+      .from('cold_dm_lead_groups')
+      .select('id')
+      .eq('client_id', clientId)
+      .eq('id', normalizedLeadGroupId)
+      .maybeSingle();
+    if (leadGroupErr) throw leadGroupErr;
+    if (!leadGroupRow?.id) {
+      console.warn(
+        `[createScrapeJob] Skipping stale lead_group_id=${normalizedLeadGroupId} for client=${clientId}; scrape job will be queued without a group.`
+      );
+      normalizedLeadGroupId = null;
+    }
+  }
   const payload = {
     client_id: clientId,
     target_username: targetUsername,
@@ -3035,7 +3051,7 @@ async function createScrapeJob(
     scraped_count: 0,
     started_at: new Date().toISOString(),
   };
-  if (leadGroupId) payload.lead_group_id = leadGroupId;
+  if (normalizedLeadGroupId) payload.lead_group_id = normalizedLeadGroupId;
   if (scrapeType) payload.scrape_type = scrapeType;
   if (postUrls && Array.isArray(postUrls) && postUrls.length) payload.post_urls = postUrls;
   if (platformScraperSessionId) payload.platform_scraper_session_id = platformScraperSessionId;
