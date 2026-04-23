@@ -680,9 +680,17 @@ async function getLeadsTotalAndRemaining(clientId) {
   if (!error && data != null) {
     return { total: data.total ?? 0, remaining: data.remaining ?? 0 };
   }
-  const [leads, sentSet] = await Promise.all([getLeads(clientId), getSentUsernames(clientId)]);
-  const remaining = leads.filter((u) => !sentSet.has(u)).length;
-  return { total: leads.length, remaining };
+  const [{ count: totalCount }, { count: sentCount }] = await Promise.all([
+    sb.from('cold_dm_leads').select('*', { count: 'exact', head: true }).eq('client_id', clientId),
+    sb
+      .from('cold_dm_sent_messages')
+      .select('*', { count: 'exact', head: true })
+      .eq('client_id', clientId)
+      .eq('status', 'success'),
+  ]);
+  const total = totalCount ?? 0;
+  const remaining = Math.max(0, total - (sentCount ?? 0));
+  return { total, remaining };
 }
 
 async function getSession(clientId) {
@@ -3591,7 +3599,18 @@ async function heartbeatSendJobLease(jobId, workerId, leaseSeconds = 240, campai
 async function syncSendJobsForCampaign(clientId, campaignId) {
   const sb = getSupabase();
   if (!sb || !clientId || !campaignId) return 0;
-  await addCampaignLeadsFromGroups(clientId, campaignId).catch(() => 0);
+
+  const [{ count: existingCampaignLeadCount }, mappedLeadCount] = await Promise.all([
+    sb
+      .from('cold_dm_campaign_leads')
+      .select('*', { count: 'exact', head: true })
+      .eq('campaign_id', campaignId),
+    getCampaignMappedLeadCount(clientId, campaignId).catch(() => 0),
+  ]);
+  if ((mappedLeadCount ?? 0) > (existingCampaignLeadCount ?? 0)) {
+    await addCampaignLeadsFromGroups(clientId, campaignId).catch(() => 0);
+  }
+
   const { data: campaign } = await sb
     .from('cold_dm_campaigns')
     .select('id, status, timezone, schedule_start_time, schedule_end_time')
@@ -4459,6 +4478,28 @@ async function canClientActivelySendNow(clientId) {
   return false;
 }
 
+async function getCampaignMappedLeadCount(clientId, campaignId) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !campaignId) return 0;
+
+  const { data: leadGroupRows, error: leadGroupErr } = await sb
+    .from('cold_dm_campaign_lead_groups')
+    .select('lead_group_id')
+    .eq('campaign_id', campaignId);
+  if (leadGroupErr) throw leadGroupErr;
+
+  const leadGroupIds = (leadGroupRows || []).map((r) => r.lead_group_id).filter(Boolean);
+  if (leadGroupIds.length === 0) return 0;
+
+  const { count, error: leadCountErr } = await sb
+    .from('cold_dm_leads')
+    .select('*', { count: 'exact', head: true })
+    .eq('client_id', clientId)
+    .in('lead_group_id', leadGroupIds);
+  if (leadCountErr) throw leadCountErr;
+  return count ?? 0;
+}
+
 async function getCampaignsMissingSendDelays(clientId, campaignId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) return [];
@@ -4488,33 +4529,7 @@ async function getCampaignsMissingSendDelays(clientId, campaignId = null) {
     }
 
     if (!shouldBlock) {
-      const { data: leadGroupRows, error: leadGroupErr } = await sb
-        .from('cold_dm_campaign_lead_groups')
-        .select('lead_group_id')
-        .eq('campaign_id', camp.id);
-      if (leadGroupErr) throw leadGroupErr;
-      const leadGroupIds = (leadGroupRows || []).map((r) => r.lead_group_id).filter(Boolean);
-      if (leadGroupIds.length > 0) {
-        const { data: mappedLeads, error: mappedLeadsErr } = await sb
-          .from('cold_dm_leads')
-          .select('username')
-          .eq('client_id', clientId)
-          .in('lead_group_id', leadGroupIds);
-        if (mappedLeadsErr) throw mappedLeadsErr;
-        const usernames = (mappedLeads || [])
-          .map((r) => normalizeUsername(r.username || '').toLowerCase())
-          .filter(Boolean);
-        if (usernames.length > 0) {
-          const { data: sentRows, error: sentErr } = await sb
-            .from('cold_dm_sent_messages')
-            .select('username')
-            .eq('client_id', clientId)
-            .in('username', usernames);
-          if (sentErr) throw sentErr;
-          const sentSet = new Set((sentRows || []).map((r) => normalizeUsername(r.username || '').toLowerCase()));
-          shouldBlock = usernames.some((u) => !sentSet.has(u));
-        }
-      }
+      shouldBlock = (await getCampaignMappedLeadCount(clientId, camp.id)) > 0;
     }
 
     if (shouldBlock) {
@@ -4583,13 +4598,13 @@ async function getMostSpecificNoWorkHint(clientId) {
       return `Campaign "${camp.name || camp.id}" has no lead groups assigned. Select at least one lead group before starting.`;
     }
 
-    const { data: leadRows, error: leadErr } = await sb
+    const { count: mappedLeadCount, error: leadErr } = await sb
       .from('cold_dm_leads')
-      .select('id')
+      .select('*', { count: 'exact', head: true })
       .eq('client_id', clientId)
       .in('lead_group_id', leadGroupIds);
     if (leadErr) throw leadErr;
-    if (!leadRows || leadRows.length === 0) {
+    if ((mappedLeadCount ?? 0) === 0) {
       return `Campaign "${camp.name || camp.id}" has no leads in the selected lead groups. Add leads to those groups before starting.`;
     }
   }
@@ -5165,32 +5180,8 @@ async function reactivateCampaignsWithPendingLeads(clientId, campaignId = null) 
       .eq('status', 'pending');
     let shouldActivate = (pendingCount ?? 0) > 0;
     if (!shouldActivate) {
-      // Fallback: some flows show leads as pending in UI before campaign_leads rows are materialized.
-      // If campaign has mapped lead groups with leads, activate so worker can materialize pending rows.
-      const { data: leadGroupRows } = await sb
-        .from('cold_dm_campaign_lead_groups')
-        .select('lead_group_id')
-        .eq('campaign_id', camp.id);
-      const leadGroupIds = (leadGroupRows || []).map((r) => r.lead_group_id).filter(Boolean);
-      if (leadGroupIds.length > 0) {
-        const { data: mappedLeads } = await sb
-          .from('cold_dm_leads')
-          .select('username')
-          .eq('client_id', clientId)
-          .in('lead_group_id', leadGroupIds);
-        const usernames = (mappedLeads || [])
-          .map((r) => normalizeUsername(r.username || '').toLowerCase())
-          .filter(Boolean);
-        if (usernames.length > 0) {
-          const { data: sentRows } = await sb
-            .from('cold_dm_sent_messages')
-            .select('username')
-            .eq('client_id', clientId)
-            .in('username', usernames);
-          const sentSet = new Set((sentRows || []).map((r) => normalizeUsername(r.username || '').toLowerCase()));
-          shouldActivate = usernames.some((u) => !sentSet.has(u));
-        }
-      }
+      // If campaign_leads have not been materialized yet, mapped group membership is enough to reactivate.
+      shouldActivate = (await getCampaignMappedLeadCount(clientId, camp.id)) > 0;
     }
     if (!shouldActivate) continue;
     const { error } = await sb
