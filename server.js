@@ -118,6 +118,12 @@ function getPuppeteerDepsInstallCommand() {
   return `apt-get update && apt-get install -y ${PUPPETEER_APT_PACKAGES.join(' ')}`;
 }
 
+function shQuote(s) {
+  // Minimal single-quote escaping for embedding values into a `bash -lc` string.
+  // Example: abc'd -> 'abc'\''d'
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
 function envCheckSnapshot(req) {
   const auth = req.headers.authorization;
   const bearer = typeof auth === 'string' ? auth.replace(/^Bearer\s+/i, '').trim() : '';
@@ -382,7 +388,6 @@ app.post('/api/admin/update', (req, res) => {
     .trim() || 'main';
   const updateId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString('hex');
   const updateLogPath = `/tmp/cold-dm-update-${updateId}.log`;
-  const cmd = `cd ${projectRoot} && git pull origin ${branch} && npm install && pm2 restart all --update-env && (pm2 start ecosystem.config.cjs --update-env 2>/dev/null || true) && pm2 save`;
 
   logger.log(`[admin:update] accepted updateId=${updateId} branch=${branch}`);
   res.json({
@@ -396,7 +401,28 @@ app.post('/api/admin/update', (req, res) => {
   });
 
   setTimeout(() => {
-    const runner = `set -euo pipefail; (${cmd}) > ${updateLogPath} 2>&1`;
+    // IMPORTANT: avoid `pm2 restart all` from inside the dashboard process.
+    // When PM2 restarts `ig-dm-dashboard`, it can kill this background runner (process-tree kill),
+    // which leads to partial updates where `ig-dm-send` never restarts.
+    //
+    // Fix: restart workers first, `pm2 save`, then restart the dashboard last.
+    const script = [
+      'set -euo pipefail',
+      `cd ${shQuote(projectRoot)}`,
+      `echo "[admin:update] start updateId=${updateId} branch=${branch} at=$(date -Is)"`,
+      `git pull origin ${shQuote(branch)}`,
+      'npm install',
+      // Best-effort: load ecosystem if missing (no-op if already started).
+      '(pm2 start ecosystem.config.cjs --update-env >/dev/null 2>&1 || true)',
+      // Restart workers first so even if the dashboard restart kills this runner, workers are already bounced.
+      '(pm2 restart ig-dm-send --update-env || pm2 start ecosystem.config.cjs --only ig-dm-send --update-env)',
+      '(pm2 restart ig-dm-scrape --update-env || pm2 start ecosystem.config.cjs --only ig-dm-scrape --update-env)',
+      // Save before restarting the dashboard (the command below may kill this runner).
+      '(pm2 save || true)',
+      '(pm2 restart ig-dm-dashboard --update-env || pm2 start ecosystem.config.cjs --only ig-dm-dashboard --update-env)',
+      'echo "[admin:update] done at=$(date -Is)"',
+    ].join('\n');
+    const runner = `(${script}) > ${shQuote(updateLogPath)} 2>&1`;
     try {
       const child = spawn('bash', ['-lc', runner], {
         cwd: projectRoot,
