@@ -1854,7 +1854,7 @@ app.post('/api/control/start', async (req, res) => {
       console.error('[API] reactivateCampaignsWithPendingLeads', e);
     }
     await setControlSupabase(clientId, 0).catch((e) => console.error('[API] setControlSupabase', e));
-    await syncSendJobsForClient(clientId, campaignId || null).catch((e) => {
+    await syncSendJobsForClient(clientId, campaignId || null, { force: true }).catch((e) => {
       console.error(
         '[API] syncSendJobsForClient',
         JSON.stringify({
@@ -1960,7 +1960,7 @@ app.post('/api/campaigns/add-leads-from-groups', async (req, res) => {
   }
   try {
     const added = await addCampaignLeadsFromGroups(clientId, campaignId);
-    const queued = await syncSendJobsForClient(clientId, campaignId).catch(() => 0);
+    const queued = await syncSendJobsForClient(clientId, campaignId, { force: true }).catch(() => 0);
     return res.json({ ok: true, added, queued_send_jobs: queued });
   } catch (e) {
     console.error('[API] add-leads-from-groups', e);

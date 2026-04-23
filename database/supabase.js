@@ -29,6 +29,15 @@ const COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS = Math.max(
   0,
   parseInt(process.env.COLD_DM_MIN_DELAY_WINDOW_GAP_SECONDS || '10', 10) || 10
 );
+const SEND_JOB_SYNC_COOLDOWN_MS = Math.max(
+  1000,
+  parseInt(process.env.SEND_JOB_SYNC_COOLDOWN_MS || '15000', 10) || 15000
+);
+const SEND_JOB_SYNC_BATCH_SIZE = Math.max(
+  25,
+  Math.min(500, parseInt(process.env.SEND_JOB_SYNC_BATCH_SIZE || '250', 10) || 250)
+);
+const sendJobSyncStateByKey = new Map();
 
 function noWorkDebugEnabled() {
   return process.env.NO_WORK_DEBUG === '1' || process.env.NO_WORK_DEBUG === 'true';
@@ -91,6 +100,44 @@ function logColdDmConcurrencyDebug(message, details = null) {
   } catch {
     console.log(prefix + message);
   }
+}
+
+function getSendJobSyncKey(clientId, campaignId) {
+  return `${clientId || '__null__'}:${campaignId || '__all__'}`;
+}
+
+async function runWithSendJobSyncCooldown(clientId, campaignId, force, work) {
+  const key = getSendJobSyncKey(clientId, campaignId);
+  const now = Date.now();
+  let entry = sendJobSyncStateByKey.get(key);
+  if (!entry) {
+    entry = { updatedAt: 0, lastResult: 0, inFlight: null };
+    sendJobSyncStateByKey.set(key, entry);
+  }
+
+  if (!force) {
+    if (entry.inFlight) return entry.inFlight;
+    if (now - entry.updatedAt < SEND_JOB_SYNC_COOLDOWN_MS) {
+      return entry.lastResult || 0;
+    }
+  }
+
+  entry.inFlight = Promise.resolve()
+    .then(work)
+    .then((result) => {
+      entry.lastResult = Number(result) || 0;
+      entry.updatedAt = Date.now();
+      return entry.lastResult;
+    })
+    .catch((err) => {
+      entry.updatedAt = Date.now();
+      throw err;
+    })
+    .finally(() => {
+      entry.inFlight = null;
+    });
+
+  return entry.inFlight;
 }
 
 async function withTimeout(promise, timeoutMs, timeoutMessage) {
@@ -3604,282 +3651,299 @@ async function heartbeatSendJobLease(jobId, workerId, leaseSeconds = 240, campai
   return ok;
 }
 
-async function syncSendJobsForCampaign(clientId, campaignId) {
+async function syncSendJobsForCampaign(clientId, campaignId, options = {}) {
   const sb = getSupabase();
   if (!sb || !clientId || !campaignId) return 0;
+  const force = options && options.force === true;
 
-  const [{ count: existingCampaignLeadCount }, mappedLeadCount] = await Promise.all([
-    sb
-      .from('cold_dm_campaign_leads')
-      .select('*', { count: 'exact', head: true })
-      .eq('campaign_id', campaignId),
-    getCampaignMappedLeadCount(clientId, campaignId).catch(() => 0),
-  ]);
-  if ((mappedLeadCount ?? 0) > (existingCampaignLeadCount ?? 0)) {
-    await addCampaignLeadsFromGroups(clientId, campaignId).catch(() => 0);
-  }
+  return runWithSendJobSyncCooldown(clientId, campaignId, force, async () => {
+    const [{ count: existingCampaignLeadCount }, mappedLeadCount] = await Promise.all([
+      sb
+        .from('cold_dm_campaign_leads')
+        .select('*', { count: 'exact', head: true })
+        .eq('campaign_id', campaignId),
+      getCampaignMappedLeadCount(clientId, campaignId).catch(() => 0),
+    ]);
+    if ((mappedLeadCount ?? 0) > (existingCampaignLeadCount ?? 0)) {
+      await addCampaignLeadsFromGroups(clientId, campaignId).catch(() => 0);
+    }
 
-  const { data: campaign } = await sb
-    .from('cold_dm_campaigns')
-    .select('id, status, timezone, schedule_start_time, schedule_end_time')
-    .eq('client_id', clientId)
-    .eq('id', campaignId)
-    .maybeSingle();
-  if (!campaign) return 0;
-  if (campaign.status !== 'active') {
-    const { data: inactiveJobs, error: inactiveJobsErr } = await sb
-      .from('cold_dm_send_jobs')
-      .select('id')
+    const { data: campaign } = await sb
+      .from('cold_dm_campaigns')
+      .select('id, status, timezone, schedule_start_time, schedule_end_time')
       .eq('client_id', clientId)
+      .eq('id', campaignId)
+      .maybeSingle();
+    if (!campaign) return 0;
+    if (campaign.status !== 'active') {
+      const { data: inactiveJobs, error: inactiveJobsErr } = await sb
+        .from('cold_dm_send_jobs')
+        .select('id')
+        .eq('client_id', clientId)
+        .eq('campaign_id', campaignId)
+        .in('status', ['pending', 'retry', 'running']);
+      if (inactiveJobsErr) throw inactiveJobsErr;
+      const queuedJobIds = (inactiveJobs || []).map((row) => row.id).filter(Boolean);
+      if (queuedJobIds.length > 0) {
+        for (let i = 0; i < queuedJobIds.length; i += 200) {
+          const batch = queuedJobIds.slice(i, i + 200);
+          await sb.from('cold_dm_send_jobs').delete().in('id', batch);
+        }
+        console.log(
+          `[syncSendJobsForCampaign] removed ${queuedJobIds.length} queued job(s) for non-active campaign ${campaignId} (${campaign.status})`
+        );
+      }
+      return 0;
+    }
+
+    const { data: leadRows, error: leadErr } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('id, lead_id, status')
       .eq('campaign_id', campaignId)
-      .in('status', ['pending', 'retry', 'running']);
-    if (inactiveJobsErr) throw inactiveJobsErr;
-    const queuedJobIds = (inactiveJobs || []).map((row) => row.id).filter(Boolean);
-    if (queuedJobIds.length > 0) {
-      for (let i = 0; i < queuedJobIds.length; i += 200) {
-        const batch = queuedJobIds.slice(i, i + 200);
+      .eq('status', 'pending');
+    if (leadErr) throw leadErr;
+    if (!leadRows?.length) return 0;
+
+    const leadIds = leadRows.map((r) => r.lead_id).filter(Boolean);
+    if (leadIds.length === 0) return 0;
+    // Chunk large IN filters to avoid PostgREST "Bad Request" on long query strings.
+    const leads = [];
+    // Keep URL/query length below PostgREST header/url limits when using .in('id', [...uuid]).
+    // UUID filters can overflow around a few hundred ids depending on URL/base headers.
+    const leadChunkSize = Math.max(
+      20,
+      Math.min(120, parseInt(process.env.SEND_SYNC_LEAD_ID_CHUNK || '80', 10) || 80)
+    );
+    for (let i = 0; i < leadIds.length; i += leadChunkSize) {
+      const chunk = leadIds.slice(i, i + leadChunkSize);
+      const { data: part, error: leadsErr } = await sb
+        .from('cold_dm_leads')
+        .select('id, username')
+        .eq('client_id', clientId)
+        .in('id', chunk);
+      if (leadsErr) {
+        const wrapped = new Error(`[syncSendJobsForCampaign:load_leads_chunk] ${leadsErr.message || leadsErr}`);
+        wrapped.code = leadsErr.code || null;
+        wrapped.details = leadsErr.details || null;
+        wrapped.hint = leadsErr.hint || null;
+        throw wrapped;
+      }
+      if (part?.length) leads.push(...part);
+    }
+    const usernameByLeadId = new Map((leads || []).map((r) => [r.id, r.username]));
+
+    let existingJobs = [];
+    const { data: existingWithLease, error: existingErr } = await sb
+      .from('cold_dm_send_jobs')
+      .select('id, campaign_lead_id, status, last_error_class, leased_until, lease_heartbeat_at, available_at')
+      .eq('client_id', clientId)
+      .eq('campaign_id', campaignId);
+    if (!existingErr) {
+      existingJobs = existingWithLease || [];
+    } else if (
+      isMissingStandardLeaseColumnsError(existingErr) ||
+      String(existingErr.message || '').toLowerCase() === 'bad request'
+    ) {
+      // Backward compatibility if lease columns are missing in this DB.
+      const { data: existingLegacy, error: legacyErr } = await sb
+        .from('cold_dm_send_jobs')
+        .select('id, campaign_lead_id, status, last_error_class, available_at')
+        .eq('client_id', clientId)
+        .eq('campaign_id', campaignId);
+      if (legacyErr) throw legacyErr;
+      existingJobs = existingLegacy || [];
+    } else {
+      throw existingErr;
+    }
+
+    const { data: campaignLeadIdRows, error: campaignLeadIdsErr } = await sb
+      .from('cold_dm_campaign_leads')
+      .select('id')
+      .eq('campaign_id', campaignId);
+    if (campaignLeadIdsErr) throw campaignLeadIdsErr;
+    const validCampaignLeadIds = new Set((campaignLeadIdRows || []).map((r) => r.id).filter(Boolean));
+    const deadJobIds = [];
+    for (const j of existingJobs || []) {
+      if (!['pending', 'retry', 'running'].includes(j.status)) continue;
+      if (!j.campaign_lead_id || !validCampaignLeadIds.has(j.campaign_lead_id)) deadJobIds.push(j.id);
+    }
+    if (deadJobIds.length > 0) {
+      for (let i = 0; i < deadJobIds.length; i += 200) {
+        const batch = deadJobIds.slice(i, i + 200);
         await sb.from('cold_dm_send_jobs').delete().in('id', batch);
       }
       console.log(
-        `[syncSendJobsForCampaign] removed ${queuedJobIds.length} queued job(s) for non-active campaign ${campaignId} (${campaign.status})`
+        `[syncSendJobsForCampaign] removed ${deadJobIds.length} orphan/unresolvable send job(s) for campaign ${campaignId} (null campaign_lead_id or deleted campaign_lead)`
       );
+      existingJobs = (existingJobs || []).filter((j) => !deadJobIds.includes(j.id));
     }
-    return 0;
-  }
 
-  const { data: leadRows, error: leadErr } = await sb
-    .from('cold_dm_campaign_leads')
-    .select('id, lead_id, status')
-    .eq('campaign_id', campaignId)
-    .eq('status', 'pending');
-  if (leadErr) throw leadErr;
-  if (!leadRows?.length) return 0;
-
-  const leadIds = leadRows.map((r) => r.lead_id).filter(Boolean);
-  if (leadIds.length === 0) return 0;
-  // Chunk large IN filters to avoid PostgREST "Bad Request" on long query strings.
-  const leads = [];
-  // Keep URL/query length below PostgREST header/url limits when using .in('id', [...uuid]).
-  // UUID filters can overflow around a few hundred ids depending on URL/base headers.
-  const leadChunkSize = Math.max(
-    20,
-    Math.min(120, parseInt(process.env.SEND_SYNC_LEAD_ID_CHUNK || '80', 10) || 80)
-  );
-  for (let i = 0; i < leadIds.length; i += leadChunkSize) {
-    const chunk = leadIds.slice(i, i + leadChunkSize);
-    const { data: part, error: leadsErr } = await sb
-      .from('cold_dm_leads')
-      .select('id, username')
-      .eq('client_id', clientId)
-      .in('id', chunk);
-    if (leadsErr) {
-      const wrapped = new Error(`[syncSendJobsForCampaign:load_leads_chunk] ${leadsErr.message || leadsErr}`);
-      wrapped.code = leadsErr.code || null;
-      wrapped.details = leadsErr.details || null;
-      wrapped.hint = leadsErr.hint || null;
-      throw wrapped;
-    }
-    if (part?.length) leads.push(...part);
-  }
-  const usernameByLeadId = new Map((leads || []).map((r) => [r.id, r.username]));
-
-  let existingJobs = [];
-  const { data: existingWithLease, error: existingErr } = await sb
-    .from('cold_dm_send_jobs')
-    .select('id, campaign_lead_id, status, last_error_class, leased_until, lease_heartbeat_at, available_at')
-    .eq('client_id', clientId)
-    .eq('campaign_id', campaignId);
-  if (!existingErr) {
-    existingJobs = existingWithLease || [];
-  } else if (isMissingStandardLeaseColumnsError(existingErr) || String(existingErr.message || '').toLowerCase() === 'bad request') {
-    // Backward compatibility if lease columns are missing in this DB.
-    const { data: existingLegacy, error: legacyErr } = await sb
-      .from('cold_dm_send_jobs')
-      .select('id, campaign_lead_id, status, last_error_class, available_at')
-      .eq('client_id', clientId)
-      .eq('campaign_id', campaignId);
-    if (legacyErr) throw legacyErr;
-    existingJobs = existingLegacy || [];
-  } else {
-    throw existingErr;
-  }
-
-  const { data: campaignLeadIdRows, error: campaignLeadIdsErr } = await sb
-    .from('cold_dm_campaign_leads')
-    .select('id')
-    .eq('campaign_id', campaignId);
-  if (campaignLeadIdsErr) throw campaignLeadIdsErr;
-  const validCampaignLeadIds = new Set((campaignLeadIdRows || []).map((r) => r.id).filter(Boolean));
-  const deadJobIds = [];
-  for (const j of existingJobs || []) {
-    if (!['pending', 'retry', 'running'].includes(j.status)) continue;
-    if (!j.campaign_lead_id || !validCampaignLeadIds.has(j.campaign_lead_id)) deadJobIds.push(j.id);
-  }
-  if (deadJobIds.length > 0) {
-    for (let i = 0; i < deadJobIds.length; i += 200) {
-      const batch = deadJobIds.slice(i, i + 200);
-      await sb.from('cold_dm_send_jobs').delete().in('id', batch);
-    }
-    console.log(
-      `[syncSendJobsForCampaign] removed ${deadJobIds.length} orphan/unresolvable send job(s) for campaign ${campaignId} (null campaign_lead_id or deleted campaign_lead)`
-    );
-    existingJobs = (existingJobs || []).filter((j) => !deadJobIds.includes(j.id));
-  }
-
-  const activeLeadIds = new Set();
-  const staleJobIds = [];
-  const staleRunningJobIds = [];
-  const nowMs = Date.now();
-  const staleRunningHeartbeatMs =
-    Math.max(45, parseInt(process.env.SEND_JOB_RUNNING_STALE_SEC || '180', 10) || 180) * 1000;
-  const scheduleTz = campaign.timezone ?? null;
-  const nextAvailableAt = isWithinSchedule(campaign.schedule_start_time, campaign.schedule_end_time, scheduleTz)
-    ? new Date().toISOString()
-    : (getNextScheduleStartInTimezone(campaign.schedule_start_time, scheduleTz)?.toISOString() ?? new Date(Date.now() + 15 * 60 * 1000).toISOString());
-  for (const j of existingJobs || []) {
-    if (!j.campaign_lead_id) continue;
-    if (j.status === 'running') {
-      const leaseUntilMs = j.leased_until ? Date.parse(j.leased_until) : NaN;
-      const hbMs = j.lease_heartbeat_at ? Date.parse(j.lease_heartbeat_at) : NaN;
-      const leaseExpired = Number.isFinite(leaseUntilMs) ? leaseUntilMs <= nowMs : true;
-      const heartbeatStale = Number.isFinite(hbMs) ? hbMs < nowMs - staleRunningHeartbeatMs : true;
-      if (leaseExpired || heartbeatStale) {
-        staleRunningJobIds.push(j.id);
-        continue;
+    const activeLeadIds = new Set();
+    const staleJobIds = [];
+    const staleRunningJobIds = [];
+    const nowMs = Date.now();
+    const staleRunningHeartbeatMs =
+      Math.max(45, parseInt(process.env.SEND_JOB_RUNNING_STALE_SEC || '180', 10) || 180) * 1000;
+    const scheduleTz = campaign.timezone ?? null;
+    const nextAvailableAt = isWithinSchedule(campaign.schedule_start_time, campaign.schedule_end_time, scheduleTz)
+      ? new Date().toISOString()
+      : (getNextScheduleStartInTimezone(campaign.schedule_start_time, scheduleTz)?.toISOString() ??
+          new Date(Date.now() + 15 * 60 * 1000).toISOString());
+    for (const j of existingJobs || []) {
+      if (!j.campaign_lead_id) continue;
+      if (j.status === 'running') {
+        const leaseUntilMs = j.leased_until ? Date.parse(j.leased_until) : NaN;
+        const hbMs = j.lease_heartbeat_at ? Date.parse(j.lease_heartbeat_at) : NaN;
+        const leaseExpired = Number.isFinite(leaseUntilMs) ? leaseUntilMs <= nowMs : true;
+        const heartbeatStale = Number.isFinite(hbMs) ? hbMs < nowMs - staleRunningHeartbeatMs : true;
+        if (leaseExpired || heartbeatStale) {
+          staleRunningJobIds.push(j.id);
+          continue;
+        }
+      }
+      if (['pending', 'running', 'retry'].includes(j.status)) {
+        activeLeadIds.add(j.campaign_lead_id);
+      } else {
+        staleJobIds.push(j.id);
       }
     }
-    if (['pending', 'running', 'retry'].includes(j.status)) {
-      activeLeadIds.add(j.campaign_lead_id);
-    } else {
-      staleJobIds.push(j.id);
-    }
-  }
 
-  if (staleRunningJobIds.length > 0) {
-    const nowIso = new Date().toISOString();
-    const fullReset = await sb
-      .from('cold_dm_send_jobs')
-      .update({
-        status: 'retry',
-        available_at: nowIso,
-        leased_until: null,
-        leased_by_worker: null,
-        lease_heartbeat_at: nowIso,
-        last_error_class: 'stale_running_requeued',
-        last_error_message: 'stale_running_requeued',
-        updated_at: nowIso,
-      })
-      .in('id', staleRunningJobIds);
-    if (fullReset?.error && isMissingStandardLeaseColumnsError(fullReset.error)) {
-      await sb
+    if (staleRunningJobIds.length > 0) {
+      const nowIso = new Date().toISOString();
+      const fullReset = await sb
         .from('cold_dm_send_jobs')
         .update({
           status: 'retry',
           available_at: nowIso,
+          leased_until: null,
+          leased_by_worker: null,
+          lease_heartbeat_at: nowIso,
           last_error_class: 'stale_running_requeued',
           last_error_message: 'stale_running_requeued',
           updated_at: nowIso,
         })
         .in('id', staleRunningJobIds);
+      if (fullReset?.error && isMissingStandardLeaseColumnsError(fullReset.error)) {
+        await sb
+          .from('cold_dm_send_jobs')
+          .update({
+            status: 'retry',
+            available_at: nowIso,
+            last_error_class: 'stale_running_requeued',
+            last_error_message: 'stale_running_requeued',
+            updated_at: nowIso,
+          })
+          .in('id', staleRunningJobIds);
+      }
+      console.log(
+        `[syncSendJobsForCampaign] requeued ${staleRunningJobIds.length} stale running send job(s) for campaign ${campaignId}`
+      );
     }
-    console.log(
-      `[syncSendJobsForCampaign] requeued ${staleRunningJobIds.length} stale running send job(s) for campaign ${campaignId}`
-    );
-  }
 
-  if (staleJobIds.length > 0) {
-    for (let i = 0; i < staleJobIds.length; i += 200) {
-      const batch = staleJobIds.slice(i, i + 200);
-      await sb.from('cold_dm_send_jobs').delete().in('id', batch);
+    if (staleJobIds.length > 0) {
+      for (let i = 0; i < staleJobIds.length; i += 200) {
+        const batch = staleJobIds.slice(i, i + 200);
+        await sb.from('cold_dm_send_jobs').delete().in('id', batch);
+      }
+      console.log(`[syncSendJobsForCampaign] cleaned ${staleJobIds.length} stale send job(s) for campaign ${campaignId}`);
     }
-    console.log(`[syncSendJobsForCampaign] cleaned ${staleJobIds.length} stale send job(s) for campaign ${campaignId}`);
-  }
 
-  const requeueableJobIds = (existingJobs || [])
-    .filter((j) => {
-      if (j.status !== 'retry' || j.last_error_class !== 'outside_schedule') return false;
-      const currentAvailableAtMs = j.available_at ? Date.parse(j.available_at) : NaN;
-      const nextAvailableAtMs = Date.parse(nextAvailableAt);
-      if (!Number.isFinite(nextAvailableAtMs)) return true;
-      if (!Number.isFinite(currentAvailableAtMs)) return true;
-      return Math.abs(currentAvailableAtMs - nextAvailableAtMs) > 1000;
-    })
-    .map((j) => j.id)
-    .filter(Boolean);
-  if (requeueableJobIds.length > 0) {
-    await sb
-      .from('cold_dm_send_jobs')
-      .update({
-        available_at: nextAvailableAt,
-        updated_at: new Date().toISOString(),
+    const requeueableJobIds = (existingJobs || [])
+      .filter((j) => {
+        if (j.status !== 'retry' || j.last_error_class !== 'outside_schedule') return false;
+        const currentAvailableAtMs = j.available_at ? Date.parse(j.available_at) : NaN;
+        const nextAvailableAtMs = Date.parse(nextAvailableAt);
+        if (!Number.isFinite(nextAvailableAtMs)) return true;
+        if (!Number.isFinite(currentAvailableAtMs)) return true;
+        return Math.abs(currentAvailableAtMs - nextAvailableAtMs) > 1000;
       })
-      .in('id', requeueableJobIds);
-    console.log(
-      `[syncSendJobsForCampaign] rescheduled ${requeueableJobIds.length} outside_schedule job(s) for campaign ${campaignId} to ${nextAvailableAt}`
-    );
-  }
+      .map((j) => j.id)
+      .filter(Boolean);
+    if (requeueableJobIds.length > 0) {
+      await sb
+        .from('cold_dm_send_jobs')
+        .update({
+          available_at: nextAvailableAt,
+          updated_at: new Date().toISOString(),
+        })
+        .in('id', requeueableJobIds);
+      console.log(
+        `[syncSendJobsForCampaign] rescheduled ${requeueableJobIds.length} outside_schedule job(s) for campaign ${campaignId} to ${nextAvailableAt}`
+      );
+    }
 
-  const rows = [];
-  for (const row of leadRows) {
-    if (!row?.id || activeLeadIds.has(row.id)) continue;
-    const username = usernameByLeadId.get(row.lead_id);
-    if (!username) continue;
-    rows.push({
-      client_id: clientId,
-      campaign_id: campaignId,
-      campaign_lead_id: row.id,
-      username: normalizeUsername(username),
-      payload: {},
-      status: 'pending',
-      priority: 100,
-      available_at: new Date().toISOString(),
-      idempotency_key: `campaign-lead:${row.id}`,
-    });
-  }
-  if (rows.length === 0) return 0;
-  let inserted = 0;
-  // Insert rows individually so we don't depend on a specific conflict-target shape in older databases.
-  // The deterministic idempotency_key still protects us from duplicates at the row level.
-  for (const row of rows) {
-    const r = await sb.from('cold_dm_send_jobs').insert(row);
-    if (!r.error) {
-      inserted += 1;
-      continue;
+    const rows = [];
+    for (const row of leadRows) {
+      if (!row?.id || activeLeadIds.has(row.id)) continue;
+      const username = usernameByLeadId.get(row.lead_id);
+      if (!username) continue;
+      rows.push({
+        client_id: clientId,
+        campaign_id: campaignId,
+        campaign_lead_id: row.id,
+        username: normalizeUsername(username),
+        payload: {},
+        status: 'pending',
+        priority: 100,
+        available_at: new Date().toISOString(),
+        idempotency_key: `campaign-lead:${row.id}`,
+      });
     }
-    const msg = String(r.error?.message || '').toLowerCase();
-    const duplicate = r.error?.code === '23505' || msg.includes('duplicate key');
-    if (duplicate) continue;
-    // Older schema fallback: minimal row shape (omit payload/priority/idempotency_key).
-    const minimal = {
-      client_id: row.client_id,
-      campaign_id: row.campaign_id,
-      campaign_lead_id: row.campaign_lead_id,
-      username: row.username,
-      status: 'pending',
-      available_at: row.available_at,
-    };
-    const r2 = await sb.from('cold_dm_send_jobs').insert(minimal);
-    if (!r2.error) {
-      inserted += 1;
-      continue;
+    if (rows.length === 0) return 0;
+    let inserted = 0;
+    // Prefer batched upserts to avoid one network round-trip per lead on large campaigns.
+    for (let i = 0; i < rows.length; i += SEND_JOB_SYNC_BATCH_SIZE) {
+      const batch = rows.slice(i, i + SEND_JOB_SYNC_BATCH_SIZE);
+      const batched = await sb
+        .from('cold_dm_send_jobs')
+        .upsert(batch, { onConflict: 'client_id,idempotency_key', ignoreDuplicates: true });
+      if (!batched.error) {
+        inserted += batch.length;
+        continue;
+      }
+
+      // Older schema fallback: insert rows individually and gracefully ignore duplicates.
+      for (const row of batch) {
+        const r = await sb.from('cold_dm_send_jobs').insert(row);
+        if (!r.error) {
+          inserted += 1;
+          continue;
+        }
+        const msg = String(r.error?.message || '').toLowerCase();
+        const duplicate = r.error?.code === '23505' || msg.includes('duplicate key');
+        if (duplicate) continue;
+        const minimal = {
+          client_id: row.client_id,
+          campaign_id: row.campaign_id,
+          campaign_lead_id: row.campaign_lead_id,
+          username: row.username,
+          status: 'pending',
+          available_at: row.available_at,
+        };
+        const r2 = await sb.from('cold_dm_send_jobs').insert(minimal);
+        if (!r2.error) {
+          inserted += 1;
+          continue;
+        }
+        const msg2 = String(r2.error?.message || '').toLowerCase();
+        const duplicate2 = r2.error?.code === '23505' || msg2.includes('duplicate key');
+        if (duplicate2) continue;
+        throw r2.error;
+      }
     }
-    const msg2 = String(r2.error?.message || '').toLowerCase();
-    const duplicate2 = r2.error?.code === '23505' || msg2.includes('duplicate key');
-    if (duplicate2) continue;
-    throw r2.error;
-  }
-  console.log(`[syncSendJobsForCampaign] created ${inserted} send job(s) for campaign ${campaignId}`);
-  return inserted;
+    console.log(`[syncSendJobsForCampaign] created ${inserted} send job(s) for campaign ${campaignId}`);
+    return inserted;
+  });
 }
 
-async function syncSendJobsForClient(clientId, campaignId = null) {
+async function syncSendJobsForClient(clientId, campaignId = null, options = {}) {
   const sb = getSupabase();
   if (!sb || !clientId) return 0;
-  if (campaignId) return syncSendJobsForCampaign(clientId, campaignId);
+  if (campaignId) return syncSendJobsForCampaign(clientId, campaignId, options);
   const campaigns = await getActiveCampaigns(clientId);
   let total = 0;
   for (const campaign of campaigns) {
-    total += await syncSendJobsForCampaign(clientId, campaign.id).catch((e) => {
+    total += await syncSendJobsForCampaign(clientId, campaign.id, options).catch((e) => {
       console.error(
         '[syncSendJobsForClient] campaign sync failed',
         JSON.stringify({
