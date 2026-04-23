@@ -228,14 +228,15 @@ async function pressModifiedEnter(page, useShift = false) {
 
 async function typeTextNaturally(page, text, opts = {}) {
   const value = String(text ?? '');
+  const chars = Array.from(value);
   const correctionChance = opts.correctionChance ?? 0.035;
   const pauseChance = opts.pauseChance ?? 0.11;
   const minKeyDelay = opts.minKeyDelay ?? 35;
   const maxKeyDelay = opts.maxKeyDelay ?? 135;
   const shiftEnterNewlines = opts.shiftEnterNewlines !== false;
 
-  for (let i = 0; i < value.length; i++) {
-    const ch = value[i];
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i];
     if (ch === '\n') {
       await pressModifiedEnter(page, shiftEnterNewlines);
       await delay(randomInt(60, 180));
@@ -245,8 +246,8 @@ async function typeTextNaturally(page, text, opts = {}) {
     const shouldCorrect =
       /[a-z]/i.test(ch) &&
       i > 1 &&
-      i < value.length - 1 &&
-      !/\s/.test(value[i - 1] || '') &&
+      i < chars.length - 1 &&
+      !/\s/.test(chars[i - 1] || '') &&
       chance(correctionChance);
     if (shouldCorrect) {
       const typo = typoForCharacter(ch);
