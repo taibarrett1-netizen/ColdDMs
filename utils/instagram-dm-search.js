@@ -130,6 +130,59 @@ async function clickInstagramDmSearchResult(page, username) {
       }
     }
 
+    function rectOf(el) {
+      try {
+        return el.getBoundingClientRect();
+      } catch {
+        return null;
+      }
+    }
+
+    function centerX(el) {
+      const r = rectOf(el);
+      return r ? r.left + r.width / 2 : Number.POSITIVE_INFINITY;
+    }
+
+    function findSearchInputRect() {
+      const inputs = Array.from(document.querySelectorAll('input, textarea, [contenteditable="true"]')).filter(visible);
+      const picked = inputs.find((el) => {
+        const txt = combinedMatchText(el);
+        return txt.includes('search') || txt.includes('to:');
+      }) || inputs[0] || null;
+      return picked ? rectOf(picked) : null;
+    }
+
+    const searchInputRect = findSearchInputRect();
+
+    function inLikelySearchResultsArea(el) {
+      const r = rectOf(el);
+      if (!r) return false;
+      if (!visible(el)) return false;
+      if (searchInputRect) {
+        const paneRight = Math.max(searchInputRect.right + 80, window.innerWidth * 0.4);
+        return r.top >= searchInputRect.bottom - 12 && centerX(el) <= paneRight;
+      }
+      return centerX(el) <= window.innerWidth * 0.45;
+    }
+
+    function clickableRowTarget(el) {
+      if (!el) return null;
+      let best = null;
+      let n = el;
+      for (let i = 0; i < 8 && n; i++) {
+        const r = rectOf(n);
+        if (r && visible(n) && r.width >= 120 && r.height >= 24 && r.height <= 180 && inLikelySearchResultsArea(n)) {
+          best = n;
+          const role = (n.getAttribute && n.getAttribute('role')) || '';
+          if (role === 'button' || role === 'option' || n.tagName === 'A' || n.tagName === 'BUTTON' || n.tagName === 'LI') {
+            return n;
+          }
+        }
+        n = n.parentElement;
+      }
+      return best || el;
+    }
+
     function inSearchUiShell(el) {
       let n = el;
       for (let i = 0; i < 20 && n; i++) {
@@ -199,6 +252,30 @@ async function clickInstagramDmSearchResult(page, username) {
       return out;
     }
 
+    function collectTextMatchCandidates() {
+      const selectors = ['div', 'a', 'span', 'li'];
+      const seen = new Set();
+      const out = [];
+      for (const sel of selectors) {
+        let nodes;
+        try {
+          nodes = document.querySelectorAll(sel);
+        } catch {
+          continue;
+        }
+        for (let i = 0; i < nodes.length; i++) {
+          const el = nodes[i];
+          if (!el || seen.has(el)) continue;
+          if (!visible(el)) continue;
+          if (!inLikelySearchResultsArea(el)) continue;
+          if (!rowLooksLikeSearchHit(el)) continue;
+          seen.add(el);
+          out.push(clickableRowTarget(el));
+        }
+      }
+      return out.filter(Boolean);
+    }
+
     function sortByMoreAccounts(arr) {
       return [...arr].sort((a, b) => {
         const ay = rowCenterY(a);
@@ -236,7 +313,7 @@ async function clickInstagramDmSearchResult(page, username) {
       return { ok: true, detail: 'global_profile_href', displayName: displayName || null };
     }
 
-    const candidates = collectCandidates();
+    const candidates = collectCandidates().concat(collectTextMatchCandidates());
     const sorted = sortByMoreAccounts(candidates);
 
     const byHref = sorted.find((el) => {
@@ -258,7 +335,7 @@ async function clickInstagramDmSearchResult(page, username) {
     const byText = sorted.find((el) => rowLooksLikeSearchHit(el));
     if (byText) {
       const displayName = extractDisplayNameFromRow(byText);
-      byText.click();
+      clickableRowTarget(byText).click();
       return { ok: true, detail: 'text_token_match', displayName: displayName || null };
     }
 
