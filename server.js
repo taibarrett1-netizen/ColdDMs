@@ -382,7 +382,7 @@ app.post('/api/admin/update', (req, res) => {
     .trim() || 'main';
   const updateId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString('hex');
   const updateLogPath = `/tmp/cold-dm-update-${updateId}.log`;
-  const cmd = `cd ${projectRoot} && git pull origin ${branch} && npm install && pm2 restart all && pm2 save`;
+  const cmd = `cd ${projectRoot} && git pull origin ${branch} && npm install && pm2 restart all --update-env && (pm2 start ecosystem.config.cjs --update-env 2>/dev/null || true) && pm2 save`;
 
   logger.log(`[admin:update] accepted updateId=${updateId} branch=${branch}`);
   res.json({
