@@ -441,7 +441,9 @@ const upload = multer({ dest: projectRoot, limits: { fileSize: 1024 * 1024 } });
 const uploadVoice = multer({ dest: voiceNotesDir, limits: { fileSize: 25 * 1024 * 1024 } });
 
 const BOT_PM2_NAME = 'ig-dm-send';
+const SCRAPE_PM2_NAME = 'ig-dm-scrape';
 const SEND_WORKER_ENTRY = process.env.SEND_WORKER_ENTRY || 'workers/send-worker.js';
+const SCRAPE_WORKER_ENTRY = process.env.SCRAPE_WORKER_ENTRY || 'workers/scrape-worker.js';
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 const SEND_SCRAPE_COOLDOWN_MS = Math.max(
   60 * 1000,
@@ -754,6 +756,60 @@ async function ensureSendWorkerProcess() {
     return { ok: true, action: 'create_missing', out: create.out };
   }
   return { ok: false, action: 'create_missing_failed', out: create.out, err: create.err };
+}
+
+async function ensureScrapeWorkerProcess() {
+  const status = await getPm2AppStatusByName(SCRAPE_PM2_NAME);
+  if (!status.error && status.online) {
+    return { ok: true, action: 'noop_online', out: `already online (${SCRAPE_PM2_NAME})` };
+  }
+  if (!status.error && status.exists) {
+    const startByName = await execPm2(`pm2 start ${SCRAPE_PM2_NAME} --update-env`);
+    if (startByName.ok || /online|already\s+running|successfully/i.test(startByName.out)) {
+      return { ok: true, action: 'start_existing', out: startByName.out };
+    }
+    const restartByName = await execPm2(`pm2 restart ${SCRAPE_PM2_NAME} --update-env`);
+    if (restartByName.ok || /online|already\s+running|successfully/i.test(restartByName.out)) {
+      return { ok: true, action: 'restart_existing', out: restartByName.out };
+    }
+    return { ok: false, action: 'start_existing_failed', out: `${startByName.out}\n${restartByName.out}`.trim(), err: restartByName.err || startByName.err };
+  }
+  const create = await execPm2(`pm2 start ${SCRAPE_WORKER_ENTRY} --name ${SCRAPE_PM2_NAME}`);
+  if (create.ok || /online|already\s+running|successfully/i.test(create.out)) {
+    return { ok: true, action: 'create_missing', out: create.out };
+  }
+  return { ok: false, action: 'create_missing_failed', out: create.out, err: create.err };
+}
+
+async function ensureAssignedClientWorkerStack(reason) {
+  const assignedClientId = (getClientId() || '').trim();
+  if (!assignedClientId) {
+    return;
+  }
+
+  const results = await Promise.allSettled([
+    ensureSendWorkerProcess(),
+    ensureScrapeWorkerProcess(),
+  ]);
+
+  const labels = ['send', 'scrape'];
+  results.forEach((result, idx) => {
+    const label = labels[idx];
+    if (result.status === 'rejected') {
+      console.error(`[pm2:auto-ensure] ${label} worker failed reason=${reason}`, result.reason);
+      return;
+    }
+    if (!result.value.ok) {
+      const detail = String(result.value.out || result.value.err?.message || 'pm2 ensure failed').slice(0, 220);
+      console.error(`[pm2:auto-ensure] ${label} worker failed reason=${reason}: ${detail}`);
+      return;
+    }
+    if (result.value.action !== 'noop_online') {
+      console.log(
+        `[pm2:auto-ensure] ${label} worker ${result.value.action} reason=${reason} clientId=${assignedClientId.slice(0, 8)}`
+      );
+    }
+  });
 }
 
 const STATUS_TIMEOUT_MS = 8000; // respond before typical Edge Function timeouts (~10–15s); status uses fast queries
@@ -2139,8 +2195,20 @@ app.post('/api/scraper/start', async (req, res) => {
         remaining: quota.remaining,
         limit: quota.limit,
       },
-      hint: 'Run PM2 process ig-dm-scrape (workers/scrape-worker.js) to drain scrape jobs.',
+      hint: 'Scrape worker will be started automatically if needed.',
     });
+    ensureScrapeWorkerProcess()
+      .then((r) => {
+        if (!r.ok) {
+          const detail = String(r.out || r.err?.message || 'pm2 ensure failed').slice(0, 220);
+          console.error('[API] pm2 ensure scrape worker failed', r.err || detail);
+          return;
+        }
+        if (r.action !== 'noop_online') {
+          console.log(`[API] pm2 ensure scrape worker (${r.action}) done.`);
+        }
+      })
+      .catch((err) => console.error('[API] pm2 ensure scrape worker failed', err));
   } catch (e) {
     console.error('[API] Scraper start error', e);
     res.status(500).json({ ok: false, error: e.message });
@@ -2210,6 +2278,11 @@ app.post('/api/control/stop', (req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Dashboard at http://0.0.0.0:${PORT}`);
   schedulePoolWorkerReadyRegistration();
+  setTimeout(() => {
+    ensureAssignedClientWorkerStack('startup').catch((err) => {
+      console.error('[pm2:auto-ensure] assigned client worker stack failed on startup', err);
+    });
+  }, 1500);
   if (shouldAutoScaleSendWorkers()) {
     const min = SCALE_SEND_WORKERS_AUTO_INTERVAL_MS / 60000;
     console.log(
