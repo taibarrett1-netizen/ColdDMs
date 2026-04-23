@@ -1101,6 +1101,10 @@ async function handleInstagramTermsUnblock(page) {
 
       const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
       const nodes = Array.from(document.querySelectorAll('button, [role="button"], a, div[tabindex="0"]'));
+      const onFullTermsReviewScreen =
+        bodyText.includes('updates to our terms and privacy policy') ||
+        bodyText.includes('read the full terms and privacy policy') ||
+        bodyText.includes('we updated our intellectual property licenses');
       const labelOf = (el) => {
         const t = lower(el.textContent);
         const a = lower(el.getAttribute && el.getAttribute('aria-label'));
@@ -1149,7 +1153,6 @@ async function handleInstagramTermsUnblock(page) {
         /^agree$/i,
         /^agree and continue$/i,
         /^continue$/i,
-        /^review now$/i,
       ];
       const primaryCandidates = nodes
         .map((el) => {
@@ -1166,6 +1169,21 @@ async function handleInstagramTermsUnblock(page) {
         .sort((a, b) => bottomGap(a.el) - bottomGap(b.el));
       for (const { el, pick } of primaryCandidates) {
         return { action: 'primary_cta', label: pick, ok: clickEl(el) };
+      }
+
+      if (!onFullTermsReviewScreen) {
+        const reviewNow = nodes
+          .map((el) => {
+            const t = norm(el.textContent);
+            const aria = norm(el.getAttribute && el.getAttribute('aria-label'));
+            const pick = t || aria;
+            return { el, pick };
+          })
+          .filter(({ el, pick }) => visible(el) && /^review now$/i.test(pick))
+          .sort((a, b) => bottomGap(a.el) - bottomGap(b.el))[0];
+        if (reviewNow) {
+          return { action: 'review_now', label: reviewNow.pick, ok: clickEl(reviewNow.el) };
+        }
       }
 
       for (const el of nodes) {
