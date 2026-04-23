@@ -227,14 +227,15 @@ function getDecodoGateUsernamePrefix() {
 }
 
 /** Stable alphanumeric id for sticky session (same client + IG → same egress IP while session lives). */
-function stickySessionKeyForAssignment(clientId, instagramUsername) {
+function stickySessionKeyForAssignment(clientId, instagramUsername, extraSeed = '') {
   const ig = String(instagramUsername || '')
     .trim()
     .replace(/^@/, '')
     .toLowerCase()
     .replace(/[^a-z0-9_]/g, '_')
     .slice(0, 24);
-  return crypto.createHash('sha256').update(`${clientId}:${ig}`).digest('hex').slice(0, 12);
+  const seed = String(extraSeed || '').trim();
+  return crypto.createHash('sha256').update(`${clientId}:${ig}:${seed}`).digest('hex').slice(0, 12);
 }
 
 /** ISO 3166-1 alpha-2 for Decodo `-country-xx` (must come before `-session-` in username). */
@@ -552,7 +553,7 @@ async function createDecodoSubUser(authHeaders, username, password, primaryServi
  * Create or reuse a Decodo sub-user (stable username per client+IG) and return proxy URL + provider_ref.
  * If the sub-user already exists (e.g. orphaned from a failed DB write), we rotate password via PUT.
  */
-async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
+async function provisionDecodoSubuserProxy(clientId, instagramUsername, opts = {}) {
   const sharedGate = getSharedGateCredentials();
   const subUsername = stableSubuserUsername(clientId, instagramUsername);
   const subPassword = randomSubuserPassword();
@@ -565,7 +566,9 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
     let stickyMins = parseInt(process.env.DECODO_STICKY_SESSION_DURATION_MINUTES || '60', 10);
     if (!Number.isFinite(stickyMins)) stickyMins = 60;
     stickyMins = Math.min(1440, Math.max(30, stickyMins));
-    const stickyKey = useSticky ? stickySessionKeyForAssignment(clientId, instagramUsername) : null;
+    const stickyKey = useSticky
+      ? stickySessionKeyForAssignment(clientId, instagramUsername, opts.stickySeed || '')
+      : null;
     const proxyUrl = buildProxyUrlFromCredentials(sharedGate.username, sharedGate.password, {
       useResidentialDefaultCountry: serviceType === 'residential_proxies',
       stickySessionId: stickyKey,
@@ -712,7 +715,9 @@ async function provisionDecodoSubuserProxy(clientId, instagramUsername) {
   let stickyMins = parseInt(process.env.DECODO_STICKY_SESSION_DURATION_MINUTES || '60', 10);
   if (!Number.isFinite(stickyMins)) stickyMins = 60;
   stickyMins = Math.min(1440, Math.max(30, stickyMins));
-  const stickyKey = useSticky ? stickySessionKeyForAssignment(clientId, instagramUsername) : null;
+  const stickyKey = useSticky
+    ? stickySessionKeyForAssignment(clientId, instagramUsername, opts.stickySeed || '')
+    : null;
   const proxyUrl = buildProxyUrlFromCredentials(subUsername, subPassword, {
     useResidentialDefaultCountry: serviceType === 'residential_proxies',
     stickySessionId: stickyKey,

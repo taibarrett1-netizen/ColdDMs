@@ -1263,13 +1263,17 @@ function normalizeInstagramKey(instagramUsername) {
 
 /**
  * Resolve or create Decodo sub-user proxy for this client + IG handle. Reuses cold_dm_proxy_assignments after session delete.
+ * Options:
+ * - forceRotate: ignore the stored sticky tunnel and mint a fresh proxy URL
+ * - stickySeed: extra entropy for the Decodo sticky-session id when force-rotating
  * @returns {{ proxyUrl: string|null, proxyAssignmentId: string|null }}
  */
-async function getOrResolveColdDmProxyUrl(clientId, instagramUsername) {
+async function getOrResolveColdDmProxyUrl(clientId, instagramUsername, opts = {}) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
   const ig = normalizeInstagramKey(instagramUsername);
   if (!ig) throw new Error('instagram username required for proxy resolution');
+  const forceRotate = !!opts.forceRotate;
   const forceGermany = (process.env.DECODO_GATE_COUNTRY || '').trim().toLowerCase() === 'de' || !(process.env.DECODO_GATE_COUNTRY || '').trim();
 
   const { data: existing, error: selErr } = await sb
@@ -1282,8 +1286,10 @@ async function getOrResolveColdDmProxyUrl(clientId, instagramUsername) {
   if (existing?.proxy_url) {
     const needsRefresh = decodoProvision.decodoStoredProxyUrlNeedsRefresh(clientId, ig, existing.proxy_url, existing.provider_ref);
     const missingGermanyPin = forceGermany && !String(existing.proxy_url).includes('-country-de');
-    if (needsRefresh || missingGermanyPin) {
-      const { proxyUrl, providerRef } = await decodoProvision.provisionDecodoSubuserProxy(clientId, ig);
+    if (forceRotate || needsRefresh || missingGermanyPin) {
+      const { proxyUrl, providerRef } = await decodoProvision.provisionDecodoSubuserProxy(clientId, ig, {
+        stickySeed: opts.stickySeed || '',
+      });
       const { error: upErr } = await sb
         .from('cold_dm_proxy_assignments')
         .update({
@@ -1302,7 +1308,9 @@ async function getOrResolveColdDmProxyUrl(clientId, instagramUsername) {
     return { proxyUrl: null, proxyAssignmentId: null };
   }
 
-  const { proxyUrl, providerRef } = await decodoProvision.provisionDecodoSubuserProxy(clientId, ig);
+  const { proxyUrl, providerRef } = await decodoProvision.provisionDecodoSubuserProxy(clientId, ig, {
+    stickySeed: opts.stickySeed || '',
+  });
   const { data: inserted, error: insErr } = await sb
     .from('cold_dm_proxy_assignments')
     .insert({

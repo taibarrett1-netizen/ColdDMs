@@ -6194,22 +6194,67 @@ async function drainSleep(ms, label) {
           'Instagram logged out — reconnect your sender in Cold Outreach, then sending resumes.'
         ).catch(() => {});
       } else if (!sendResult.ok && sendResult.reason === 'proxy_tunnel_failed') {
-        delayMs = randomDelay(15 * 60 * 1000, 30 * 60 * 1000);
-        sendJobStatus = 'retry';
-        sendJobUpdates = {
-          available_at: new Date(Date.now() + delayMs).toISOString(),
-          last_error_class: 'proxy_tunnel_failed',
-          last_error_message: sendResult.statusMessage || 'proxy_tunnel_failed',
-        };
-        logger.error(
-          `[send-worker] Proxy/network failure — pausing client ${clientId} (lead @${work.username} not marked failed).`
-        );
-        await sb.setControl(clientId, 1).catch(() => {});
-        sb.setClientStatusMessage(
-          clientId,
-          sendResult.statusMessage ||
-            'Instagram unreachable (proxy/VPN tunnel failed). Sending paused — fix connectivity and press Start.'
-        ).catch(() => {});
+        let proxyRotated = false;
+        if (
+          clientId &&
+          session?.id &&
+          session?.instagram_username &&
+          typeof sb.getOrResolveColdDmProxyUrl === 'function' &&
+          typeof sb.updateInstagramSessionProxy === 'function'
+        ) {
+          try {
+            const rotatedProxy = await sb.getOrResolveColdDmProxyUrl(clientId, session.instagram_username, {
+              forceRotate: true,
+              stickySeed: `proxy-recover-${Date.now()}`,
+            });
+            if (rotatedProxy?.proxyUrl) {
+              await sb.updateInstagramSessionProxy(session.id, rotatedProxy);
+              session.proxy_url = rotatedProxy.proxyUrl;
+              session.proxy_assignment_id = rotatedProxy.proxyAssignmentId || session.proxy_assignment_id || null;
+              await invalidateSendWorkerBrowser('rotated sender proxy after tunnel failure');
+              proxyRotated = true;
+              logger.warn(
+                `[send-worker] Proxy tunnel failed for sender @${session.instagram_username}; rotated proxy assignment and will retry.`
+              );
+            }
+          } catch (proxyRotateErr) {
+            logger.warn(
+              `[send-worker] Proxy rotation after tunnel failure failed for sender @${session.instagram_username}: ${
+                proxyRotateErr?.message || proxyRotateErr
+              }`
+            );
+          }
+        }
+        if (proxyRotated) {
+          delayMs = randomDelay(45 * 1000, 90 * 1000);
+          sendJobStatus = 'retry';
+          sendJobUpdates = {
+            available_at: new Date(Date.now() + delayMs).toISOString(),
+            last_error_class: 'proxy_tunnel_failed',
+            last_error_message: 'proxy_rotated_after_tunnel_failure',
+          };
+          sb.setClientStatusMessage(
+            clientId,
+            'Sender proxy connection failed. Rotated the proxy automatically and retrying shortly.'
+          ).catch(() => {});
+        } else {
+          delayMs = randomDelay(15 * 60 * 1000, 30 * 60 * 1000);
+          sendJobStatus = 'retry';
+          sendJobUpdates = {
+            available_at: new Date(Date.now() + delayMs).toISOString(),
+            last_error_class: 'proxy_tunnel_failed',
+            last_error_message: sendResult.statusMessage || 'proxy_tunnel_failed',
+          };
+          logger.error(
+            `[send-worker] Proxy/network failure — pausing client ${clientId} (lead @${work.username} not marked failed).`
+          );
+          await sb.setControl(clientId, 1).catch(() => {});
+          sb.setClientStatusMessage(
+            clientId,
+            sendResult.statusMessage ||
+              'Instagram unreachable (proxy/VPN tunnel failed). Sending paused — fix connectivity and press Start.'
+          ).catch(() => {});
+        }
       } else {
         const normalizedDelayWindow = normalizeColdOutreachDelayWindow(work.minDelaySec, work.maxDelaySec);
         delayMs =
