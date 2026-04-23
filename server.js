@@ -386,10 +386,7 @@ app.post('/api/admin/update', (req, res) => {
     `cd ${projectRoot}`,
     `git pull origin ${branch}`,
     'npm install',
-    '(pm2 restart ig-dm-scrape --update-env || pm2 start workers/scrape-worker.js --name ig-dm-scrape)',
-    'pm2 restart ig-dm-dashboard --update-env',
-    '(pm2 delete ig-dm-send || true)',
-    'pm2 start ecosystem.config.cjs --only ig-dm-send --update-env',
+    'pm2 restart all --update-env',
     'pm2 save',
   ].join(' && ');
 
