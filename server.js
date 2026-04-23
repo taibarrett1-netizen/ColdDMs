@@ -711,6 +711,9 @@ async function getPm2AppStatusByName(appName) {
  * (cluster mode) so each process gets NODE_APP_INSTANCE and pins to distinct campaign queues.
  */
 function sendWorkerPm2ClusterInstances() {
+  if ((getClientId() || '').trim()) {
+    return 1;
+  }
   return Math.max(
     1,
     parseInt(

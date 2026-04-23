@@ -1947,6 +1947,7 @@ async function getRecommendedSendWorkerInstanceCount() {
   const minN = Math.max(1, parseInt(process.env.SEND_WORKER_MIN || '1', 10) || 1);
   const maxN = Math.max(minN, parseInt(process.env.SEND_WORKER_MAX || '64', 10) || 64);
   const sb = getSupabase();
+  const pinnedClientId = (getClientId() || '').trim();
   if (!sb) {
     return {
       recommended: minN,
@@ -1958,7 +1959,10 @@ async function getRecommendedSendWorkerInstanceCount() {
       reason: 'no_supabase',
     };
   }
-  const clientIds = await getClientIdsWithPauseZero();
+  let clientIds = await getClientIdsWithPauseZero();
+  if (pinnedClientId) {
+    clientIds = clientIds.includes(pinnedClientId) ? [pinnedClientId] : [];
+  }
   const pauseZero = clientIds.length;
   let instagramSessionsForActiveClients = 0;
   if (clientIds.length > 0) {
@@ -1971,13 +1975,40 @@ async function getRecommendedSendWorkerInstanceCount() {
   }
   let campaignsWithReadyJobs = 0;
   try {
-    const cids = await getDistinctActiveCampaignIdsWithReadySendJobs();
-    campaignsWithReadyJobs = cids.length;
+    if (pinnedClientId) {
+      const nowIso = new Date().toISOString();
+      const { data: readyJobs, error: readyJobsErr } = await sb
+        .from('cold_dm_send_jobs')
+        .select('campaign_id')
+        .eq('client_id', pinnedClientId)
+        .in('status', ['pending', 'retry'])
+        .lte('available_at', nowIso)
+        .not('campaign_id', 'is', null);
+      if (readyJobsErr) throw readyJobsErr;
+      const readyCampaignIds = [...new Set((readyJobs || []).map((row) => row.campaign_id).filter(Boolean))];
+      if (readyCampaignIds.length > 0) {
+        const { data: activeCampaigns, error: activeCampaignsErr } = await sb
+          .from('cold_dm_campaigns')
+          .select('id')
+          .eq('client_id', pinnedClientId)
+          .eq('status', 'active')
+          .in('id', readyCampaignIds);
+        if (activeCampaignsErr) throw activeCampaignsErr;
+        campaignsWithReadyJobs = (activeCampaigns || []).length;
+      }
+    } else {
+      const cids = await getDistinctActiveCampaignIdsWithReadySendJobs();
+      campaignsWithReadyJobs = cids.length;
+    }
   } catch (e) {
     console.warn('[getRecommendedSendWorkerInstanceCount] campaign ready count failed:', e?.message || e);
   }
-  const raw =
+  let raw =
     pauseZero === 0 ? 1 : Math.max(1, pauseZero, instagramSessionsForActiveClients, campaignsWithReadyJobs);
+  if (pinnedClientId) {
+    const sessionCap = Math.max(1, instagramSessionsForActiveClients || 1);
+    raw = pauseZero === 0 ? 1 : Math.min(raw, sessionCap);
+  }
   const recommended = Math.max(minN, Math.min(maxN, raw));
   return {
     recommended,
@@ -1986,6 +2017,7 @@ async function getRecommendedSendWorkerInstanceCount() {
     campaignsWithReadyJobs,
     minN,
     maxN,
+    pinnedClientId: pinnedClientId || null,
   };
 }
 
@@ -3470,8 +3502,25 @@ async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240, campaign
       campaignId: r.campaign_id || null,
     })),
   });
+  const campaignIdsInCandidates = [...new Set(interleaved.map((r) => r.campaign_id).filter(Boolean))];
+  const activeCampaignIds = new Set();
+  if (campaignIdsInCandidates.length > 0) {
+    const { data: activeCampaignRows } = await sb
+      .from('cold_dm_campaigns')
+      .select('id')
+      .in('id', campaignIdsInCandidates)
+      .eq('status', 'active');
+    for (const row of activeCampaignRows || []) {
+      if (row?.id) activeCampaignIds.add(row.id);
+    }
+  }
+  const staleInactiveJobIds = [];
   for (const candidate of interleaved) {
     const campaignId = candidate.campaign_id || null;
+    if (campaignId && !activeCampaignIds.has(campaignId)) {
+      staleInactiveJobIds.push(candidate.id);
+      continue;
+    }
     if (campaignId) {
       const lockOk = await claimCampaignSendLease(campaignId, workerId, leaseSeconds);
       if (!lockOk) continue;
@@ -3505,6 +3554,15 @@ async function claimColdDmSendJobFallback(workerId, leaseSeconds = 240, campaign
       return updated;
     }
     if (campaignId) await releaseCampaignSendLease(campaignId, workerId).catch(() => {});
+  }
+  if (staleInactiveJobIds.length > 0) {
+    for (let i = 0; i < staleInactiveJobIds.length; i += 200) {
+      const batch = staleInactiveJobIds.slice(i, i + 200);
+      await sb.from('cold_dm_send_jobs').delete().in('id', batch);
+    }
+    console.log(
+      `[claimColdDmSendJobFallback] removed ${staleInactiveJobIds.length} queued job(s) for non-active campaign(s)`
+    );
   }
   return null;
 }
@@ -3547,17 +3605,24 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
     .maybeSingle();
   if (!campaign) return 0;
   if (campaign.status !== 'active') {
-    const { count: stillPending } = await sb
-      .from('cold_dm_campaign_leads')
-      .select('*', { count: 'exact', head: true })
+    const { data: inactiveJobs, error: inactiveJobsErr } = await sb
+      .from('cold_dm_send_jobs')
+      .select('id')
+      .eq('client_id', clientId)
       .eq('campaign_id', campaignId)
-      .eq('status', 'pending');
-    if ((stillPending ?? 0) > 0) {
-      await sb.from('cold_dm_campaigns').update({ status: 'active', updated_at: new Date().toISOString() }).eq('id', campaignId);
-      console.log(`[syncSendJobsForCampaign] reactivated campaign ${campaignId} (was ${campaign.status}, ${stillPending} pending leads)`);
-    } else {
-      return 0;
+      .in('status', ['pending', 'retry', 'running']);
+    if (inactiveJobsErr) throw inactiveJobsErr;
+    const queuedJobIds = (inactiveJobs || []).map((row) => row.id).filter(Boolean);
+    if (queuedJobIds.length > 0) {
+      for (let i = 0; i < queuedJobIds.length; i += 200) {
+        const batch = queuedJobIds.slice(i, i + 200);
+        await sb.from('cold_dm_send_jobs').delete().in('id', batch);
+      }
+      console.log(
+        `[syncSendJobsForCampaign] removed ${queuedJobIds.length} queued job(s) for non-active campaign ${campaignId} (${campaign.status})`
+      );
     }
+    return 0;
   }
 
   const { data: leadRows, error: leadErr } = await sb
@@ -3599,7 +3664,7 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
   let existingJobs = [];
   const { data: existingWithLease, error: existingErr } = await sb
     .from('cold_dm_send_jobs')
-    .select('id, campaign_lead_id, status, last_error_class, leased_until, lease_heartbeat_at')
+    .select('id, campaign_lead_id, status, last_error_class, leased_until, lease_heartbeat_at, available_at')
     .eq('client_id', clientId)
     .eq('campaign_id', campaignId);
   if (!existingErr) {
@@ -3608,7 +3673,7 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
     // Backward compatibility if lease columns are missing in this DB.
     const { data: existingLegacy, error: legacyErr } = await sb
       .from('cold_dm_send_jobs')
-      .select('id, campaign_lead_id, status, last_error_class')
+      .select('id, campaign_lead_id, status, last_error_class, available_at')
       .eq('client_id', clientId)
       .eq('campaign_id', campaignId);
     if (legacyErr) throw legacyErr;
@@ -3709,7 +3774,14 @@ async function syncSendJobsForCampaign(clientId, campaignId) {
   }
 
   const requeueableJobIds = (existingJobs || [])
-    .filter((j) => j.status === 'retry' && j.last_error_class === 'outside_schedule')
+    .filter((j) => {
+      if (j.status !== 'retry' || j.last_error_class !== 'outside_schedule') return false;
+      const currentAvailableAtMs = j.available_at ? Date.parse(j.available_at) : NaN;
+      const nextAvailableAtMs = Date.parse(nextAvailableAt);
+      if (!Number.isFinite(nextAvailableAtMs)) return true;
+      if (!Number.isFinite(currentAvailableAtMs)) return true;
+      return Math.abs(currentAvailableAtMs - nextAvailableAtMs) > 1000;
+    })
     .map((j) => j.id)
     .filter(Boolean);
   if (requeueableJobIds.length > 0) {
