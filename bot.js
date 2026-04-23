@@ -900,13 +900,49 @@ async function pageHasInstagramSessionCookie(page) {
   return cookies.some((c) => c.name === 'sessionid' && c.value && String(c.value).length >= 8);
 }
 
+async function waitForInstagramSessionCookie(page, contextLabel, timeoutMs = null) {
+  const waitMs = Math.max(
+    2000,
+    Math.min(parseInt(process.env.LOGIN_SESSION_COOKIE_WAIT_MS || '', 10) || timeoutMs || 15000, 90000)
+  );
+  const deadline = Date.now() + waitMs;
+  let handledTerms = false;
+  while (Date.now() < deadline) {
+    const url = page.url();
+    if (await pageHasInstagramSessionCookie(page).catch(() => false)) {
+      return true;
+    }
+    if (isInstagramTermsUnblockUrl(url)) {
+      handledTerms = true;
+      const cleared = await handleInstagramTermsUnblock(page).catch(() => false);
+      if (cleared) {
+        await delay(1200);
+        continue;
+      }
+    }
+    const urlReason = instagramAuthUrlFailureReason(url);
+    if (urlReason) throw new Error(urlReason);
+    const domHit = await detectInstagramDomBlockAfterLogin(page).catch(() => null);
+    if (domHit) {
+      throw new Error(
+        `Instagram blocked or challenged this login (${domHit}). Log in once in Chrome/Firefox (same network if possible), complete any prompt, or use 2FA — then retry Connect.`
+      );
+    }
+    await delay(1000);
+  }
+  if (handledTerms) {
+    logger.warn(`[login] sessionid still missing after clearing terms/unblock during ${contextLabel || 'login'}`);
+  }
+  return false;
+}
+
 /**
  * After navigation away from the login form, ensure we are not on a challenge URL, no block modal text,
  * and Instagram set a web session cookie — otherwise the dashboard would show "connected" incorrectly.
  */
 async function assertHealthyInstagramSessionOrThrow(page, contextLabel) {
-  const url = page.url();
-  const urlReason = instagramAuthUrlFailureReason(url);
+  const initialUrl = page.url();
+  const urlReason = instagramAuthUrlFailureReason(initialUrl);
   if (urlReason) throw new Error(urlReason);
   const domHit = await detectInstagramDomBlockAfterLogin(page);
   if (domHit) {
@@ -914,12 +950,13 @@ async function assertHealthyInstagramSessionOrThrow(page, contextLabel) {
       `Instagram blocked or challenged this login (${domHit}). Log in once in Chrome/Firefox (same network if possible), complete any prompt, or use 2FA — then retry Connect.`
     );
   }
-  const hasSession = await pageHasInstagramSessionCookie(page);
+  const hasSession = await waitForInstagramSessionCookie(page, contextLabel);
   if (!hasSession) {
+    const currentUrl = page.url();
     if (envLoginDebugEnabled()) {
       const ck = await page.cookies();
       logger.error(
-        `[login] Missing sessionid after ${contextLabel || 'login'}; cookie names=${ck.length ? ck.map((c) => c.name).join(', ') : '(none)'} url=${url}`
+        `[login] Missing sessionid after ${contextLabel || 'login'}; cookie names=${ck.length ? ck.map((c) => c.name).join(', ') : '(none)'} url=${currentUrl}`
       );
       const snippet = await page
         .evaluate(() => ((document.body && document.body.innerText) || '').slice(0, 500))
@@ -931,7 +968,7 @@ async function assertHealthyInstagramSessionOrThrow(page, contextLabel) {
         `Why VPS often works: same datacenter IP + browser fingerprint may already be trusted. Residential is a new IP/device every time until sticky + warmup. ` +
         `Try: (1) Proxy geo is random by default; set DECODO_GATE_COUNTRY=us/gb/etc. (or none for random). Reconnect so proxy_url updates. ` +
         `(2) Log in once in Chrome/Firefox using the exact proxy_url from Supabase, finish any checkpoint, then Connect on the VPS. ` +
-        `(3) Use 2FA on Connect if the account has it.`
+        `(3) Use 2FA on Connect if the account has it. Current URL: ${currentUrl}`
     );
   }
 }
