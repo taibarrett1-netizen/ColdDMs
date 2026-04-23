@@ -429,6 +429,42 @@ async function logTermsUnblockVisibleButtons(page) {
   }
 }
 
+async function logTermsUnblockState(page, label, forceScreenshot = false) {
+  if (!page) return;
+  try {
+    const state = await page.evaluate(() => {
+      const bodyText = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim();
+      const visibleButtons = Array.from(document.querySelectorAll('button, [role="button"], a, div[tabindex="0"]'))
+        .filter((el) => {
+          try {
+            const st = window.getComputedStyle(el);
+            if (st.visibility === 'hidden' || st.display === 'none') return false;
+            const r = el.getBoundingClientRect();
+            return r.width >= 2 && r.height >= 2;
+          } catch {
+            return false;
+          }
+        })
+        .slice(0, 12)
+        .map((el) => ((el.textContent || el.getAttribute?.('aria-label') || '').replace(/\s+/g, ' ').trim()).slice(0, 80))
+        .filter(Boolean);
+      return {
+        href: location.href,
+        title: document.title || '',
+        bodyLen: bodyText.length,
+        snippet: bodyText.slice(0, 500),
+        buttons: visibleButtons,
+      };
+    });
+    logger.warn(`[terms/unblock] ${label} state=${JSON.stringify(state)}`);
+  } catch (e) {
+    logger.warn(`[terms/unblock] ${label} state capture failed: ${e.message || e}`);
+  }
+  if (forceScreenshot || wantsTermsUnblockDebugScreenshot()) {
+    await saveTermsUnblockDebugScreenshot(page, label).catch(() => {});
+  }
+}
+
 function wantsDmSearchDebugScreenshot() {
   return (
     process.env.DM_SEARCH_DEBUG_SCREENSHOTS === '1' ||
@@ -999,6 +1035,7 @@ async function handleInstagramTermsUnblock(page) {
       ) {
         recoveredApiLandingPage = true;
         logger.warn(`terms/unblock redirected to Instagram API URL (${currentUrl}); navigating back to app shell.`);
+        await logTermsUnblockState(page, 'terms_unblock_api_redirect', true).catch(() => {});
         await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
         await delay(2500);
         continue;
@@ -1010,6 +1047,9 @@ async function handleInstagramTermsUnblock(page) {
     if (pass === 10) {
       await saveTermsUnblockDebugScreenshot(page, 'terms_unblock_after_scroll');
       await logTermsUnblockVisibleButtons(page);
+    }
+    if (pass === 0 || pass === 5 || pass === 15 || pass === 30) {
+      await logTermsUnblockState(page, `terms_unblock_pass_${pass + 1}`, pass > 0).catch(() => {});
     }
 
     // Keyboard scroll backup (some layouts only respond to this).
@@ -1277,9 +1317,11 @@ async function handleInstagramTermsUnblock(page) {
         ) {
           recoveredApiLandingPage = true;
           logger.warn(`terms/unblock landed on Instagram API page (${blankHref}); navigating back to app shell.`);
+          await logTermsUnblockState(page, 'terms_unblock_blank_api_page', true).catch(() => {});
           await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
         } else {
           logger.warn(`terms/unblock click landed on a blank/sticky page (bodyLen=${blankState.bodyLen}); reloading once.`);
+          await logTermsUnblockState(page, 'terms_unblock_blank_page', true).catch(() => {});
           await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 }).catch(() => {});
         }
         await delay(2500);
@@ -1293,6 +1335,7 @@ async function handleInstagramTermsUnblock(page) {
     await delay(350);
   }
 
+  await logTermsUnblockState(page, 'terms_unblock_give_up', true).catch(() => {});
   return !isInstagramTermsUnblockUrl(page.url());
 }
 
