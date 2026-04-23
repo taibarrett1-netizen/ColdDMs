@@ -381,7 +381,17 @@ app.post('/api/admin/update', (req, res) => {
   const branch = String(process.env.COLD_DM_WORKER_BRANCH || process.env.GIT_BRANCH || 'main')
     .trim() || 'main';
   const updateId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString('hex');
-  const cmd = `${getPuppeteerDepsInstallCommand()} && cd ${projectRoot} && git pull origin ${branch} && npm install && pm2 restart all --update-env`;
+  const cmd = [
+    getPuppeteerDepsInstallCommand(),
+    `cd ${projectRoot}`,
+    `git pull origin ${branch}`,
+    'npm install',
+    '(pm2 restart ig-dm-scrape --update-env || pm2 start workers/scrape-worker.js --name ig-dm-scrape)',
+    'pm2 restart ig-dm-dashboard --update-env',
+    '(pm2 delete ig-dm-send || true)',
+    'pm2 start ecosystem.config.cjs --only ig-dm-send --update-env',
+    'pm2 save',
+  ].join(' && ');
 
   logger.log(`[admin:update] accepted updateId=${updateId} branch=${branch}`);
   res.json({
