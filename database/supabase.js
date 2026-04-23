@@ -4384,6 +4384,22 @@ async function upsertLead(clientId, username, source) {
 async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId = null) {
   const sb = getSupabase();
   if (!sb || !clientId) throw new Error('Supabase or clientId missing');
+  let normalizedLeadGroupId = leadGroupId || null;
+  if (normalizedLeadGroupId) {
+    const { data: leadGroupRow, error: leadGroupErr } = await sb
+      .from('cold_dm_lead_groups')
+      .select('id')
+      .eq('client_id', clientId)
+      .eq('id', normalizedLeadGroupId)
+      .maybeSingle();
+    if (leadGroupErr) throw leadGroupErr;
+    if (!leadGroupRow?.id) {
+      console.warn(
+        `[upsertLeadsBatch] Skipping stale lead_group_id=${normalizedLeadGroupId} for client=${clientId}; leads will be inserted without a group.`
+      );
+      normalizedLeadGroupId = null;
+    }
+  }
   const normalized = [];
   for (const item of leadsOrUsernames || []) {
     const u = normalizeUsername(typeof item === 'string' ? item : item.username);
@@ -4419,9 +4435,9 @@ async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId 
         source: source || null,
         added_at: isoNow,
       };
-      if (leadGroupId) row.lead_group_id = leadGroupId;
+      if (normalizedLeadGroupId) row.lead_group_id = normalizedLeadGroupId;
       inserts.push(row);
-    } else if (leadGroupId && (ex.lead_group_id == null || ex.lead_group_id === '')) {
+    } else if (normalizedLeadGroupId && (ex.lead_group_id == null || ex.lead_group_id === '')) {
       idsToAssignGroup.push(ex.id);
     }
   }
@@ -4436,12 +4452,12 @@ async function upsertLeadsBatch(clientId, leadsOrUsernames, source, leadGroupId 
   }
 
   const assignIds = [...new Set(idsToAssignGroup)];
-  if (assignIds.length && leadGroupId) {
+  if (assignIds.length && normalizedLeadGroupId) {
     for (let i = 0; i < assignIds.length; i += insChunk) {
       const slice = assignIds.slice(i, i + insChunk);
       const { error: upErr } = await sb
         .from('cold_dm_leads')
-        .update({ lead_group_id: leadGroupId })
+        .update({ lead_group_id: normalizedLeadGroupId })
         .eq('client_id', clientId)
         .in('id', slice);
       if (upErr) throw upErr;
