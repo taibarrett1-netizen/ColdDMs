@@ -1321,6 +1321,9 @@ async function getOrResolveColdDmProxyUrl(clientId, instagramUsername, opts = {}
   const ig = normalizeInstagramKey(instagramUsername);
   if (!ig) throw new Error('instagram username required for proxy resolution');
   const forceRotate = !!opts.forceRotate;
+  const neverRefresh =
+    process.env.COLD_DM_NEVER_REFRESH_PROXY_ASSIGNMENTS === '1' ||
+    process.env.COLD_DM_NEVER_REFRESH_PROXY_ASSIGNMENTS === 'true';
   const forceGermany = (process.env.DECODO_GATE_COUNTRY || '').trim().toLowerCase() === 'de' || !(process.env.DECODO_GATE_COUNTRY || '').trim();
 
   const { data: existing, error: selErr } = await sb
@@ -1331,6 +1334,12 @@ async function getOrResolveColdDmProxyUrl(clientId, instagramUsername, opts = {}
     .maybeSingle();
   if (selErr) throw selErr;
   if (existing?.proxy_url) {
+    // Safety: keep a stable exit IP for the lifetime of an IG session. Refreshing a stored proxy URL
+    // can swap exit IPs under the same cookies/session_data and trigger IG checkpoints/suspensions.
+    // Allow refresh only when explicitly forced by the caller.
+    if (neverRefresh && !forceRotate) {
+      return { proxyUrl: existing.proxy_url, proxyAssignmentId: existing.id };
+    }
     const needsRefresh = decodoProvision.decodoStoredProxyUrlNeedsRefresh(clientId, ig, existing.proxy_url, existing.provider_ref);
     const missingGermanyPin = forceGermany && !String(existing.proxy_url).includes('-country-de');
     if (forceRotate || needsRefresh || missingGermanyPin) {
