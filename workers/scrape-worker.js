@@ -20,9 +20,26 @@ const SEND_SCRAPE_COOLDOWN_MS = Math.max(
   60 * 1000,
   parseInt(process.env.SEND_SCRAPE_COOLDOWN_MS || String(5 * 60 * 1000), 10) || 5 * 60 * 1000
 );
+const WORKER_HEARTBEAT_MS = Math.max(
+  15000,
+  parseInt(process.env.SCRAPER_WORKER_HEARTBEAT_MS || '30000', 10) || 30000
+);
+const CLAIM_ERROR_BACKOFF_MIN_MS = Math.max(
+  1000,
+  parseInt(process.env.SCRAPER_CLAIM_ERROR_BACKOFF_MIN_MS || '5000', 10) || 5000
+);
+const CLAIM_ERROR_BACKOFF_MAX_MS = Math.max(
+  CLAIM_ERROR_BACKOFF_MIN_MS,
+  parseInt(process.env.SCRAPER_CLAIM_ERROR_BACKOFF_MAX_MS || '120000', 10) || 120000
+);
 
 function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function backoffMs(attempt, minMs = CLAIM_ERROR_BACKOFF_MIN_MS, maxMs = CLAIM_ERROR_BACKOFF_MAX_MS) {
+  const exp = Math.min(maxMs, minMs * Math.pow(2, Math.min(Math.max(0, attempt), 6)));
+  return Math.min(maxMs, exp + Math.floor(exp * (0.2 + Math.random() * 0.3)));
 }
 
 async function processOneJob(workerId, job) {
@@ -167,12 +184,29 @@ async function main() {
   );
 
   const activeJobs = new Map();
+  let lastHeartbeatAt = 0;
+  let claimErrorCount = 0;
 
   for (;;) {
-    await sb.workerHeartbeat(workerId, 'scrape', { pid: process.pid, activeJobs: activeJobs.size }).catch(() => {});
+    const now = Date.now();
+    if (now - lastHeartbeatAt >= WORKER_HEARTBEAT_MS) {
+      lastHeartbeatAt = now;
+      await sb.workerHeartbeat(workerId, 'scrape', { pid: process.pid, activeJobs: activeJobs.size }).catch(() => {});
+    }
 
     while (activeJobs.size < MAX_CONCURRENT) {
-      const job = await sb.claimColdDmScrapeJob(workerId, LEASE_SEC);
+      let job = null;
+      try {
+        job = await sb.claimColdDmScrapeJob(workerId, LEASE_SEC);
+        claimErrorCount = 0;
+      } catch (e) {
+        const waitMs = backoffMs(claimErrorCount++);
+        logger.warn(
+          `[scrape-worker] claim failed; backing off ${Math.ceil(waitMs / 1000)}s (${e?.message || e})`
+        );
+        await delay(waitMs);
+        break;
+      }
       if (!job) break;
 
       logger.log(

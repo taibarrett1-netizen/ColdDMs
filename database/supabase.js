@@ -866,6 +866,43 @@ function computeAvailableAtIso(delaySeconds = 0) {
   return new Date(Date.now() + sec * 1000).toISOString();
 }
 
+function computeBackoffSeconds(baseSeconds = 60, attempt = 0, maxSeconds = 30 * 60) {
+  const base = Math.max(1, parseInt(baseSeconds, 10) || 60);
+  const n = Math.max(0, parseInt(attempt, 10) || 0);
+  const cap = Math.max(base, parseInt(maxSeconds, 10) || 30 * 60);
+  const exp = Math.min(cap, base * Math.pow(2, Math.min(n, 6)));
+  const jitter = Math.floor(exp * (0.2 + Math.random() * 0.3));
+  return Math.min(cap, exp + jitter);
+}
+
+function isLikelyTransientSupabaseError(error) {
+  const status = Number(error?.status || error?.statusCode || error?.__httpStatus || 0);
+  const code = String(error?.code || '').toUpperCase();
+  const message = String(error?.message || error || '').toLowerCase();
+  return (
+    status === 408 ||
+    status === 425 ||
+    status === 429 ||
+    status >= 500 ||
+    code === '57014' ||
+    code === '53300' ||
+    code === '53400' ||
+    code === '57P03' ||
+    message.includes('connection not available') ||
+    message.includes('unabletoconnecttoproject') ||
+    message.includes('request was dropped') ||
+    message.includes('timeout') ||
+    message.includes('fetch failed') ||
+    message.includes('503')
+  );
+}
+
+function shouldFallbackMissingRpc(error) {
+  const code = String(error?.code || '').toUpperCase();
+  const message = String(error?.message || '').toLowerCase();
+  return code === 'PGRST202' || code === '42883' || message.includes('could not find the function');
+}
+
 function instagramLeaseStaleBeforeIso(leaseSeconds = 600) {
   const staleSec = Math.max(
     45,
@@ -3239,16 +3276,41 @@ async function claimColdDmScrapeJob(workerId, leaseSeconds = 240) {
     if (rows.length > 0) return rows[0];
     return null;
   }
+  if (!shouldFallbackMissingRpc(error) || isLikelyTransientSupabaseError(error)) throw error;
   return claimColdDmScrapeJobFallback(workerId, leaseSeconds, onlyClientId || null);
 }
 
 async function retryScrapeJob(jobId, errorMessage = null, delaySeconds = 60, workerId = null) {
   const sb = getSupabase();
   if (!sb || !jobId) throw new Error('Supabase or jobId missing');
+  const maxAttempts = Math.max(1, parseInt(process.env.SCRAPE_JOB_MAX_ATTEMPTS || '8', 10) || 8);
+  const { data: jobRow } = await sb
+    .from('cold_dm_scrape_jobs')
+    .select('attempt_count')
+    .eq('id', jobId)
+    .maybeSingle();
+  const attempts = Math.max(0, Number(jobRow?.attempt_count || 0));
+  if (attempts >= maxAttempts) {
+    const failedPayload = {
+      status: 'failed',
+      error_message: errorMessage || 'max_retries_exhausted',
+      last_error_class: 'max_retries_exhausted',
+      leased_until: null,
+      leased_by_worker: null,
+      lease_heartbeat_at: new Date().toISOString(),
+      finished_at: new Date().toISOString(),
+    };
+    let fq = sb.from('cold_dm_scrape_jobs').update(failedPayload).eq('id', jobId);
+    if (workerId) fq = fq.eq('leased_by_worker', workerId);
+    const { error: failError } = await fq;
+    if (failError) throw failError;
+    return;
+  }
+  const retryDelaySeconds = computeBackoffSeconds(delaySeconds, attempts);
   const payload = {
     status: 'retry',
     error_message: errorMessage || 'retry_scheduled',
-    available_at: computeAvailableAtIso(delaySeconds),
+    available_at: computeAvailableAtIso(retryDelaySeconds),
     leased_until: null,
     leased_by_worker: null,
     lease_heartbeat_at: new Date().toISOString(),
@@ -3302,6 +3364,7 @@ async function heartbeatScrapeJobLease(jobId, workerId, leaseSeconds = 240) {
   });
   if (!error && data === true) return true;
   if (!error && data === false) return false;
+  if (error && (!shouldFallbackMissingRpc(error) || isLikelyTransientSupabaseError(error))) return false;
   const leaseUntil = new Date(Date.now() + Math.max(30, leaseSeconds) * 1000).toISOString();
   const { data: rows, error: uerr } = await sb
     .from('cold_dm_scrape_jobs')
