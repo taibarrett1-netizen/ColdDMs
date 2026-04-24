@@ -4848,13 +4848,9 @@ function isProxyOrNetworkInfrastructureError(message) {
     m.includes('ERR_TUNNEL_CONNECTION_FAILED') ||
     m.includes('ERR_PROXY_CONNECTION_FAILED') ||
     m.includes('ERR_PROXY_CERTIFICATE_INVALID') ||
-    m.includes('ERR_CONNECTION_CLOSED') ||
-    m.includes('ERR_CONNECTION_RESET') ||
-    m.includes('ERR_CONNECTION_REFUSED') ||
     m.includes('ERR_NAME_NOT_RESOLVED') ||
     m.includes('ERR_INTERNET_DISCONNECTED') ||
-    m.includes('ERR_ADDRESS_UNREACHABLE') ||
-    m.includes('ERR_SSL_PROTOCOL_ERROR')
+    m.includes('ERR_ADDRESS_UNREACHABLE')
   );
 }
 
@@ -5102,8 +5098,8 @@ async function sendDM(page, username, adapter, options = {}) {
     return {
       ok: false,
       reason: 'proxy_tunnel_failed',
-      statusMessage:
-        'Instagram unreachable (proxy/VPN tunnel or network failure). Sending paused — fix proxy and click Start.',
+      statusMessage: 'Instagram could not be reached right now. Sending has been paused.',
+      errorMessage: lastError?.message || 'proxy_tunnel_failed',
     };
   }
   await Promise.resolve(logSent('failed', null));
@@ -6291,7 +6287,7 @@ async function drainSleep(ms, label) {
           sendJobUpdates = {
             available_at: new Date(Date.now() + delayMs).toISOString(),
             last_error_class: 'proxy_tunnel_failed',
-            last_error_message: sendResult.statusMessage || 'proxy_tunnel_failed',
+            last_error_message: sendResult.errorMessage || sendResult.statusMessage || 'proxy_tunnel_failed',
           };
           logger.error(
             `[send-worker] Proxy/network failure — pausing client ${clientId} (lead @${work.username} not marked failed).`
@@ -6299,9 +6295,7 @@ async function drainSleep(ms, label) {
           await sb.setControl(clientId, 1).catch(() => {});
           sb.setClientStatusMessage(
             clientId,
-            (sendResult.statusMessage ||
-              'Instagram unreachable (proxy/VPN tunnel failed). Sending paused — fix connectivity and press Start.') +
-              ' (No auto-rotation; session stays pinned to its proxy.)'
+            'Instagram connection issue detected. Sending has been paused. Press Start to retry.'
           ).catch(() => {});
         }
       } else {
