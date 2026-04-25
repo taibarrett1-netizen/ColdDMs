@@ -842,6 +842,84 @@ async function logDmSearchFailureDiagnostics(page, username, searchPick) {
   await saveDmSearchDebugScreenshot(page, `dm_search_fail_${u.replace(/[^a-z0-9_-]/gi, '_').slice(0, 40)}`);
 }
 
+/**
+ * Instagram sometimes lands on inbox chrome at /direct/new/ (Primary/General tabs + global Search)
+ * instead of the "New message" recipient picker. In that state typing into search will never produce
+ * selectable recipient rows. This helper opens the composer explicitly before result selection.
+ */
+async function ensureDirectNewComposerMode(page, logger) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const state = await page
+      .evaluate(() => {
+        const norm = (s) => (s || '').toString().toLowerCase();
+        const visible = (el) => {
+          try {
+            if (!el || el.disabled) return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 2 && r.height > 2;
+          } catch {
+            return false;
+          }
+        };
+        const text = norm((document.body && document.body.innerText) || '');
+        const hasInboxTabs = text.includes('primary') && text.includes('general');
+        const hasToField = Array.from(
+          document.querySelectorAll('input, textarea, [contenteditable="true"], [role="combobox"], [role="textbox"]')
+        ).some((el) => {
+          const ph = norm(el.getAttribute && el.getAttribute('placeholder'));
+          const aria = norm(el.getAttribute && el.getAttribute('aria-label'));
+          return ph.includes('to:') || aria.includes('to:');
+        });
+        const hasListbox = document.querySelectorAll('[role="listbox"] [role="option"]').length > 0;
+        const inComposer = hasToField || hasListbox;
+        if (inComposer) {
+          return { inComposer: true, clicked: false, clickLabel: null };
+        }
+
+        const clickables = Array.from(
+          document.querySelectorAll('button, [role="button"], div[role="button"], a[role="button"], a')
+        ).filter(visible);
+        const newMessageBtn = clickables.find((el) => {
+          const t = norm(el.textContent).replace(/\s+/g, ' ').trim();
+          const aria = norm(el.getAttribute && el.getAttribute('aria-label'));
+          const title = norm(el.getAttribute && el.getAttribute('title'));
+          return (
+            t === 'new message' ||
+            aria.includes('new message') ||
+            title.includes('new message') ||
+            aria.includes('compose') ||
+            title.includes('compose')
+          );
+        });
+        if (newMessageBtn) {
+          (newMessageBtn.closest('button, [role="button"], a') || newMessageBtn).click();
+          return {
+            inComposer: false,
+            clicked: true,
+            clickLabel: (newMessageBtn.textContent || newMessageBtn.getAttribute('aria-label') || 'new message')
+              .toString()
+              .trim(),
+            hasInboxTabs,
+          };
+        }
+        return { inComposer: false, clicked: false, clickLabel: null, hasInboxTabs };
+      })
+      .catch(() => ({ inComposer: false, clicked: false, clickLabel: null, hasInboxTabs: false }));
+
+    if (state.inComposer) return true;
+    if (state.clicked) {
+      logger.log(`[dm-search] Opened composer via "${state.clickLabel || 'new message'}"`);
+      await delay(700);
+      continue;
+    }
+    if (state.hasInboxTabs) {
+      logger.warn('[dm-search] Still on inbox chrome (Primary/General) and no "New message" target found.');
+    }
+    break;
+  }
+  return false;
+}
+
 /** Non-login Instagram URLs that mean we do not have a usable session (challenge, checkpoint, etc.). */
 function instagramAuthUrlFailureReason(url) {
   try {
@@ -2722,6 +2800,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   // Includes cookie-consent handling; direct/new can surface cookie walls that block search/compose.
   await dismissInstagramPopups(page, logger);
   await delay(500);
+  await ensureDirectNewComposerMode(page, logger).catch(() => {});
 
   // Wait for the direct/new search UI to render (may be an input, textarea, or contenteditable element).
   await page
