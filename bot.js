@@ -863,6 +863,8 @@ async function ensureDirectNewComposerMode(page, logger) {
         };
         const text = norm((document.body && document.body.innerText) || '');
         const hasInboxTabs = text.includes('primary') && text.includes('general');
+        const hasComposerHeader = text.includes('new message') && text.includes('back');
+        const hasCreateChat = text.includes('create chat');
         const hasToField = Array.from(
           document.querySelectorAll('input, textarea, [contenteditable="true"], [role="combobox"], [role="textbox"]')
         ).some((el) => {
@@ -871,7 +873,7 @@ async function ensureDirectNewComposerMode(page, logger) {
           return ph.includes('to:') || aria.includes('to:');
         });
         const hasListbox = document.querySelectorAll('[role="listbox"] [role="option"]').length > 0;
-        const inComposer = hasToField || hasListbox;
+        const inComposer = hasToField || hasListbox || hasComposerHeader || hasCreateChat;
         if (inComposer) {
           return { inComposer: true, clicked: false, clickLabel: null };
         }
@@ -915,9 +917,10 @@ async function ensureDirectNewComposerMode(page, logger) {
               .toString()
               .trim(),
             hasInboxTabs,
+            hasComposerHeader,
           };
         }
-        return { inComposer: false, clicked: false, clickLabel: null, hasInboxTabs };
+        return { inComposer: false, clicked: false, clickLabel: null, hasInboxTabs, hasComposerHeader };
       })
       .catch(() => ({ inComposer: false, clicked: false, clickLabel: null, hasInboxTabs: false }));
 
@@ -944,9 +947,11 @@ async function ensureDirectNewComposerMode(page, logger) {
         const aria = ((el.getAttribute && el.getAttribute('aria-label')) || '').toLowerCase();
         return ph.includes('to:') || aria.includes('to:');
       });
-      return { hasInboxTabs, hasToField };
+      const hasComposerHeader = text.includes('new message') && text.includes('back');
+      const hasCreateChat = text.includes('create chat');
+      return { hasInboxTabs, hasToField, hasComposerHeader, hasCreateChat };
     });
-    if (fallbackState.hasInboxTabs && !fallbackState.hasToField) {
+    if (fallbackState.hasInboxTabs && !fallbackState.hasToField && !fallbackState.hasComposerHeader && !fallbackState.hasCreateChat) {
       const vp = page.viewport() || { width: 1280, height: 800 };
       await page.mouse.click(Math.floor(vp.width * 0.93), 34, { delay: 80 });
       logger.log('[dm-search] Composer fallback click at top-right coordinates');
@@ -3030,6 +3035,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 
     const bodyLower = ((document.body && document.body.innerText) || '').toLowerCase();
     const looksLikeInboxChrome = bodyLower.includes('primary') && bodyLower.includes('general');
+    const looksLikeComposerVariant = bodyLower.includes('new message') && bodyLower.includes('back');
 
     const findWithHints = (predicates) => {
       for (const pred of predicates) {
@@ -3065,12 +3071,12 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
 
     const hit =
       // If inbox chrome is visible, never pick generic search fields; require "To:".
-      (looksLikeInboxChrome
+      (looksLikeInboxChrome && !looksLikeComposerVariant
         ? findWithHints([toFieldOnly])
         : findWithHints([searchOrTo, comboboxRole])) ||
       findWithHints([toFieldOnly]) ||
-      (!looksLikeInboxChrome ? findWithHints([textInput]) : null) ||
-      (!looksLikeInboxChrome ? candidates[0] : null) ||
+      ((looksLikeComposerVariant || !looksLikeInboxChrome) ? findWithHints([textInput]) : null) ||
+      ((looksLikeComposerVariant || !looksLikeInboxChrome) ? candidates[0] : null) ||
       null;
 
     return hit;
