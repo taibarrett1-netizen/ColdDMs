@@ -3170,9 +3170,9 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
       await clickElementNaturally(page, retrySearchEl, { totalDurationMs: randomDelay(220, 420) }).catch(() => {});
       await organicPause('compose', 0.45);
       if (retryMeta.tag === 'INPUT' || retryMeta.tag === 'TEXTAREA' || retryMeta.isCE) {
-        const exactSet = await setDmSearchFieldExact(page, retrySearchEl, u).catch(() => false);
+        const exactSet = false; // force natural typing
         if (!exactSet) {
-          await focusAndTypeNaturally(page, retrySearchEl, u, {
+          await focusAndTypeNaturally(page, searchEl, u, {
             clearFirst: true,
             minKeyDelay: 45,
             maxKeyDelay: 120,
@@ -3226,7 +3226,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   await organicPause('compose', 0.45);
 
   if (searchMeta.tag === 'INPUT' || searchMeta.tag === 'TEXTAREA' || searchMeta.isCE) {
-    const exactSet = await setDmSearchFieldExact(page, searchEl, u).catch(() => false);
+    const exactSet = false; // force natural typing
     if (!exactSet) {
       await focusAndTypeNaturally(page, searchEl, u, {
         clearFirst: true,
