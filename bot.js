@@ -3242,6 +3242,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   await organicPause('open_dm');
   await dismissInstagramPopups(page, logger).catch(() => {});
   await delay(300);
+  await page.waitForSelector('[role="listbox"]', { timeout: 5000 }).catch(() => {});
 
   if (wantsDmSearchPairScreenshots()) {
     await saveDmSearchDebugScreenshot(page, `dm_search_before_pick_${u.replace(/[^a-z0-9_-]/gi, '_').slice(0, 40)}`);
