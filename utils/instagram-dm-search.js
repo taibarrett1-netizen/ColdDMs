@@ -121,6 +121,16 @@ async function clickInstagramDmSearchResult(page, username) {
       return null;
     }
 
+    function rowHasExactUsernameLine(el) {
+      const rawText = (el.innerText || el.textContent || '').replace(/\r/g, '').trim();
+      if (!rawText) return false;
+      const lines = rawText
+        .split(/\n+/)
+        .map((s) => s.replace(/\s+/g, ' ').trim().toLowerCase())
+        .filter(Boolean);
+      return lines.some((l) => l === needle || l === '@' + needle);
+    }
+
     function rowCenterY(el) {
       try {
         const r = el.getBoundingClientRect();
@@ -332,6 +342,13 @@ async function clickInstagramDmSearchResult(page, username) {
       return { ok: true, detail: 'href_match', displayName: displayName || null };
     }
 
+    const byExactUsernameLine = sorted.find((el) => rowLooksLikeSearchHit(el) && rowHasExactUsernameLine(el));
+    if (byExactUsernameLine) {
+      const displayName = extractDisplayNameFromRow(byExactUsernameLine);
+      clickableRowTarget(byExactUsernameLine).click();
+      return { ok: true, detail: 'text_exact_username_line_match', displayName: displayName || null };
+    }
+
     const byText = sorted.find((el) => rowLooksLikeSearchHit(el));
     if (byText) {
       const displayName = extractDisplayNameFromRow(byText);
@@ -421,13 +438,17 @@ async function clickInstagramDmSearchResult(page, username) {
   });
   if (!stillOnNew) return pick;
 
-  for (let steps = 1; steps <= 5; steps++) {
-    for (let s = 0; s < steps; s++) {
+  for (let steps = 0; steps <= 12; steps++) {
+    // Keep keyboard traversal deterministic from top.
+    if (steps === 0) {
+      await page.keyboard.press('Home').catch(() => {});
+      await delay(120);
+    } else {
       await page.keyboard.press('ArrowDown').catch(() => {});
       await delay(110);
     }
     await page.keyboard.press('Enter').catch(() => {});
-    await delay(950);
+    await delay(1100);
     const navigated = await page.evaluate(() => {
       try {
         return /\/direct\/t\//.test(window.location.pathname || '');
@@ -436,7 +457,7 @@ async function clickInstagramDmSearchResult(page, username) {
       }
     });
     if (navigated) {
-      return { ok: true, detail: `keyboard_${steps}_arrows_enter`, displayName: null };
+      return { ok: true, detail: `keyboard_step_${steps}_enter`, displayName: null };
     }
   }
 
