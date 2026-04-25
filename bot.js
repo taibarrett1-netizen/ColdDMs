@@ -2719,7 +2719,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     }
   }
 
-  await dismissInstagramHomeModals(page, logger);
+  // Includes cookie-consent handling; direct/new can surface cookie walls that block search/compose.
+  await dismissInstagramPopups(page, logger);
   await delay(500);
 
   // Wait for the direct/new search UI to render (may be an input, textarea, or contenteditable element).
@@ -2944,7 +2945,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   await searchEl.dispose();
   await searchHandle.dispose();
   await organicPause('open_dm');
-  await dismissInstagramHomeModals(page, logger).catch(() => {});
+  await dismissInstagramPopups(page, logger).catch(() => {});
   await delay(300);
 
   if (wantsDmSearchPairScreenshots()) {
@@ -2957,8 +2958,8 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     logLine: `evaluate_threw: ${e && e.message ? e.message : String(e)}`,
   }));
   if (!searchPick.ok && searchPick.reason === 'search_result_select_failed') {
-    // "Turn on Notifications" or similar overlays can appear after typing and block row clicks.
-    await dismissInstagramHomeModals(page, logger).catch(() => {});
+    // Notifications/cookie overlays can appear after typing and block row clicks.
+    await dismissInstagramPopups(page, logger).catch(() => {});
     await delay(500);
     searchPick = await clickInstagramDmSearchResult(page, u).catch((e) => ({
       ok: false,
@@ -3045,7 +3046,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   }
   await organicPause('between_actions');
 
-  await dismissInstagramHomeModals(page, logger);
+  await dismissInstagramPopups(page, logger);
   await delay(600);
 
   // Hard stop: Instagram sometimes shows a persistent right-pane error ("Something isn't working").
@@ -3081,7 +3082,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
   try {
     await page.waitForSelector(composeSelector, { timeout: 20000 });
     composeFound = true;
-    await dismissInstagramHomeModals(page, logger);
+    await dismissInstagramPopups(page, logger);
     await delay(500);
   } catch (e) {
     // Instagram sometimes leaves us on /direct/t/... but only the inbox list is rendered (no right pane composer yet).
@@ -3145,7 +3146,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     if (recovery?.clicked) {
       logger.log(`Compose recovery click: ${recovery.clicked}`);
       await delay(1800);
-      await dismissInstagramHomeModals(page, logger);
+      await dismissInstagramPopups(page, logger);
       composeRecoveryScreenshotPath = await saveAfterComposeRecoveryScreenshot(page, recovery.clicked, u);
       try {
         await page.waitForSelector(composeSelector, { timeout: 12000 });
@@ -3159,7 +3160,7 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         logger.warn('Compose still missing on /direct/t/ thread; retrying with one thread reload.');
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 45000 });
         await delay(2500);
-        await dismissInstagramHomeModals(page, logger);
+        await dismissInstagramPopups(page, logger);
         await page.waitForSelector(composeSelector, { timeout: 12000 });
         composeFound = true;
         noComposeReason = null;
@@ -4324,7 +4325,7 @@ async function previewDmLeadNamesFromSession(body) {
     await page.goto('https://www.instagram.com/', { waitUntil: 'domcontentloaded', timeout: 45000 });
     await applyInstagramWebStorageFromSessionData(page, session.session_data, logger);
     await delay(3000);
-    await dismissInstagramHomeModals(page, logger);
+    await dismissInstagramPopups(page, logger);
     await delay(500);
     if (page.url().includes('/accounts/login')) {
       let screenshotPath = null;
