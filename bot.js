@@ -3301,30 +3301,12 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
         if (el.offsetParent !== null && el.offsetWidth > 0 && el.offsetHeight > 0) candidates.push(el);
       });
     }
-    console.log('BUTTONS:', candidates.map(el => (el.textContent||'').replace(/\s+/g,' ').trim().slice(0,40)).filter(Boolean).join(' | '));
-    const needle = (t) => t.toLowerCase().replace(/\s+/g, ' ').trim();
-    const labels = ['send message', 'message', 'next', 'chat', 'send a message', 'start a chat'];
-    for (const label of labels) {
-      const btn = candidates.find((el) => {
-        const t = needle(el.textContent || '');
-        return t === label || (t.includes('send') && t.includes('message')) || (t === 'next') || (t === 'chat');
-      });
-      if (btn) {
-        btn.click();
-        return true;
-      }
-    }
-    for (const label of labels) {
-      const btn = candidates.find((el) => needle(el.textContent || '').includes(label));
-      if (btn) {
-        btn.click();
-        return true;
-      }
-    }
-    return false;
-  });
-  if (openedThread) await organicPause('open_dm');
-  await organicPause('between_actions');
+    const buttonTexts = candidates.map(el => (el.textContent||'').replace(/\s+/g,' ').trim().slice(0,40)).filter(Boolean);
+    return { debug: buttonTexts };
+});
+logger.log('BUTTONS: ' + JSON.stringify(openedThread));
+if (openedThread) await organicPause('open_dm');
+await organicPause('between_actions');
 
   try {
     await page.waitForFunction(
