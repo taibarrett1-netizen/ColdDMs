@@ -3303,10 +3303,10 @@ async function sendDMOnce(page, u, messageTemplate, nameFallback = {}, sendOpts 
     }
     const buttonTexts = candidates.map(el => (el.textContent||'').replace(/\s+/g,' ').trim().slice(0,40)).filter(Boolean);
     return { debug: buttonTexts };
-});
-logger.log('BUTTONS: ' + JSON.stringify(openedThread));
-if (openedThread) await organicPause('open_dm');
-await organicPause('between_actions');
+  });
+  logger.log('BUTTONS: ' + JSON.stringify(openedThread));
+  if (openedThread) await organicPause('open_dm');
+  await organicPause('between_actions');
 
   try {
     await page.waitForFunction(
