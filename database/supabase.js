@@ -2185,6 +2185,30 @@ async function getClientOutsideScheduleStatus(clientId) {
   return `Outside schedule. Sends between ${firstWindow} (${tzLabel}).`;
 }
 
+async function getCampaignOutsideScheduleResume(clientId, campaignId) {
+  const sb = getSupabase();
+  if (!sb || !clientId || !campaignId) return null;
+  const { data: campaign, error } = await sb
+    .from('cold_dm_campaigns')
+    .select('id, name, schedule_start_time, schedule_end_time, timezone')
+    .eq('id', campaignId)
+    .eq('client_id', clientId)
+    .maybeSingle();
+  if (error || !campaign) return null;
+  if (isWithinSchedule(campaign.schedule_start_time, campaign.schedule_end_time, campaign.timezone ?? null)) {
+    return null;
+  }
+  const nextStart = getNextScheduleStartInTimezone(campaign.schedule_start_time, campaign.timezone ?? null);
+  const availableAt = nextStart ? nextStart.toISOString() : computeAvailableAtIso(15 * 60);
+  return {
+    campaignId,
+    campaignName: campaign.name || campaign.id,
+    resumeAt: nextStart || new Date(availableAt),
+    availableAt,
+    message: formatOutsideScheduleResumeMessage(campaign.timezone ?? null, nextStart, availableAt),
+  };
+}
+
 /**
  * Returns the status message and reason when there is no sendable work for this client
  * (outside schedule, daily limit, hourly limit, or no pending leads).
@@ -5535,6 +5559,7 @@ module.exports = {
   getNextPendingWorkAnyClient,
   getOrResolveColdDmProxyUrl,
   getClientOutsideScheduleStatus,
+  getCampaignOutsideScheduleResume,
   getClientNoWorkReason,
   getClientNoWorkResumeAt,
   getNoWorkHint,

@@ -5963,6 +5963,30 @@ async function drainSleep(ms, label) {
     if (session.scrape_cooldown_until) {
       const scrapeCooldownUntilMs = new Date(session.scrape_cooldown_until).getTime();
       if (Number.isFinite(scrapeCooldownUntilMs) && scrapeCooldownUntilMs > Date.now()) {
+        const scheduleBlocker =
+          typeof sb.getCampaignOutsideScheduleResume === 'function'
+            ? await sb.getCampaignOutsideScheduleResume(clientId, work.campaignId).catch(() => null)
+            : null;
+        const scheduleResumeMs = scheduleBlocker?.resumeAt ? new Date(scheduleBlocker.resumeAt).getTime() : NaN;
+        if (scheduleBlocker?.message && (!Number.isFinite(scheduleResumeMs) || scheduleResumeMs >= scrapeCooldownUntilMs)) {
+          await sb.setClientStatusMessage(clientId, scheduleBlocker.message).catch(() => {});
+          await sb.updateSendJob(
+            claimedJob.id,
+            {
+              status: 'retry',
+              available_at: scheduleBlocker.availableAt || new Date(scheduleResumeMs).toISOString(),
+              last_error_class: 'outside_schedule',
+              last_error_message: scheduleBlocker.message,
+            },
+            SEND_WORKER_ID
+          ).catch(() => {});
+          await releaseClaimedCampaignLease(claimedJob.campaign_id);
+          await sb.releaseInstagramSessionLease(session.id, SEND_WORKER_ID).catch(() => {});
+          leasedSessionIdForSignal = null;
+          leasedCampaignIdForSignal = null;
+          await delay(400);
+          continue;
+        }
         const waitMs = scrapeCooldownUntilMs - Date.now();
         const statusMsg = `Scraping cooldown active for account safety. Sending resumes in ${formatDurationShort(waitMs)}.`;
         await sb.setClientStatusMessage(clientId, statusMsg).catch(() => {});
