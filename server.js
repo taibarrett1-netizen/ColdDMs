@@ -470,6 +470,9 @@ const SCRAPE_WORKER_ENTRY = process.env.SCRAPE_WORKER_ENTRY || 'workers/scrape-w
 const PER_CLIENT_PM2_WORKERS_ENABLED =
   process.env.COLD_DM_PER_CLIENT_PM2_WORKERS !== '0' &&
   process.env.COLD_DM_PER_CLIENT_PM2_WORKERS !== 'false';
+const LEGACY_SHARED_SEND_WORKER_ENABLED =
+  process.env.COLD_DM_ALLOW_LEGACY_SHARED_SEND_WORKER === '1' ||
+  process.env.COLD_DM_ALLOW_LEGACY_SHARED_SEND_WORKER === 'true';
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 const SEND_SCRAPE_COOLDOWN_MS = Math.max(
   60 * 1000,
@@ -930,6 +933,15 @@ function sendWorkerPm2ClusterInstances() {
  * - missing: start by script+name (cluster `-i N`, same as ecosystem.config.cjs)
  */
 async function ensureSendWorkerProcess() {
+  if (PER_CLIENT_PM2_WORKERS_ENABLED && !LEGACY_SHARED_SEND_WORKER_ENABLED) {
+    return {
+      ok: false,
+      action: 'legacy_shared_send_worker_disabled',
+      out:
+        `Refusing to start shared ${BOT_PM2_NAME}; per-client PM2 workers are enabled. ` +
+        `Use ensureClientWorkerStack(clientId), or set COLD_DM_ALLOW_LEGACY_SHARED_SEND_WORKER=1 to opt in.`,
+    };
+  }
   const status = await getPm2AppStatusByName(BOT_PM2_NAME);
   if (!status.error && status.online) {
     return { ok: true, action: 'noop_online', out: `already online (${BOT_PM2_NAME})` };
