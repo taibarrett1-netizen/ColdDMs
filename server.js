@@ -4,8 +4,7 @@ const cookieParser = require('cookie-parser');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { exec, spawn } = require('child_process');
-const pm2 = require('pm2');
+const { exec, execFile, spawn } = require('child_process');
 const multer = require('multer');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { getDailyStats, getRecentSent, getControl, setControl, alreadySent, clearFailedAttempts } = require('./database/db');
@@ -581,7 +580,7 @@ app.post('/api/admin/update', (req, res) => {
   }, 25);
 });
 
-app.post('/api/admin/assign-client', (req, res) => {
+app.post('/api/admin/assign-client', async (req, res) => {
   const clientId = (req.body?.clientId || '').toString().trim();
   if (!clientId) {
     return res.status(400).json({ ok: false, error: 'clientId is required' });
@@ -591,17 +590,40 @@ app.post('/api/admin/assign-client', (req, res) => {
     ip: req.ip,
     userAgent: req.get('user-agent') || null,
   });
-  // Respond first so Edge does not timeout while PM2 starts workers.
-  res.json({ ok: true, clientId, accepted: true });
-  setTimeout(() => {
-    ensureClientWorkerStack(clientId).then((result) => {
-      if (!result.ok) {
-        console.error(`[API] assign-client failed to spawn workers clientId=${clientId.slice(0, 8)} error=${result.error || 'unknown'}`);
-      }
-    }).catch((e) => {
-      console.error(`[API] assign-client worker spawn exception clientId=${clientId.slice(0, 8)}`, e);
-    });
-  }, 10);
+  const syncTimeoutMs = Math.max(1000, parseInt(process.env.ASSIGN_CLIENT_SYNC_TIMEOUT_MS || '15000', 10) || 15000);
+  let timedOut = false;
+  const ensurePromise = ensureClientWorkerStack(clientId);
+  const timeoutPromise = new Promise((resolve) => {
+    setTimeout(() => {
+      timedOut = true;
+      resolve({ ok: false, timeout: true });
+    }, syncTimeoutMs);
+  });
+  const result = await Promise.race([ensurePromise, timeoutPromise]);
+  if (timedOut) {
+    ensurePromise
+      .then((lateResult) => {
+        if (!lateResult.ok) {
+          console.error(`[API] assign-client failed to spawn workers clientId=${clientId.slice(0, 8)} error=${lateResult.error || 'unknown'}`);
+        }
+      })
+      .catch((e) => {
+        console.error(`[API] assign-client worker spawn exception clientId=${clientId.slice(0, 8)}`, e);
+      });
+    return res.status(202).json({ ok: true, clientId, accepted: true, workersReady: false, timeoutMs: syncTimeoutMs });
+  }
+  if (!result.ok) {
+    console.error(`[API] assign-client failed to spawn workers clientId=${clientId.slice(0, 8)} error=${result.error || 'unknown'}`);
+    return res.status(500).json({ ok: false, clientId, error: result.error || 'worker_spawn_failed' });
+  }
+  res.json({
+    ok: true,
+    clientId,
+    accepted: true,
+    workersReady: true,
+    sendName: result.sendName,
+    scrapeName: result.scrapeName,
+  });
 });
 
 app.get('/api/admin/clients', (_req, res) => {
@@ -978,21 +1000,40 @@ async function listActiveClientIdsFromPm2() {
   ];
 }
 
-function pm2ConnectAsync() {
-  return new Promise((resolve, reject) => {
-    pm2.connect((err) => (err ? reject(err) : resolve()));
-  });
-}
-
-function pm2DisconnectSafe() {
-  try {
-    pm2.disconnect();
-  } catch (_) {}
-}
-
-function pm2StartAsync(options) {
-  return new Promise((resolve, reject) => {
-    pm2.start(options, (err, apps) => (err ? reject(err) : resolve(apps)));
+function execPm2File(args, env, auditCommand) {
+  const startedAt = Date.now();
+  const commandId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(8).toString('hex');
+  dashboardDebugState.lastPm2Command = {
+    commandId,
+    command: auditCommand,
+    startedAt: new Date(startedAt).toISOString(),
+  };
+  appendDashboardAudit('pm2_command_start', dashboardDebugState.lastPm2Command);
+  return new Promise((resolve) => {
+    execFile('pm2', args, { cwd: projectRoot, env }, (err, stdout, stderr) => {
+      const done = {
+        commandId,
+        command: auditCommand,
+        ok: !err,
+        durationMs: Date.now() - startedAt,
+        err: err ? { message: err.message, code: err.code, signal: err.signal, killed: err.killed } : null,
+        stdoutPreview: String(stdout || '').slice(0, 1000),
+        stderrPreview: String(stderr || '').slice(0, 1000),
+      };
+      dashboardDebugState.lastPm2Command = {
+        ...dashboardDebugState.lastPm2Command,
+        ...done,
+        finishedAt: new Date().toISOString(),
+      };
+      appendDashboardAudit('pm2_command_finish', done);
+      resolve({
+        ok: !err,
+        err,
+        stdout: (stdout || '').toString(),
+        stderr: (stderr || '').toString(),
+        out: (((stdout || '') + (stderr || '')).toString() || '').trim(),
+      });
+    });
   });
 }
 
@@ -1086,19 +1127,34 @@ async function startClientProcessIfMissing(processName, script, env, outFile, er
       /^ig-dm-(dashboard|send|scrape)(-|$)/.test(key)
     ),
   });
-  await pm2StartAsync({
-    name: processName,
-    script,
-    cwd: projectRoot,
-    exec_mode: 'fork',
-    autorestart: true,
-    max_restarts: 20,
-    min_uptime: 5000,
-    out_file: outFile,
-    error_file: errorFile,
-    env,
-    updateEnv: true,
-  });
+  const args = status.exists
+    ? ['restart', processName, '--update-env']
+    : [
+        'start',
+        script,
+        '--name',
+        processName,
+        '--cwd',
+        projectRoot,
+        '--output',
+        outFile,
+        '--error',
+        errorFile,
+        '--log-date-format',
+        'YYYY-MM-DD HH:mm:ss Z',
+        '--max-restarts',
+        '20',
+        '--min-uptime',
+        '5000',
+        '--update-env',
+      ];
+  const auditCommand = status.exists
+    ? `pm2 restart ${processName} --update-env`
+    : `pm2 start ${script} --name ${processName} --cwd ${projectRoot} --update-env`;
+  const result = await execPm2File(args, env, auditCommand);
+  if (!result.ok) {
+    throw result.err || new Error(result.stderr || result.stdout || `pm2 failed for ${processName}`);
+  }
   return { ok: true, action: status.exists ? 'restart_existing' : 'create_missing' };
 }
 
@@ -1122,7 +1178,6 @@ async function ensureClientWorkerStack(clientId) {
   const scrapeOut = path.join(projectRoot, 'logs', `scrape-${normalizedClientId}.out.log`);
   const scrapeErr = path.join(projectRoot, 'logs', `scrape-${normalizedClientId}.err.log`);
 
-  await pm2ConnectAsync();
   try {
     await startClientProcessIfMissing(sendName, SEND_WORKER_ENTRY, mergedEnv, sendOut, sendErr);
     await startClientProcessIfMissing(scrapeName, SCRAPE_WORKER_ENTRY, mergedEnv, scrapeOut, scrapeErr);
@@ -1144,8 +1199,6 @@ async function ensureClientWorkerStack(clientId) {
     };
     appendDashboardAudit('ensure_client_worker_stack_error', dashboardDebugState.lastWorkerEnsure);
     return { ok: false, error: e?.message || String(e) };
-  } finally {
-    pm2DisconnectSafe();
   }
 }
 

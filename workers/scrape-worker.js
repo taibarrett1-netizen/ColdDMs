@@ -8,6 +8,8 @@
 require('dotenv').config({ quiet: true });
 
 const os = require('os');
+const fs = require('fs');
+const path = require('path');
 const logger = require('../utils/logger');
 const sb = require('../database/supabase');
 const legacyScraper = require('../scraper');
@@ -40,6 +42,15 @@ const SCRAPER_POLL_MS = Math.max(1000, parseInt(process.env.SCRAPER_WORKER_POLL_
 const SCRAPER_SLOT_POLL_MS = Math.max(50, parseInt(process.env.SCRAPER_SLOT_POLL_MS || '400', 10) || 400);
 const LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 const MAX_CONCURRENT = Math.max(1, parseInt(process.env.SCRAPE_MAX_CONCURRENT || '1', 10) || 1);
+const VPS_MAX_CONCURRENT_SCRAPES = Math.max(
+  1,
+  parseInt(process.env.COLD_DM_MAX_CONCURRENT_SCRAPES_PER_VPS || '1', 10) || 1
+);
+const SCRAPER_SLOT_DIR = process.env.SCRAPER_GLOBAL_SLOT_DIR || path.join(os.tmpdir(), 'cold-dm-scrape-slots');
+const SCRAPER_GLOBAL_SLOT_STALE_MS = Math.max(
+  10 * 60 * 1000,
+  parseInt(process.env.SCRAPER_GLOBAL_SLOT_STALE_MS || String(2 * 60 * 60 * 1000), 10) || 2 * 60 * 60 * 1000
+);
 const SEND_SCRAPE_COOLDOWN_MS = Math.max(
   60 * 1000,
   parseInt(process.env.SEND_SCRAPE_COOLDOWN_MS || String(5 * 60 * 1000), 10) || 5 * 60 * 1000
@@ -64,6 +75,71 @@ function delay(ms) {
 function backoffMs(attempt, minMs = CLAIM_ERROR_BACKOFF_MIN_MS, maxMs = CLAIM_ERROR_BACKOFF_MAX_MS) {
   const exp = Math.min(maxMs, minMs * Math.pow(2, Math.min(Math.max(0, attempt), 6)));
   return Math.min(maxMs, exp + Math.floor(exp * (0.2 + Math.random() * 0.3)));
+}
+
+function pidLooksAlive(pid) {
+  const n = Number(pid);
+  if (!Number.isFinite(n) || n <= 0) return false;
+  try {
+    process.kill(n, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseScrapeSlot(slot) {
+  if (!slot?.dir) return;
+  try {
+    fs.rmSync(slot.dir, { recursive: true, force: true });
+  } catch (_) {}
+}
+
+function touchScrapeSlot(slot) {
+  if (!slot?.file) return;
+  try {
+    fs.writeFileSync(
+      slot.file,
+      JSON.stringify({
+        pid: process.pid,
+        workerId: slot.workerId,
+        clientId: clientId || null,
+        touchedAt: new Date().toISOString(),
+      })
+    );
+  } catch (_) {}
+}
+
+function acquireScrapeSlot(workerId) {
+  fs.mkdirSync(SCRAPER_SLOT_DIR, { recursive: true });
+  const now = Date.now();
+  for (let i = 0; i < VPS_MAX_CONCURRENT_SCRAPES; i++) {
+    const dir = path.join(SCRAPER_SLOT_DIR, `slot-${i}`);
+    const file = path.join(dir, 'owner.json');
+    try {
+      fs.mkdirSync(dir);
+      const slot = { dir, file, workerId, index: i };
+      touchScrapeSlot(slot);
+      return slot;
+    } catch (e) {
+      if (e?.code !== 'EEXIST') throw e;
+      try {
+        const stat = fs.statSync(file);
+        const raw = fs.readFileSync(file, 'utf8');
+        const owner = JSON.parse(raw || '{}');
+        const staleByAge = now - stat.mtimeMs > SCRAPER_GLOBAL_SLOT_STALE_MS;
+        const staleByPid = owner?.pid && !pidLooksAlive(owner.pid);
+        if (staleByAge || staleByPid) {
+          fs.rmSync(dir, { recursive: true, force: true });
+          i -= 1;
+        }
+      } catch {
+        fs.rmSync(dir, { recursive: true, force: true });
+        i -= 1;
+      }
+    }
+  }
+  return null;
 }
 
 async function processOneJob(workerId, job) {
@@ -204,7 +280,7 @@ async function main() {
   const workerId = `scrape-${os.hostname()}-${process.pid}-${Date.now().toString(36)}`;
   logger.log(
     `[scrape-worker] started id=${workerId} idle_poll=${SCRAPER_POLL_MS}ms slot_poll=${SCRAPER_SLOT_POLL_MS}ms ` +
-      `concurrency=${MAX_CONCURRENT} lease=${LEASE_SEC}s`
+      `concurrency=${MAX_CONCURRENT} vps_concurrency=${VPS_MAX_CONCURRENT_SCRAPES} lease=${LEASE_SEC}s`
   );
 
   const activeJobs = new Map();
@@ -219,6 +295,10 @@ async function main() {
     }
 
     while (activeJobs.size < MAX_CONCURRENT) {
+      const scrapeSlot = acquireScrapeSlot(workerId);
+      if (!scrapeSlot) {
+        break;
+      }
       let job = null;
       try {
         job = await sb.claimColdDmScrapeJob(workerId, LEASE_SEC);
@@ -231,17 +311,25 @@ async function main() {
         logger.warn(
           `[scrape-worker] claim failed; backing off ${Math.ceil(waitMs / 1000)}s (${e?.message || e}${cause})`
         );
+        releaseScrapeSlot(scrapeSlot);
         await delay(waitMs);
         break;
       }
-      if (!job) break;
+      if (!job) {
+        releaseScrapeSlot(scrapeSlot);
+        break;
+      }
 
       logger.log(
         `[scrape-worker] claimed job=${job.id} client=${job.client_id} type=${job.scrape_type || 'followers'} ` +
-          `target=@${String(job.target_username || '').replace(/^@/, '') || '—'} active=${activeJobs.size + 1}/${MAX_CONCURRENT}`
+          `target=@${String(job.target_username || '').replace(/^@/, '') || '—'} active=${activeJobs.size + 1}/${MAX_CONCURRENT} ` +
+          `vpsSlot=${scrapeSlot.index + 1}/${VPS_MAX_CONCURRENT_SCRAPES}`
       );
 
+      const slotHeartbeat = setInterval(() => touchScrapeSlot(scrapeSlot), Math.min(30000, WORKER_HEARTBEAT_MS));
       const p = processOneJob(workerId, job).finally(() => {
+        clearInterval(slotHeartbeat);
+        releaseScrapeSlot(scrapeSlot);
         activeJobs.delete(job.id);
       });
       activeJobs.set(job.id, p);
