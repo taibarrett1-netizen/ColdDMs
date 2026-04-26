@@ -1,17 +1,16 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const { exec, spawn } = require('child_process');
+const { exec, execFile, spawn } = require('child_process');
 const multer = require('multer');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { getDailyStats, getRecentSent, getControl, setControl, alreadySent, clearFailedAttempts } = require('./database/db');
 const {
   isSupabaseConfigured,
   getClientId,
-  setClientId,
   getControl: getControlSupabase,
   setControl: setControlSupabase,
   getClientStatusMessage: getClientStatusMessageSupabase,
@@ -47,6 +46,7 @@ const {
   releaseAllCampaignSendLeases,
   getClientIdsWithPauseZero,
   getLatestSuccessfulColdDmSentAt,
+  getClientsOnCurrentVps,
 } = require('./database/supabase');
 const {
   loadLeadsFromCSV,
@@ -70,9 +70,145 @@ const voiceNotesDir = path.join(projectRoot, 'voice-notes');
 const followUpScreenshotsDir = path.join(projectRoot, 'follow-up-screenshots');
 const loginDebugScreenshotsDir = path.join(projectRoot, 'logs', 'login-debug');
 const PROCESS_BOOT_ID = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
+const dashboardAuditPath = path.join(projectRoot, 'logs', 'dashboard-restart-audit.log');
+const dashboardStartedAt = Date.now();
+const dashboardDebugState = {
+  recentRequests: [],
+  lastAdminUpdate: null,
+  lastControlStart: null,
+  lastPm2Command: null,
+  lastWorkerEnsure: null,
+  signalCounts: {},
+};
+
+function safeJson(value) {
+  return JSON.stringify(value, (_key, val) => {
+    if (val instanceof Error) {
+      return { name: val.name, message: val.message, stack: val.stack };
+    }
+    if (typeof val === 'bigint') return val.toString();
+    if (typeof val === 'function') return `[Function ${val.name || 'anonymous'}]`;
+    return val;
+  });
+}
+
+function redactForAudit(value) {
+  const secretKeyPattern = /(SECRET|PASSWORD|TOKEN|API_KEY|SERVICE_ROLE|SUPABASE_DB_URL|DATABASE_URL|DB_URL|JWT|BEARER|COOKIE)/i;
+  const redactString = (s) => {
+    if (/eyJ[a-zA-Z0-9_-]+\./.test(s)) return '[REDACTED_JWT]';
+    if (s.length > 120 && /[A-Za-z0-9+/=_-]{80,}/.test(s)) return '[REDACTED_LONG_SECRET]';
+    return s;
+  };
+  const walk = (val, key = '') => {
+    if (val == null) return val;
+    if (secretKeyPattern.test(key)) return '[REDACTED]';
+    if (typeof val === 'string') return redactString(val);
+    if (Array.isArray(val)) return val.map((item) => walk(item));
+    if (typeof val === 'object') {
+      const out = {};
+      for (const [childKey, childValue] of Object.entries(val)) {
+        out[childKey] = walk(childValue, childKey);
+      }
+      return out;
+    }
+    return val;
+  };
+  return walk(value);
+}
+
+function appendDashboardAudit(event, details = {}) {
+  const entry = {
+    at: new Date().toISOString(),
+    event,
+    bootId: PROCESS_BOOT_ID,
+    pid: process.pid,
+    ppid: process.ppid,
+    pmId: process.env.pm_id || null,
+    uptimeMs: Math.round(process.uptime() * 1000),
+    ...redactForAudit(details),
+  };
+  const line = `${safeJson(entry)}\n`;
+  try {
+    fs.mkdirSync(path.dirname(dashboardAuditPath), { recursive: true });
+    fs.appendFileSync(dashboardAuditPath, line);
+  } catch (_) {}
+  try {
+    if (process.env.DASHBOARD_AUDIT_CONSOLE === '1' || process.env.DASHBOARD_AUDIT_CONSOLE === 'true') {
+      console.log(`[dashboard:audit] ${event} ${safeJson(redactForAudit(details))}`);
+    }
+  } catch (_) {}
+}
+
+function dashboardDebugSnapshot(extra = {}) {
+  return {
+    uptimeMs: Date.now() - dashboardStartedAt,
+    memory: process.memoryUsage(),
+    activeHandles: typeof process._getActiveHandles === 'function' ? process._getActiveHandles().length : null,
+    activeRequests: typeof process._getActiveRequests === 'function' ? process._getActiveRequests().length : null,
+    state: dashboardDebugState,
+    ...extra,
+  };
+}
+
+process.on('exit', (code) => {
+  appendDashboardAudit('process_exit', dashboardDebugSnapshot({ code }));
+});
+process.on('SIGINT', () => {
+  dashboardDebugState.signalCounts.SIGINT = (dashboardDebugState.signalCounts.SIGINT || 0) + 1;
+  appendDashboardAudit('signal_SIGINT', dashboardDebugSnapshot());
+});
+process.on('SIGTERM', () => {
+  dashboardDebugState.signalCounts.SIGTERM = (dashboardDebugState.signalCounts.SIGTERM || 0) + 1;
+  appendDashboardAudit('signal_SIGTERM', dashboardDebugSnapshot());
+});
+process.on('uncaughtException', (err) => {
+  appendDashboardAudit('uncaught_exception', dashboardDebugSnapshot({ err }));
+  process.exitCode = 1;
+});
+process.on('unhandledRejection', (reason) => {
+  appendDashboardAudit('unhandled_rejection', dashboardDebugSnapshot({ reason }));
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  const entry = {
+    id: crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(8).toString('hex'),
+    method: req.method,
+    path: req.path,
+    action: req.body?.action || null,
+    clientId: req.body?.clientId || req.query?.clientId || null,
+    ip: req.ip,
+    userAgent: req.get('user-agent') || null,
+    startedAt: new Date(startedAt).toISOString(),
+  };
+  dashboardDebugState.recentRequests.push(entry);
+  dashboardDebugState.recentRequests = dashboardDebugState.recentRequests.slice(-30);
+  if (
+    req.path === '/api/admin/update' ||
+    req.path === '/api/control/start' ||
+    req.path === '/api/admin/assign-client' ||
+    process.env.DASHBOARD_RESTART_DEBUG_VERBOSE === '1'
+  ) {
+    appendDashboardAudit('request_start', entry);
+  }
+  res.on('finish', () => {
+    const done = { ...entry, statusCode: res.statusCode, durationMs: Date.now() - startedAt };
+    const idx = dashboardDebugState.recentRequests.findIndex((r) => r.id === entry.id);
+    if (idx >= 0) dashboardDebugState.recentRequests[idx] = done;
+    if (
+      req.path === '/api/admin/update' ||
+      req.path === '/api/control/start' ||
+      req.path === '/api/admin/assign-client' ||
+      process.env.DASHBOARD_RESTART_DEBUG_VERBOSE === '1'
+    ) {
+      appendDashboardAudit('request_finish', done);
+    }
+  });
+  next();
+});
 
 const API_KEY = (process.env.COLD_DM_API_KEY || '').trim();
 const API_KEY_CLIENT_MAP = (process.env.COLD_DM_API_KEYS || '')
@@ -249,11 +385,6 @@ function requireScopedClientId(req, res) {
     res.status(400).json({ ok: false, error: 'clientId is required' });
     return null;
   }
-  const pinnedClientId = (process.env.COLD_DM_CLIENT_ID || '').trim();
-  if (pinnedClientId && pinnedClientId !== clientId) {
-    res.status(403).json({ ok: false, error: 'Forbidden: this worker is pinned to a different clientId' });
-    return null;
-  }
   if (req.authClientId && req.authClientId !== clientId) {
     res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
     return null;
@@ -389,8 +520,17 @@ app.post('/api/admin/update', (req, res) => {
     .trim() || 'main';
   const updateId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString('hex');
   const updateLogPath = `/tmp/cold-dm-update-${updateId}.log`;
+  dashboardDebugState.lastAdminUpdate = {
+    updateId,
+    branch,
+    acceptedAt: new Date().toISOString(),
+    ip: req.ip,
+    userAgent: req.get('user-agent') || null,
+    bodyKeys: Object.keys(req.body || {}),
+  };
 
   logger.log(`[admin:update] accepted updateId=${updateId} branch=${branch}`);
+  appendDashboardAudit('admin_update_accepted', dashboardDebugState.lastAdminUpdate);
   res.json({
     ok: true,
     accepted: true,
@@ -413,17 +553,30 @@ app.post('/api/admin/update', (req, res) => {
       `echo "[admin:update] start updateId=${updateId} branch=${branch} at=$(date -Is)"`,
       `git pull origin ${shQuote(branch)}`,
       'npm install',
+      `node - <<'NODE'
+const { execFileSync } = require('child_process');
+const list = JSON.parse(execFileSync('pm2', ['jlist'], { encoding: 'utf8' }) || '[]');
+for (const proc of list) {
+  const name = proc && proc.name;
+  if (typeof name === 'string' && /^ig-dm-(send|scrape)-/.test(name)) {
+    execFileSync('pm2', ['restart', name, '--update-env'], { stdio: 'inherit' });
+  }
+}
+NODE`,
       // Best-effort: load ecosystem if missing (no-op if already started).
       '(pm2 start ecosystem.config.cjs --update-env >/dev/null 2>&1 || true)',
-      // Restart workers first so even if the dashboard restart kills this runner, workers are already bounced.
-      '(pm2 restart ig-dm-send --update-env || pm2 start ecosystem.config.cjs --only ig-dm-send --update-env)',
-      '(pm2 restart ig-dm-scrape --update-env || pm2 start ecosystem.config.cjs --only ig-dm-scrape --update-env)',
       // Save before restarting the dashboard (the command below may kill this runner).
       '(pm2 save || true)',
       '(pm2 restart ig-dm-dashboard --update-env || pm2 start ecosystem.config.cjs --only ig-dm-dashboard --update-env)',
       'echo "[admin:update] done at=$(date -Is)"',
     ].join('\n');
     const runner = `(${script}) > ${shQuote(updateLogPath)} 2>&1`;
+    appendDashboardAudit('admin_update_runner_spawn', {
+      updateId,
+      branch,
+      updateLogPath,
+      willRestartDashboard: true,
+    });
     try {
       const child = spawn('bash', ['-lc', runner], {
         cwd: projectRoot,
@@ -437,29 +590,56 @@ app.post('/api/admin/update', (req, res) => {
   }, 25);
 });
 
-app.post('/api/admin/assign-client', (req, res) => {
-  // Used by the Edge function when assigning a spare pool droplet to a client.
-  // Pins this droplet to that clientId so requests cannot target other tenants.
+app.post('/api/admin/assign-client', async (req, res) => {
   const clientId = (req.body?.clientId || '').toString().trim();
   if (!clientId) {
     return res.status(400).json({ ok: false, error: 'clientId is required' });
   }
-  try {
-    // Do not rewrite the whole .env (it contains secrets); patch just this key.
-    upsertEnvKey('COLD_DM_CLIENT_ID', clientId);
-    setClientId(clientId);
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: e?.message || String(e) || 'Failed to pin clientId' });
+  appendDashboardAudit('admin_assign_client_accepted', {
+    clientId,
+    ip: req.ip,
+    userAgent: req.get('user-agent') || null,
+  });
+  const syncTimeoutMs = Math.max(1000, parseInt(process.env.ASSIGN_CLIENT_SYNC_TIMEOUT_MS || '15000', 10) || 15000);
+  let timedOut = false;
+  const ensurePromise = ensureClientWorkerStack(clientId);
+  const timeoutPromise = new Promise((resolve) => {
+    setTimeout(() => {
+      timedOut = true;
+      resolve({ ok: false, timeout: true });
+    }, syncTimeoutMs);
+  });
+  const result = await Promise.race([ensurePromise, timeoutPromise]);
+  if (timedOut) {
+    ensurePromise
+      .then((lateResult) => {
+        if (!lateResult.ok) {
+          console.error(`[API] assign-client failed to spawn workers clientId=${clientId.slice(0, 8)} error=${lateResult.error || 'unknown'}`);
+        }
+      })
+      .catch((e) => {
+        console.error(`[API] assign-client worker spawn exception clientId=${clientId.slice(0, 8)}`, e);
+      });
+    return res.status(202).json({ ok: true, clientId, accepted: true, workersReady: false, timeoutMs: syncTimeoutMs });
   }
-  // IMPORTANT: respond before restarting. Restarting the process can kill this request mid-flight,
-  // which makes the Edge function hang/timeout even though the assignment succeeded.
-  res.json({ ok: true, clientId, restarting: true, bootIdBeforeRestart: PROCESS_BOOT_ID });
-  setTimeout(() => {
-    const cmd = 'pm2 restart ig-dm-dashboard --update-env';
-    exec(cmd, { maxBuffer: 4 * 1024 * 1024 }, (err) => {
-      if (err) console.error('[API] assign-client pm2 restart failed', err);
-    });
-  }, 50);
+  if (!result.ok) {
+    console.error(`[API] assign-client failed to spawn workers clientId=${clientId.slice(0, 8)} error=${result.error || 'unknown'}`);
+    return res.status(500).json({ ok: false, clientId, error: result.error || 'worker_spawn_failed' });
+  }
+  res.json({
+    ok: true,
+    clientId,
+    accepted: true,
+    workersReady: true,
+    sendName: result.sendName,
+    scrapeName: result.scrapeName,
+  });
+});
+
+app.get('/api/admin/clients', (_req, res) => {
+  listActiveClientIdsFromPm2()
+    .then((clientIds) => res.json({ ok: true, clientIds }))
+    .catch((e) => res.status(500).json({ ok: false, error: e?.message || String(e) }));
 });
 
 const { registerAdminLabRoutes } = require('./admin_lab/http');
@@ -471,16 +651,27 @@ const uploadVoice = multer({ dest: voiceNotesDir, limits: { fileSize: 25 * 1024 
 
 const BOT_PM2_NAME = 'ig-dm-send';
 const SCRAPE_PM2_NAME = 'ig-dm-scrape';
+const SEND_PM2_PREFIX = 'ig-dm-send-';
+const SCRAPE_PM2_PREFIX = 'ig-dm-scrape-';
 const SEND_WORKER_ENTRY = process.env.SEND_WORKER_ENTRY || 'workers/send-worker.js';
 const SCRAPE_WORKER_ENTRY = process.env.SCRAPE_WORKER_ENTRY || 'workers/scrape-worker.js';
+const PER_CLIENT_PM2_WORKERS_ENABLED =
+  process.env.COLD_DM_PER_CLIENT_PM2_WORKERS !== '0' &&
+  process.env.COLD_DM_PER_CLIENT_PM2_WORKERS !== 'false';
+const LEGACY_SHARED_SEND_WORKER_ENABLED =
+  process.env.COLD_DM_ALLOW_LEGACY_SHARED_SEND_WORKER === '1' ||
+  process.env.COLD_DM_ALLOW_LEGACY_SHARED_SEND_WORKER === 'true';
+const AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START =
+  process.env.COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START === '1' ||
+  process.env.COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START === 'true';
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 const SEND_SCRAPE_COOLDOWN_MS = Math.max(
   60 * 1000,
   parseInt(process.env.SEND_SCRAPE_COOLDOWN_MS || String(5 * 60 * 1000), 10) || 5 * 60 * 1000
 );
 const PROCESS_SCHEDULED_RESPONSES_FALLBACK_ENABLED =
-  process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK !== '0' &&
-  process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK !== 'false';
+  process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK === '1' ||
+  process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK === 'true';
 const PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS = Math.max(
   30 * 1000,
   parseInt(process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS || '60000', 10) || 60000
@@ -489,8 +680,14 @@ const PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS = Math.max(
   30 * 1000,
   parseInt(process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS || '300000', 10) || 300000
 );
+const PROCESS_SCHEDULED_RESPONSES_FALLBACK_WARN_EVERY_MS = Math.max(
+  60 * 1000,
+  parseInt(process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK_WARN_EVERY_MS || String(15 * 60 * 1000), 10) ||
+    15 * 60 * 1000
+);
 
 let processScheduledResponsesFallbackInFlight = false;
+let processScheduledResponsesFallbackLastWarn = null;
 
 function formatDurationShort(ms) {
   const safeMs = Math.max(0, Number(ms) || 0);
@@ -545,6 +742,17 @@ function getProcessScheduledResponsesBearer() {
   return (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 }
 
+function warnProcessScheduledResponsesFallbackOnce(signature, message) {
+  const now = Date.now();
+  const shouldWarn =
+    !processScheduledResponsesFallbackLastWarn ||
+    processScheduledResponsesFallbackLastWarn.signature !== signature ||
+    now - processScheduledResponsesFallbackLastWarn.at >= PROCESS_SCHEDULED_RESPONSES_FALLBACK_WARN_EVERY_MS;
+  if (!shouldWarn) return;
+  processScheduledResponsesFallbackLastWarn = { signature, at: now };
+  logger.warn(message);
+}
+
 async function triggerProcessScheduledResponsesFallback(reason = 'interval') {
   if (processScheduledResponsesFallbackInFlight) {
     logger.log(`[process-scheduled-responses:fallback] skip overlapping tick reason=${reason}`);
@@ -579,7 +787,8 @@ async function triggerProcessScheduledResponsesFallback(reason = 'interval') {
     const text = await res.text().catch(() => '');
     const snippet = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400);
     if (!res.ok) {
-      logger.warn(
+      warnProcessScheduledResponsesFallbackOnce(
+        `status:${res.status}:${snippet}`,
         `[process-scheduled-responses:fallback] tick failed status=${res.status} reason=${reason} body=${snippet || 'n/a'}`
       );
       return;
@@ -593,7 +802,8 @@ async function triggerProcessScheduledResponsesFallback(reason = 'interval') {
       );
       return;
     }
-    logger.warn(
+    warnProcessScheduledResponsesFallbackOnce(
+      `exception:${e?.message || e}`,
       `[process-scheduled-responses:fallback] tick exception reason=${reason} error=${e?.message || e}`
     );
   } finally {
@@ -707,8 +917,38 @@ function getBotProcessRunning(cb) {
 }
 
 function execPm2(command) {
+  const isNoisyStatusCommand = /^pm2\s+jlist\b/.test(command);
+  const startedAt = Date.now();
+  const commandId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(8).toString('hex');
+  const stack = new Error('pm2 command caller').stack;
+  dashboardDebugState.lastPm2Command = {
+    commandId,
+    command,
+    startedAt: new Date(startedAt).toISOString(),
+    stack,
+  };
+  if (!isNoisyStatusCommand || process.env.DASHBOARD_RESTART_DEBUG_VERBOSE === '1') {
+    appendDashboardAudit('pm2_command_start', dashboardDebugState.lastPm2Command);
+  }
   return new Promise((resolve) => {
     exec(command, { cwd: projectRoot }, (err, stdout, stderr) => {
+      const done = {
+        commandId,
+        command,
+        ok: !err,
+        durationMs: Date.now() - startedAt,
+        err: err ? { message: err.message, code: err.code, signal: err.signal, killed: err.killed } : null,
+        stdoutPreview: String(stdout || '').slice(0, 1000),
+        stderrPreview: String(stderr || '').slice(0, 1000),
+      };
+      dashboardDebugState.lastPm2Command = {
+        ...dashboardDebugState.lastPm2Command,
+        ...done,
+        finishedAt: new Date().toISOString(),
+      };
+      if (!isNoisyStatusCommand || err || process.env.DASHBOARD_RESTART_DEBUG_VERBOSE === '1') {
+        appendDashboardAudit('pm2_command_finish', done);
+      }
       resolve({
         ok: !err,
         err,
@@ -735,6 +975,260 @@ async function getPm2AppStatusByName(appName) {
     };
   } catch (e) {
     return { exists: false, online: false, status: null, error: e };
+  }
+}
+
+function sanitizeClientIdForPm2(clientId) {
+  return String(clientId || '').trim().replace(/[^a-zA-Z0-9_-]+/g, '-');
+}
+
+function getSendWorkerPm2Name(clientId) {
+  return `${SEND_PM2_PREFIX}${sanitizeClientIdForPm2(clientId)}`;
+}
+
+function getScrapeWorkerPm2Name(clientId) {
+  return `${SCRAPE_PM2_PREFIX}${sanitizeClientIdForPm2(clientId)}`;
+}
+
+async function listPm2Processes() {
+  const res = await execPm2('pm2 jlist');
+  if (!res.ok) throw res.err || new Error(res.stderr || 'pm2 jlist failed');
+  const list = JSON.parse(res.stdout || '[]');
+  return Array.isArray(list) ? list : [];
+}
+
+async function listActiveClientIdsFromPm2() {
+  const list = await listPm2Processes();
+  return [
+    ...new Set(
+      list
+        .map((proc) => String(proc?.name || ''))
+        .filter((name) => name.startsWith(SEND_PM2_PREFIX))
+        .map((name) => name.slice(SEND_PM2_PREFIX.length))
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function execPm2File(args, env, auditCommand) {
+  const startedAt = Date.now();
+  const commandId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(8).toString('hex');
+  dashboardDebugState.lastPm2Command = {
+    commandId,
+    command: auditCommand,
+    startedAt: new Date(startedAt).toISOString(),
+  };
+  appendDashboardAudit('pm2_command_start', dashboardDebugState.lastPm2Command);
+  return new Promise((resolve) => {
+    execFile('pm2', args, { cwd: projectRoot, env }, (err, stdout, stderr) => {
+      const done = {
+        commandId,
+        command: auditCommand,
+        ok: !err,
+        durationMs: Date.now() - startedAt,
+        err: err ? { message: err.message, code: err.code, signal: err.signal, killed: err.killed } : null,
+        stdoutPreview: String(stdout || '').slice(0, 1000),
+        stderrPreview: String(stderr || '').slice(0, 1000),
+      };
+      dashboardDebugState.lastPm2Command = {
+        ...dashboardDebugState.lastPm2Command,
+        ...done,
+        finishedAt: new Date().toISOString(),
+      };
+      appendDashboardAudit('pm2_command_finish', done);
+      resolve({
+        ok: !err,
+        err,
+        stdout: (stdout || '').toString(),
+        stderr: (stderr || '').toString(),
+        out: (((stdout || '') + (stderr || '')).toString() || '').trim(),
+      });
+    });
+  });
+}
+
+function cleanEnvForPm2Child(extra = {}) {
+  const forbiddenExact = new Set([
+    'NODE_APP_INSTANCE',
+    'PM2_HOME',
+    'PM2_JSON_PROCESSING',
+    'PM2_PROGRAMMATIC',
+    'PM2_USAGE',
+    'OLDPWD',
+    '_',
+    'axm_actions',
+    'axm_dynamic',
+    'axm_monitor',
+    'axm_options',
+    'automation',
+    'autostart',
+    'autorestart',
+    'created_at',
+    'cwd',
+    'env',
+    'exec_interpreter',
+    'exec_mode',
+    'filter_env',
+    'instance_var',
+    'kill_retry_time',
+    'log_date_format',
+    'max_memory_restart',
+    'max_restarts',
+    'merge_logs',
+    'min_uptime',
+    'name',
+    'namespace',
+    'node_args',
+    'pm_cwd',
+    'pm_err_log_path',
+    'pm_exec_path',
+    'pm_id',
+    'pm_out_log_path',
+    'pm_pid_path',
+    'pm_uptime',
+    'pmx',
+    'restart_time',
+    'status',
+    'treekill',
+    'unstable_restarts',
+    'updateEnv',
+    'username',
+    'version',
+    'vizion',
+    'watch',
+    'windowsHide',
+  ]);
+  const forbiddenPrefixes = ['pm_', 'axm_'];
+  const forbiddenAppNamePattern = /^ig-dm-(dashboard|send|scrape)(-|$)/;
+  const env = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (forbiddenExact.has(key)) continue;
+    if (forbiddenPrefixes.some((prefix) => key.startsWith(prefix))) continue;
+    if (forbiddenAppNamePattern.test(key)) continue;
+    env[key] = value;
+  }
+  return { ...env, ...extra };
+}
+
+async function startClientProcessIfMissing(processName, script, env, outFile, errorFile) {
+  const status = await getPm2AppStatusByName(processName);
+  if (!status.error && status.online) {
+    appendDashboardAudit('pm2_child_start_skipped_existing_online', {
+      processName,
+      script,
+      statusBeforeStart: status,
+    });
+    return { ok: true, action: 'noop_online' };
+  }
+  appendDashboardAudit('pm2_child_start_request', {
+    processName,
+    script,
+    outFile,
+    errorFile,
+    statusBeforeStart: status,
+    leakedPm2KeysPresent: Object.keys(env || {}).filter((key) =>
+      key === 'name' ||
+      key === 'pm_exec_path' ||
+      key === 'pm_cwd' ||
+      key === 'pm_id' ||
+      key === 'NODE_APP_INSTANCE' ||
+      key.startsWith('pm_') ||
+      key.startsWith('axm_') ||
+      /^ig-dm-(dashboard|send|scrape)(-|$)/.test(key)
+    ),
+  });
+  const args = status.exists
+    ? ['restart', processName, '--update-env']
+    : [
+        'start',
+        script,
+        '--name',
+        processName,
+        '--cwd',
+        projectRoot,
+        '--output',
+        outFile,
+        '--error',
+        errorFile,
+        '--log-date-format',
+        'YYYY-MM-DD HH:mm:ss Z',
+        '--max-restarts',
+        '20',
+        '--update-env',
+      ];
+  const auditCommand = status.exists
+    ? `pm2 restart ${processName} --update-env`
+    : `pm2 start ${script} --name ${processName} --cwd ${projectRoot} --update-env`;
+  const result = await execPm2File(args, env, auditCommand);
+  if (!result.ok) {
+    throw result.err || new Error(result.stderr || result.stdout || `pm2 failed for ${processName}`);
+  }
+  return { ok: true, action: status.exists ? 'restart_existing' : 'create_missing' };
+}
+
+async function ensureClientWorkerStack(clientId) {
+  const normalizedClientId = String(clientId || '').trim();
+  if (!normalizedClientId) return { ok: false, error: 'Missing clientId' };
+  dashboardDebugState.lastWorkerEnsure = {
+    kind: 'client_stack',
+    clientId: normalizedClientId,
+    startedAt: new Date().toISOString(),
+  };
+  appendDashboardAudit('ensure_client_worker_stack_start', dashboardDebugState.lastWorkerEnsure);
+  if (!String(process.env.COLD_DM_VPS_IP || '').trim()) {
+    await detectLocalPublicIp().catch(() => '');
+  }
+  const sendName = getSendWorkerPm2Name(normalizedClientId);
+  const scrapeName = getScrapeWorkerPm2Name(normalizedClientId);
+  const mergedEnv = cleanEnvForPm2Child({ COLD_DM_CLIENT_ID: normalizedClientId });
+  const sendOut = path.join(projectRoot, 'logs', `send-${normalizedClientId}.out.log`);
+  const sendErr = path.join(projectRoot, 'logs', `send-${normalizedClientId}.err.log`);
+  const scrapeOut = path.join(projectRoot, 'logs', `scrape-${normalizedClientId}.out.log`);
+  const scrapeErr = path.join(projectRoot, 'logs', `scrape-${normalizedClientId}.err.log`);
+
+  try {
+    await startClientProcessIfMissing(sendName, SEND_WORKER_ENTRY, mergedEnv, sendOut, sendErr);
+    await startClientProcessIfMissing(scrapeName, SCRAPE_WORKER_ENTRY, mergedEnv, scrapeOut, scrapeErr);
+    dashboardDebugState.lastWorkerEnsure = {
+      ...dashboardDebugState.lastWorkerEnsure,
+      sendName,
+      scrapeName,
+      finishedAt: new Date().toISOString(),
+      ok: true,
+    };
+    appendDashboardAudit('ensure_client_worker_stack_finish', dashboardDebugState.lastWorkerEnsure);
+    return { ok: true, sendName, scrapeName };
+  } catch (e) {
+    dashboardDebugState.lastWorkerEnsure = {
+      ...dashboardDebugState.lastWorkerEnsure,
+      finishedAt: new Date().toISOString(),
+      ok: false,
+      error: e?.message || String(e),
+    };
+    appendDashboardAudit('ensure_client_worker_stack_error', dashboardDebugState.lastWorkerEnsure);
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
+async function detectLocalPublicIp() {
+  if ((process.env.COLD_DM_VPS_IP || '').trim()) return process.env.COLD_DM_VPS_IP.trim();
+  try {
+    const ip = await fetchTextWithTimeout('http://169.254.169.254/metadata/v1/interfaces/public/0/ipv4/address', 2500);
+    if (ip) process.env.COLD_DM_VPS_IP = ip;
+    return ip;
+  } catch {
+    return '';
+  }
+}
+
+async function ensureAssignedClientWorkerStacksOnStartup() {
+  await detectLocalPublicIp().catch(() => '');
+  const clientIds = await getClientsOnCurrentVps().catch(() => []);
+  for (const clientId of clientIds) {
+    const result = await ensureClientWorkerStack(clientId);
+    if (!result.ok) {
+      console.error(`[pm2:auto-ensure] client stack failed on startup clientId=${String(clientId).slice(0, 8)} error=${result.error || 'unknown'}`);
+    }
   }
 }
 
@@ -768,6 +1262,15 @@ function sendWorkerPm2ClusterInstances() {
  * - missing: start by script+name (cluster `-i N`, same as ecosystem.config.cjs)
  */
 async function ensureSendWorkerProcess() {
+  if (PER_CLIENT_PM2_WORKERS_ENABLED && !LEGACY_SHARED_SEND_WORKER_ENABLED) {
+    return {
+      ok: false,
+      action: 'legacy_shared_send_worker_disabled',
+      out:
+        `Refusing to start shared ${BOT_PM2_NAME}; per-client PM2 workers are enabled. ` +
+        `Use ensureClientWorkerStack(clientId), or set COLD_DM_ALLOW_LEGACY_SHARED_SEND_WORKER=1 to opt in.`,
+    };
+  }
   const status = await getPm2AppStatusByName(BOT_PM2_NAME);
   if (!status.error && status.online) {
     return { ok: true, action: 'noop_online', out: `already online (${BOT_PM2_NAME})` };
@@ -822,29 +1325,18 @@ async function ensureAssignedClientWorkerStack(reason) {
     return;
   }
 
-  const results = await Promise.allSettled([
-    ensureSendWorkerProcess(),
-    ensureScrapeWorkerProcess(),
-  ]);
-
-  const labels = ['send', 'scrape'];
-  results.forEach((result, idx) => {
-    const label = labels[idx];
-    if (result.status === 'rejected') {
-      console.error(`[pm2:auto-ensure] ${label} worker failed reason=${reason}`, result.reason);
-      return;
-    }
-    if (!result.value.ok) {
-      const detail = String(result.value.out || result.value.err?.message || 'pm2 ensure failed').slice(0, 220);
-      console.error(`[pm2:auto-ensure] ${label} worker failed reason=${reason}: ${detail}`);
-      return;
-    }
-    if (result.value.action !== 'noop_online') {
-      console.log(
-        `[pm2:auto-ensure] ${label} worker ${result.value.action} reason=${reason} clientId=${assignedClientId.slice(0, 8)}`
-      );
-    }
-  });
+  const result = await ensureClientWorkerStack(assignedClientId);
+  if (!result.ok) {
+    console.error(
+      `[pm2:auto-ensure] client worker stack failed reason=${reason} clientId=${assignedClientId.slice(0, 8)} error=${
+        result.error || 'unknown'
+      }`
+    );
+    return;
+  }
+  console.log(
+    `[pm2:auto-ensure] client worker stack ready reason=${reason} clientId=${assignedClientId.slice(0, 8)} send=${result.sendName}`
+  );
 }
 
 const STATUS_TIMEOUT_MS = 8000; // respond before typical Edge Function timeouts (~10–15s); status uses fast queries
@@ -1622,6 +2114,7 @@ app.post('/api/voice/upload', uploadVoice.single('file'), (req, res) => {
 const pending2FAMap = new Map();
 const pendingScraper2FAMap = new Map();
 const pendingEmailVerifyMap = new Map();
+const reconnectLocksByClientId = new Map();
 const PENDING_2FA_TTL_MS = 2 * 60 * 1000;
 
 function cleanupExpired2FA() {
@@ -1675,7 +2168,12 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
   if (!username || !password || !clientId) {
     return res.status(400).json({ ok: false, error: 'username, password, and clientId are required' });
   }
+  if (reconnectLocksByClientId.get(String(clientId))) {
+    return res.status(409).json({ ok: false, error: 'A reconnect is already in progress for this client. Please wait and retry.' });
+  }
+  reconnectLocksByClientId.set(String(clientId), true);
   if (!isSupabaseConfigured()) {
+    reconnectLocksByClientId.delete(String(clientId));
     return res.status(503).json({ ok: false, error: 'Supabase not configured' });
   }
   try {
@@ -1803,6 +2301,8 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
       });
     }
     res.status(500).json({ ok: false, error: e.message || 'Login failed' });
+  } finally {
+    reconnectLocksByClientId.delete(String(clientId));
   }
 });
 
@@ -1921,6 +2421,16 @@ app.post('/api/control/start', async (req, res) => {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
   const campaignId = req.body?.campaignId || null;
+  dashboardDebugState.lastControlStart = {
+    clientId: clientId || null,
+    campaignId,
+    receivedAt: new Date().toISOString(),
+    ip: req.ip,
+    userAgent: req.get('user-agent') || null,
+    authClientId: req.authClientId || null,
+    perClientWorkersEnabled: PER_CLIENT_PM2_WORKERS_ENABLED,
+  };
+  appendDashboardAudit('control_start_received', dashboardDebugState.lastControlStart);
   if (isSupabaseConfigured()) {
     if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
     try {
@@ -2019,23 +2529,48 @@ app.post('/api/control/start', async (req, res) => {
       console.error('[API] control/start status message', e);
     }
     console.log('[API] Start (pause=0) for clientId=', clientId);
+    appendDashboardAudit('control_start_responding', {
+      clientId,
+      campaignId,
+      processRunning: true,
+      perClientWorkersEnabled: PER_CLIENT_PM2_WORKERS_ENABLED,
+    });
     res.json({ ok: true, processRunning: true });
-    ensureSendWorkerProcess()
+    const ensureWorkers = PER_CLIENT_PM2_WORKERS_ENABLED
+      ? ensureClientWorkerStack(clientId)
+      : ensureSendWorkerProcess();
+    ensureWorkers
       .then((r) => {
+        appendDashboardAudit('control_start_worker_ensure_result', {
+          clientId,
+          campaignId,
+          result: r,
+        });
         if (!r.ok) {
-          const detail = String(r.out || r.err?.message || 'pm2 ensure failed').slice(0, 220);
-          console.error('[API] pm2 ensure send worker failed', r.err || detail);
-          setClientStatusMessage(clientId, `Send worker did not start: ${detail}`).catch(() => {});
+          const detail = String(r.out || r.err?.message || r.error || 'pm2 ensure failed').slice(0, 220);
+          console.error('[API] pm2 ensure client worker stack failed', r.err || detail);
+          setClientStatusMessage(clientId, `Worker stack did not start: ${detail}`).catch(() => {});
           return;
         }
-        if (r.out) console.log(`[API] pm2 ensure send worker (${r.action}):`, r.out.slice(0, 800));
-        else console.log(`[API] pm2 ensure send worker (${r.action}) done.`);
-        scheduleAutoScaleSendWorkers('after_start');
+        if (PER_CLIENT_PM2_WORKERS_ENABLED) {
+          console.log(
+            `[API] pm2 ensure client worker stack ready send=${r.sendName || 'n/a'} scrape=${r.scrapeName || 'n/a'}`
+          );
+        } else {
+          if (r.out) console.log(`[API] pm2 ensure send worker (${r.action}):`, r.out.slice(0, 800));
+          else console.log(`[API] pm2 ensure send worker (${r.action}) done.`);
+          scheduleAutoScaleSendWorkers('after_start');
+        }
       })
       .catch((err) => {
-        console.error('[API] pm2 ensure send worker failed', err);
+        appendDashboardAudit('control_start_worker_ensure_exception', {
+          clientId,
+          campaignId,
+          err,
+        });
+        console.error('[API] pm2 ensure client worker stack failed', err);
         const detail = String(err?.message || 'pm2 ensure failed').slice(0, 220);
-        setClientStatusMessage(clientId, `Send worker did not start: ${detail}`).catch(() => {});
+        setClientStatusMessage(clientId, `Worker stack did not start: ${detail}`).catch(() => {});
       });
     return;
   }
@@ -2328,7 +2863,10 @@ app.post('/api/scraper/start', async (req, res) => {
       },
       hint: 'Scrape worker will be started automatically if needed.',
     });
-    ensureScrapeWorkerProcess()
+    const ensureScrapeWorker = PER_CLIENT_PM2_WORKERS_ENABLED
+      ? ensureClientWorkerStack(clientId)
+      : ensureScrapeWorkerProcess();
+    ensureScrapeWorker
       .then((r) => {
         if (!r.ok) {
           const detail = String(r.out || r.err?.message || 'pm2 ensure failed').slice(0, 220);
@@ -2336,7 +2874,7 @@ app.post('/api/scraper/start', async (req, res) => {
           return;
         }
         if (r.action !== 'noop_online') {
-          console.log(`[API] pm2 ensure scrape worker (${r.action}) done.`);
+          console.log(`[API] pm2 ensure scrape worker (${r.action || 'client_stack'}) done.`);
         }
       })
       .catch((err) => console.error('[API] pm2 ensure scrape worker failed', err));
@@ -2408,12 +2946,28 @@ app.post('/api/control/stop', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Dashboard at http://0.0.0.0:${PORT}`);
+  appendDashboardAudit('dashboard_listen', {
+    port: PORT,
+    processScheduledResponsesFallbackEnabled: PROCESS_SCHEDULED_RESPONSES_FALLBACK_ENABLED,
+    autoScaleSendWorkers: shouldAutoScaleSendWorkers(),
+    perClientPm2WorkersEnabled: PER_CLIENT_PM2_WORKERS_ENABLED,
+    autoEnsureClientWorkersOnDashboardStart: AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START,
+    legacySharedSendWorkerEnabled: LEGACY_SHARED_SEND_WORKER_ENABLED,
+    remoteUpdateCanRestartDashboard: true,
+  });
   schedulePoolWorkerReadyRegistration();
-  setTimeout(() => {
-    ensureAssignedClientWorkerStack('startup').catch((err) => {
-      console.error('[pm2:auto-ensure] assigned client worker stack failed on startup', err);
+  if (AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START) {
+    setTimeout(() => {
+      ensureAssignedClientWorkerStacksOnStartup().catch((err) => {
+        console.error('[pm2:auto-ensure] assigned client worker stack failed on startup', err);
+      });
+    }, 1500);
+  } else {
+    appendDashboardAudit('startup_worker_auto_ensure_skipped', {
+      reason: 'disabled_by_default',
+      enableWith: 'COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START=1',
     });
-  }, 1500);
+  }
   if (shouldAutoScaleSendWorkers()) {
     const min = SCALE_SEND_WORKERS_AUTO_INTERVAL_MS / 60000;
     console.log(
