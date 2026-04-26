@@ -2942,9 +2942,55 @@ async function handleInstagramPasswordReauthDisruption(clientId, instagramSessio
     paused: 0,
   }));
   const msg =
-    'Automation session needs reconnect — Instagram asked for your password again. Open Settings → Integrations and tap Reconnect.' +
+    'Instagram needs a quick reconnect. Sending is paused for this account until it is reconnected in Settings > Integrations.' +
     (r && r.paused ? ` Paused ${r.paused} active campaign(s) tied to this account.` : '');
   await setClientStatusMessage(clientId, msg).catch(() => {});
+  await queueColdDmReconnectRequiredEmail(clientId, instagramSessionId, 'instagram_password_reauth').catch((e) => {
+    console.warn('[handleInstagramPasswordReauthDisruption] reconnect email queue failed', e?.message || e);
+  });
+}
+
+async function queueColdDmReconnectRequiredEmail(clientId, instagramSessionId, reason = 'instagram_password_reauth') {
+  const sb = getSupabase();
+  if (!sb || !clientId) return false;
+  const { data: user, error: userError } = await sb
+    .from('users')
+    .select('id, name, primary_email, plan_tier')
+    .eq('id', clientId)
+    .maybeSingle();
+  if (userError || !user?.id) return false;
+  const emailTo = typeof user.primary_email === 'string' ? user.primary_email.trim() : '';
+  if (!emailTo) return false;
+
+  let instagramUsername = null;
+  if (instagramSessionId) {
+    const { data: session } = await sb
+      .from('cold_dm_instagram_sessions')
+      .select('instagram_username')
+      .eq('id', instagramSessionId)
+      .maybeSingle();
+    instagramUsername = session?.instagram_username || null;
+  }
+
+  const day = new Date().toISOString().slice(0, 10);
+  const dedupeKey = `cold_dm_reconnect_required:${clientId}:${instagramSessionId || 'unknown'}:${day}`;
+  const { error } = await sb.from('app_email_events').insert({
+    user_id: user.id,
+    event_name: 'cold_dm_reconnect_required',
+    rule_key: 'cold_dm_reconnect_required',
+    email_to: emailTo,
+    scheduled_for: new Date().toISOString(),
+    dedupe_key: dedupeKey,
+    payload: {
+      reason,
+      client_id: clientId,
+      instagram_session_id: instagramSessionId || null,
+      instagram_username: instagramUsername,
+      plan_tier: user.plan_tier || 'cold_outreach',
+    },
+  });
+  if (error && error.code !== '23505') throw error;
+  return true;
 }
 
 async function markPlatformScraperWebNeedsRefresh(sessionId) {
@@ -5651,6 +5697,7 @@ module.exports = {
   updateInstagramSessionSessionData,
   pauseActiveCampaignsForInstagramSession,
   handleInstagramPasswordReauthDisruption,
+  queueColdDmReconnectRequiredEmail,
   markPlatformScraperWebNeedsRefresh,
   reportPlatformScraperScrapeFailure,
   recordScraperActions,
