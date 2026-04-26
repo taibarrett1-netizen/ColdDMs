@@ -71,27 +71,119 @@ const voiceNotesDir = path.join(projectRoot, 'voice-notes');
 const followUpScreenshotsDir = path.join(projectRoot, 'follow-up-screenshots');
 const loginDebugScreenshotsDir = path.join(projectRoot, 'logs', 'login-debug');
 const PROCESS_BOOT_ID = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
+const dashboardAuditPath = path.join(projectRoot, 'logs', 'dashboard-restart-audit.log');
+const dashboardStartedAt = Date.now();
+const dashboardDebugState = {
+  recentRequests: [],
+  lastAdminUpdate: null,
+  lastControlStart: null,
+  lastPm2Command: null,
+  lastWorkerEnsure: null,
+  signalCounts: {},
+};
+
+function safeJson(value) {
+  return JSON.stringify(value, (_key, val) => {
+    if (val instanceof Error) {
+      return { name: val.name, message: val.message, stack: val.stack };
+    }
+    if (typeof val === 'bigint') return val.toString();
+    if (typeof val === 'function') return `[Function ${val.name || 'anonymous'}]`;
+    return val;
+  });
+}
+
+function appendDashboardAudit(event, details = {}) {
+  const entry = {
+    at: new Date().toISOString(),
+    event,
+    bootId: PROCESS_BOOT_ID,
+    pid: process.pid,
+    ppid: process.ppid,
+    pmId: process.env.pm_id || null,
+    uptimeMs: Math.round(process.uptime() * 1000),
+    ...details,
+  };
+  const line = `${safeJson(entry)}\n`;
+  try {
+    fs.mkdirSync(path.dirname(dashboardAuditPath), { recursive: true });
+    fs.appendFileSync(dashboardAuditPath, line);
+  } catch (_) {}
+  try {
+    console.log(`[dashboard:audit] ${event} ${safeJson(details)}`);
+  } catch (_) {}
+}
+
+function dashboardDebugSnapshot(extra = {}) {
+  return {
+    uptimeMs: Date.now() - dashboardStartedAt,
+    memory: process.memoryUsage(),
+    activeHandles: typeof process._getActiveHandles === 'function' ? process._getActiveHandles().length : null,
+    activeRequests: typeof process._getActiveRequests === 'function' ? process._getActiveRequests().length : null,
+    state: dashboardDebugState,
+    ...extra,
+  };
+}
 
 process.on('exit', (code) => {
-  console.log(`[dashboard] process exiting bootId=${PROCESS_BOOT_ID} pid=${process.pid} code=${code}`);
+  appendDashboardAudit('process_exit', dashboardDebugSnapshot({ code }));
 });
 process.on('SIGINT', () => {
-  console.warn(`[dashboard] SIGINT received bootId=${PROCESS_BOOT_ID} pid=${process.pid}`);
+  dashboardDebugState.signalCounts.SIGINT = (dashboardDebugState.signalCounts.SIGINT || 0) + 1;
+  appendDashboardAudit('signal_SIGINT', dashboardDebugSnapshot());
 });
 process.on('SIGTERM', () => {
-  console.warn(`[dashboard] SIGTERM received bootId=${PROCESS_BOOT_ID} pid=${process.pid}`);
+  dashboardDebugState.signalCounts.SIGTERM = (dashboardDebugState.signalCounts.SIGTERM || 0) + 1;
+  appendDashboardAudit('signal_SIGTERM', dashboardDebugSnapshot());
 });
 process.on('uncaughtException', (err) => {
-  console.error(`[dashboard] uncaughtException bootId=${PROCESS_BOOT_ID} pid=${process.pid}`, err);
+  appendDashboardAudit('uncaught_exception', dashboardDebugSnapshot({ err }));
   process.exitCode = 1;
 });
 process.on('unhandledRejection', (reason) => {
-  console.error(`[dashboard] unhandledRejection bootId=${PROCESS_BOOT_ID} pid=${process.pid}`, reason);
+  appendDashboardAudit('unhandled_rejection', dashboardDebugSnapshot({ reason }));
 });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
+app.use((req, res, next) => {
+  const startedAt = Date.now();
+  const entry = {
+    id: crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(8).toString('hex'),
+    method: req.method,
+    path: req.path,
+    action: req.body?.action || null,
+    clientId: req.body?.clientId || req.query?.clientId || null,
+    ip: req.ip,
+    userAgent: req.get('user-agent') || null,
+    startedAt: new Date(startedAt).toISOString(),
+  };
+  dashboardDebugState.recentRequests.push(entry);
+  dashboardDebugState.recentRequests = dashboardDebugState.recentRequests.slice(-30);
+  if (
+    req.path === '/api/admin/update' ||
+    req.path === '/api/control/start' ||
+    req.path === '/api/admin/assign-client' ||
+    process.env.DASHBOARD_RESTART_DEBUG_VERBOSE === '1'
+  ) {
+    appendDashboardAudit('request_start', entry);
+  }
+  res.on('finish', () => {
+    const done = { ...entry, statusCode: res.statusCode, durationMs: Date.now() - startedAt };
+    const idx = dashboardDebugState.recentRequests.findIndex((r) => r.id === entry.id);
+    if (idx >= 0) dashboardDebugState.recentRequests[idx] = done;
+    if (
+      req.path === '/api/admin/update' ||
+      req.path === '/api/control/start' ||
+      req.path === '/api/admin/assign-client' ||
+      process.env.DASHBOARD_RESTART_DEBUG_VERBOSE === '1'
+    ) {
+      appendDashboardAudit('request_finish', done);
+    }
+  });
+  next();
+});
 
 const API_KEY = (process.env.COLD_DM_API_KEY || '').trim();
 const API_KEY_CLIENT_MAP = (process.env.COLD_DM_API_KEYS || '')
@@ -397,26 +489,23 @@ app.use('/api', (req, res, next) => {
 
 // --- API: admin maintenance (fixed actions only; no arbitrary command execution) ---
 app.post('/api/admin/update', (req, res) => {
-  const remoteUpdateEnabled =
-    process.env.COLD_DM_ALLOW_REMOTE_UPDATE === '1' ||
-    process.env.COLD_DM_ALLOW_REMOTE_UPDATE === 'true';
-  if (!remoteUpdateEnabled) {
-    logger.warn('[admin:update] rejected: remote update disabled (set COLD_DM_ALLOW_REMOTE_UPDATE=1 to enable)');
-    return res.status(403).json({
-      ok: false,
-      error: 'Remote worker update is disabled on this VPS. SSH in and deploy manually.',
-      code: 'remote_update_disabled',
-    });
-  }
-
   // Safe "pull + restart" endpoint for per-client droplets so Edge can deploy updates without SSH.
   // Protected by the same Bearer COLD_DM_API_KEY middleware above.
   const branch = String(process.env.COLD_DM_WORKER_BRANCH || process.env.GIT_BRANCH || 'main')
     .trim() || 'main';
   const updateId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(12).toString('hex');
   const updateLogPath = `/tmp/cold-dm-update-${updateId}.log`;
+  dashboardDebugState.lastAdminUpdate = {
+    updateId,
+    branch,
+    acceptedAt: new Date().toISOString(),
+    ip: req.ip,
+    userAgent: req.get('user-agent') || null,
+    bodyKeys: Object.keys(req.body || {}),
+  };
 
   logger.log(`[admin:update] accepted updateId=${updateId} branch=${branch}`);
+  appendDashboardAudit('admin_update_accepted', dashboardDebugState.lastAdminUpdate);
   res.json({
     ok: true,
     accepted: true,
@@ -447,6 +536,12 @@ app.post('/api/admin/update', (req, res) => {
       'echo "[admin:update] done at=$(date -Is)"',
     ].join('\n');
     const runner = `(${script}) > ${shQuote(updateLogPath)} 2>&1`;
+    appendDashboardAudit('admin_update_runner_spawn', {
+      updateId,
+      branch,
+      updateLogPath,
+      willRestartDashboard: true,
+    });
     try {
       const child = spawn('bash', ['-lc', runner], {
         cwd: projectRoot,
@@ -465,6 +560,11 @@ app.post('/api/admin/assign-client', (req, res) => {
   if (!clientId) {
     return res.status(400).json({ ok: false, error: 'clientId is required' });
   }
+  appendDashboardAudit('admin_assign_client_accepted', {
+    clientId,
+    ip: req.ip,
+    userAgent: req.get('user-agent') || null,
+  });
   // Respond first so Edge does not timeout while PM2 starts workers.
   res.json({ ok: true, clientId, accepted: true });
   setTimeout(() => {
@@ -756,8 +856,38 @@ function getBotProcessRunning(cb) {
 }
 
 function execPm2(command) {
+  const isNoisyStatusCommand = /^pm2\s+jlist\b/.test(command);
+  const startedAt = Date.now();
+  const commandId = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(8).toString('hex');
+  const stack = new Error('pm2 command caller').stack;
+  dashboardDebugState.lastPm2Command = {
+    commandId,
+    command,
+    startedAt: new Date(startedAt).toISOString(),
+    stack,
+  };
+  if (!isNoisyStatusCommand || process.env.DASHBOARD_RESTART_DEBUG_VERBOSE === '1') {
+    appendDashboardAudit('pm2_command_start', dashboardDebugState.lastPm2Command);
+  }
   return new Promise((resolve) => {
     exec(command, { cwd: projectRoot }, (err, stdout, stderr) => {
+      const done = {
+        commandId,
+        command,
+        ok: !err,
+        durationMs: Date.now() - startedAt,
+        err: err ? { message: err.message, code: err.code, signal: err.signal, killed: err.killed } : null,
+        stdoutPreview: String(stdout || '').slice(0, 1000),
+        stderrPreview: String(stderr || '').slice(0, 1000),
+      };
+      dashboardDebugState.lastPm2Command = {
+        ...dashboardDebugState.lastPm2Command,
+        ...done,
+        finishedAt: new Date().toISOString(),
+      };
+      if (!isNoisyStatusCommand || err || process.env.DASHBOARD_RESTART_DEBUG_VERBOSE === '1') {
+        appendDashboardAudit('pm2_command_finish', done);
+      }
       resolve({
         ok: !err,
         err,
@@ -861,6 +991,12 @@ async function startClientProcessIfMissing(processName, script, env, outFile, er
 async function ensureClientWorkerStack(clientId) {
   const normalizedClientId = String(clientId || '').trim();
   if (!normalizedClientId) return { ok: false, error: 'Missing clientId' };
+  dashboardDebugState.lastWorkerEnsure = {
+    kind: 'client_stack',
+    clientId: normalizedClientId,
+    startedAt: new Date().toISOString(),
+  };
+  appendDashboardAudit('ensure_client_worker_stack_start', dashboardDebugState.lastWorkerEnsure);
   if (!String(process.env.COLD_DM_VPS_IP || '').trim()) {
     await detectLocalPublicIp().catch(() => '');
   }
@@ -876,8 +1012,23 @@ async function ensureClientWorkerStack(clientId) {
   try {
     await startClientProcessIfMissing(sendName, SEND_WORKER_ENTRY, mergedEnv, sendOut, sendErr);
     await startClientProcessIfMissing(scrapeName, SCRAPE_WORKER_ENTRY, mergedEnv, scrapeOut, scrapeErr);
+    dashboardDebugState.lastWorkerEnsure = {
+      ...dashboardDebugState.lastWorkerEnsure,
+      sendName,
+      scrapeName,
+      finishedAt: new Date().toISOString(),
+      ok: true,
+    };
+    appendDashboardAudit('ensure_client_worker_stack_finish', dashboardDebugState.lastWorkerEnsure);
     return { ok: true, sendName, scrapeName };
   } catch (e) {
+    dashboardDebugState.lastWorkerEnsure = {
+      ...dashboardDebugState.lastWorkerEnsure,
+      finishedAt: new Date().toISOString(),
+      ok: false,
+      error: e?.message || String(e),
+    };
+    appendDashboardAudit('ensure_client_worker_stack_error', dashboardDebugState.lastWorkerEnsure);
     return { ok: false, error: e?.message || String(e) };
   } finally {
     pm2DisconnectSafe();
@@ -2095,6 +2246,16 @@ app.post('/api/control/start', async (req, res) => {
     return res.status(403).json({ ok: false, error: 'Forbidden: clientId mismatch for provided API key' });
   }
   const campaignId = req.body?.campaignId || null;
+  dashboardDebugState.lastControlStart = {
+    clientId: clientId || null,
+    campaignId,
+    receivedAt: new Date().toISOString(),
+    ip: req.ip,
+    userAgent: req.get('user-agent') || null,
+    authClientId: req.authClientId || null,
+    perClientWorkersEnabled: PER_CLIENT_PM2_WORKERS_ENABLED,
+  };
+  appendDashboardAudit('control_start_received', dashboardDebugState.lastControlStart);
   if (isSupabaseConfigured()) {
     if (!clientId) return res.status(400).json({ ok: false, error: 'clientId required when using Supabase' });
     try {
@@ -2193,12 +2354,23 @@ app.post('/api/control/start', async (req, res) => {
       console.error('[API] control/start status message', e);
     }
     console.log('[API] Start (pause=0) for clientId=', clientId);
+    appendDashboardAudit('control_start_responding', {
+      clientId,
+      campaignId,
+      processRunning: true,
+      perClientWorkersEnabled: PER_CLIENT_PM2_WORKERS_ENABLED,
+    });
     res.json({ ok: true, processRunning: true });
     const ensureWorkers = PER_CLIENT_PM2_WORKERS_ENABLED
       ? ensureClientWorkerStack(clientId)
       : ensureSendWorkerProcess();
     ensureWorkers
       .then((r) => {
+        appendDashboardAudit('control_start_worker_ensure_result', {
+          clientId,
+          campaignId,
+          result: r,
+        });
         if (!r.ok) {
           const detail = String(r.out || r.err?.message || r.error || 'pm2 ensure failed').slice(0, 220);
           console.error('[API] pm2 ensure client worker stack failed', r.err || detail);
@@ -2216,6 +2388,11 @@ app.post('/api/control/start', async (req, res) => {
         }
       })
       .catch((err) => {
+        appendDashboardAudit('control_start_worker_ensure_exception', {
+          clientId,
+          campaignId,
+          err,
+        });
         console.error('[API] pm2 ensure client worker stack failed', err);
         const detail = String(err?.message || 'pm2 ensure failed').slice(0, 220);
         setClientStatusMessage(clientId, `Worker stack did not start: ${detail}`).catch(() => {});
@@ -2591,6 +2768,14 @@ app.post('/api/control/stop', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Dashboard at http://0.0.0.0:${PORT}`);
+  appendDashboardAudit('dashboard_listen', {
+    port: PORT,
+    processScheduledResponsesFallbackEnabled: PROCESS_SCHEDULED_RESPONSES_FALLBACK_ENABLED,
+    autoScaleSendWorkers: shouldAutoScaleSendWorkers(),
+    perClientPm2WorkersEnabled: PER_CLIENT_PM2_WORKERS_ENABLED,
+    legacySharedSendWorkerEnabled: LEGACY_SHARED_SEND_WORKER_ENABLED,
+    remoteUpdateCanRestartDashboard: true,
+  });
   schedulePoolWorkerReadyRegistration();
   setTimeout(() => {
     ensureAssignedClientWorkerStacksOnStartup().catch((err) => {
