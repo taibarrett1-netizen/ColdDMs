@@ -93,6 +93,30 @@ function safeJson(value) {
   });
 }
 
+function redactForAudit(value) {
+  const secretKeyPattern = /(SECRET|PASSWORD|TOKEN|API_KEY|SERVICE_ROLE|SUPABASE_DB_URL|DATABASE_URL|DB_URL|JWT|BEARER|COOKIE)/i;
+  const redactString = (s) => {
+    if (/eyJ[a-zA-Z0-9_-]+\./.test(s)) return '[REDACTED_JWT]';
+    if (s.length > 120 && /[A-Za-z0-9+/=_-]{80,}/.test(s)) return '[REDACTED_LONG_SECRET]';
+    return s;
+  };
+  const walk = (val, key = '') => {
+    if (val == null) return val;
+    if (secretKeyPattern.test(key)) return '[REDACTED]';
+    if (typeof val === 'string') return redactString(val);
+    if (Array.isArray(val)) return val.map((item) => walk(item));
+    if (typeof val === 'object') {
+      const out = {};
+      for (const [childKey, childValue] of Object.entries(val)) {
+        out[childKey] = walk(childValue, childKey);
+      }
+      return out;
+    }
+    return val;
+  };
+  return walk(value);
+}
+
 function appendDashboardAudit(event, details = {}) {
   const entry = {
     at: new Date().toISOString(),
@@ -102,7 +126,7 @@ function appendDashboardAudit(event, details = {}) {
     ppid: process.ppid,
     pmId: process.env.pm_id || null,
     uptimeMs: Math.round(process.uptime() * 1000),
-    ...details,
+    ...redactForAudit(details),
   };
   const line = `${safeJson(entry)}\n`;
   try {
@@ -603,6 +627,9 @@ const PER_CLIENT_PM2_WORKERS_ENABLED =
 const LEGACY_SHARED_SEND_WORKER_ENABLED =
   process.env.COLD_DM_ALLOW_LEGACY_SHARED_SEND_WORKER === '1' ||
   process.env.COLD_DM_ALLOW_LEGACY_SHARED_SEND_WORKER === 'true';
+const AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START =
+  process.env.COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START === '1' ||
+  process.env.COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START === 'true';
 const SCRAPER_SESSION_LEASE_SEC = Math.max(60, parseInt(process.env.SCRAPER_SESSION_LEASE_SEC || '240', 10) || 240);
 const SEND_SCRAPE_COOLDOWN_MS = Math.max(
   60 * 1000,
@@ -967,11 +994,91 @@ function pm2StartAsync(options) {
   });
 }
 
+function cleanEnvForPm2Child(extra = {}) {
+  const forbiddenExact = new Set([
+    'NODE_APP_INSTANCE',
+    'PM2_HOME',
+    'PM2_JSON_PROCESSING',
+    'PM2_PROGRAMMATIC',
+    'PM2_USAGE',
+    'OLDPWD',
+    '_',
+    'axm_actions',
+    'axm_dynamic',
+    'axm_monitor',
+    'axm_options',
+    'automation',
+    'autostart',
+    'autorestart',
+    'created_at',
+    'cwd',
+    'env',
+    'exec_interpreter',
+    'exec_mode',
+    'filter_env',
+    'instance_var',
+    'kill_retry_time',
+    'log_date_format',
+    'max_memory_restart',
+    'max_restarts',
+    'merge_logs',
+    'min_uptime',
+    'name',
+    'namespace',
+    'node_args',
+    'pm_cwd',
+    'pm_err_log_path',
+    'pm_exec_path',
+    'pm_id',
+    'pm_out_log_path',
+    'pm_pid_path',
+    'pm_uptime',
+    'pmx',
+    'restart_time',
+    'status',
+    'treekill',
+    'unstable_restarts',
+    'updateEnv',
+    'username',
+    'version',
+    'vizion',
+    'watch',
+    'windowsHide',
+  ]);
+  const forbiddenPrefixes = ['pm_', 'axm_'];
+  const forbiddenAppNamePattern = /^ig-dm-(dashboard|send|scrape)(-|$)/;
+  const env = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (forbiddenExact.has(key)) continue;
+    if (forbiddenPrefixes.some((prefix) => key.startsWith(prefix))) continue;
+    if (forbiddenAppNamePattern.test(key)) continue;
+    env[key] = value;
+  }
+  return { ...env, ...extra };
+}
+
 async function startClientProcessIfMissing(processName, script, env, outFile, errorFile) {
   const status = await getPm2AppStatusByName(processName);
   if (!status.error && status.online) {
     return { ok: true, action: 'noop_online' };
   }
+  appendDashboardAudit('pm2_child_start_request', {
+    processName,
+    script,
+    outFile,
+    errorFile,
+    statusBeforeStart: status,
+    leakedPm2KeysPresent: Object.keys(env || {}).filter((key) =>
+      key === 'name' ||
+      key === 'pm_exec_path' ||
+      key === 'pm_cwd' ||
+      key === 'pm_id' ||
+      key === 'NODE_APP_INSTANCE' ||
+      key.startsWith('pm_') ||
+      key.startsWith('axm_') ||
+      /^ig-dm-(dashboard|send|scrape)(-|$)/.test(key)
+    ),
+  });
   await pm2StartAsync({
     name: processName,
     script,
@@ -1002,7 +1109,7 @@ async function ensureClientWorkerStack(clientId) {
   }
   const sendName = getSendWorkerPm2Name(normalizedClientId);
   const scrapeName = getScrapeWorkerPm2Name(normalizedClientId);
-  const mergedEnv = { ...process.env, COLD_DM_CLIENT_ID: normalizedClientId };
+  const mergedEnv = cleanEnvForPm2Child({ COLD_DM_CLIENT_ID: normalizedClientId });
   const sendOut = path.join(projectRoot, 'logs', `send-${normalizedClientId}.out.log`);
   const sendErr = path.join(projectRoot, 'logs', `send-${normalizedClientId}.err.log`);
   const scrapeOut = path.join(projectRoot, 'logs', `scrape-${normalizedClientId}.out.log`);
