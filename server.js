@@ -642,6 +642,12 @@ app.get('/api/admin/clients', (_req, res) => {
     .catch((e) => res.status(500).json({ ok: false, error: e?.message || String(e) }));
 });
 
+app.get('/api/admin/processes', (_req, res) => {
+  getAdminProcessSnapshot()
+    .then((snapshot) => res.json({ ok: true, ...snapshot }))
+    .catch((e) => res.status(500).json({ ok: false, error: e?.message || String(e) }));
+});
+
 const { registerAdminLabRoutes } = require('./admin_lab/http');
 const { runScaleSendWorkers } = require('./lib/scaleSendWorkers');
 registerAdminLabRoutes(app);
@@ -1008,6 +1014,83 @@ async function listActiveClientIdsFromPm2() {
         .filter(Boolean),
     ),
   ];
+}
+
+function readEnvFileValue(key) {
+  try {
+    if (!fs.existsSync(envPath)) return null;
+    const lines = fs.readFileSync(envPath, 'utf8').split(/\r?\n/);
+    const prefix = `${key}=`;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#') || !trimmed.startsWith(prefix)) continue;
+      return trimmed.slice(prefix.length).replace(/^['"]|['"]$/g, '');
+    }
+  } catch (e) {
+    return null;
+  }
+  return null;
+}
+
+async function getAdminProcessSnapshot() {
+  const list = await listPm2Processes();
+  const processes = list.map((proc) => {
+    const name = String(proc?.name || '');
+    const status = proc?.pm2_env?.status || null;
+    const restartCount = typeof proc?.pm2_env?.restart_time === 'number' ? proc.pm2_env.restart_time : null;
+    const uptimeMs = typeof proc?.pm2_env?.pm_uptime === 'number' ? Math.max(0, Date.now() - proc.pm2_env.pm_uptime) : null;
+    const pid = typeof proc?.pid === 'number' ? proc.pid : null;
+    const memoryBytes = typeof proc?.monit?.memory === 'number' ? proc.monit.memory : null;
+    const cpu = typeof proc?.monit?.cpu === 'number' ? proc.monit.cpu : null;
+    let kind = 'other';
+    let clientId = null;
+    if (name === 'ig-dm-dashboard') {
+      kind = 'dashboard';
+    } else if (name === BOT_PM2_NAME) {
+      kind = 'legacy-send';
+    } else if (name === SCRAPE_PM2_NAME) {
+      kind = 'legacy-scrape';
+    } else if (name.startsWith(SEND_PM2_PREFIX)) {
+      kind = 'send';
+      clientId = name.slice(SEND_PM2_PREFIX.length) || null;
+    } else if (name.startsWith(SCRAPE_PM2_PREFIX)) {
+      kind = 'scrape';
+      clientId = name.slice(SCRAPE_PM2_PREFIX.length) || null;
+    }
+    return {
+      name,
+      kind,
+      clientId,
+      status,
+      online: status === 'online',
+      pid,
+      restartCount,
+      uptimeMs,
+      memoryBytes,
+      cpu,
+    };
+  });
+
+  return {
+    bootId: PROCESS_BOOT_ID,
+    projectRoot,
+    env: {
+      coldDmVpsIp: process.env.COLD_DM_VPS_IP || readEnvFileValue('COLD_DM_VPS_IP'),
+      perClientWorkers: process.env.COLD_DM_PER_CLIENT_PM2_WORKERS || readEnvFileValue('COLD_DM_PER_CLIENT_PM2_WORKERS'),
+      autoEnsureClientWorkers:
+        process.env.COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START ||
+        readEnvFileValue('COLD_DM_AUTO_ENSURE_CLIENT_WORKERS_ON_DASHBOARD_START'),
+      maxConcurrentScrapesPerVps:
+        process.env.COLD_DM_MAX_CONCURRENT_SCRAPES_PER_VPS ||
+        readEnvFileValue('COLD_DM_MAX_CONCURRENT_SCRAPES_PER_VPS'),
+    },
+    processes,
+    activeClientIds: [
+      ...new Set(processes.filter((proc) => proc.kind === 'send' && proc.clientId).map((proc) => proc.clientId)),
+    ],
+    legacySharedWorkers: processes.filter((proc) => proc.kind === 'legacy-send' || proc.kind === 'legacy-scrape').map((proc) => proc.name),
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 function execPm2File(args, env, auditCommand) {

@@ -4675,7 +4675,7 @@ async function previewDmLeadNamesFromSession(body) {
         ok: false,
         error: 'instagram_password_reauth_required',
         message:
-          'Instagram asked for your password again. Open Settings → Integrations and tap Reconnect.',
+          'Instagram needs a quick reconnect. Open Settings > Integrations and reconnect this sender.',
         gateDetails: e.gateDetails || undefined,
       };
     }
@@ -5276,7 +5276,8 @@ async function sendDM(page, username, adapter, options = {}) {
             return {
               ok: false,
               reason: 'session_logged_out',
-              statusMessage: 'Instagram logged out — reconnect this sender in Cold Outreach.',
+              statusMessage:
+                'Instagram needs a quick reconnect. Sending is paused for this account until it is reconnected.',
             };
           }
         } catch (_) {}
@@ -5334,7 +5335,8 @@ async function sendDM(page, username, adapter, options = {}) {
             return {
               ok: false,
               reason: 'session_logged_out',
-              statusMessage: 'Instagram logged out — reconnect this sender in Cold Outreach.',
+              statusMessage:
+                'Instagram needs a quick reconnect. Sending is paused for this account until it is reconnected.',
             };
           }
         } catch (_) {}
@@ -5360,6 +5362,16 @@ async function sendDM(page, username, adapter, options = {}) {
         'ffmpeg_missing',
       ];
       if (terminalReasons.includes(result.reason)) {
+        if (result.reason === 'account_unblock_required' && options.clientId && instagramSessionId) {
+          await sb.handleInstagramPasswordReauthDisruption(options.clientId, instagramSessionId).catch(() => {});
+          await Promise.resolve(logSent('failed', result.finalMessage, 'instagram_password_reauth'));
+          return {
+            ok: false,
+            reason: 'session_logged_out',
+            statusMessage:
+              'Instagram needs a quick reconnect. Sending is paused for this account until it is reconnected.',
+          };
+        }
         if (result.reason === 'instagram_technical_error' && options.clientId && sb.pauseClientAndAlert) {
           const statusMsg =
             "Sending paused: Instagram DM thread shows \"Something isn't working\" (technical error). Support required to restore sending.";
@@ -5398,7 +5410,7 @@ async function sendDM(page, username, adapter, options = {}) {
           ok: false,
           reason: 'session_logged_out',
           statusMessage:
-            'Instagram asked for your password again. Campaigns using this sender are paused. Open Settings → Integrations and tap Reconnect.',
+            'Instagram needs a quick reconnect. Sending is paused for this account until it is reconnected.',
         };
       }
       lastError = err;
@@ -6548,21 +6560,21 @@ async function drainSleep(ms, label) {
           last_error_message: 'already_sent',
         };
       } else if (!sendResult.ok && sendResult.reason === 'session_logged_out') {
-        delayMs = randomDelay(30, 90) * 1000;
-        sendJobStatus = 'retry';
+        const reconnectMsg =
+          sendResult.statusMessage ||
+          'Instagram needs a quick reconnect. Sending is paused for this account until it is reconnected.';
+        delayMs = 0;
+        sendJobStatus = 'cancelled';
         sendJobUpdates = {
-          available_at: new Date(Date.now() + delayMs).toISOString(),
+          finished_at: new Date().toISOString(),
           last_error_class: 'session_logged_out',
-          last_error_message: sendResult.statusMessage || 'session_logged_out',
+          last_error_message: reconnectMsg,
         };
         logger.error(
           `[send-worker] Instagram session logged out — pausing client ${clientId} (lead @${work.username} not marked failed).`
         );
         await sb.setControl(clientId, 1).catch(() => {});
-        sb.setClientStatusMessage(
-          clientId,
-          'Instagram logged out — reconnect your sender in Cold Outreach, then sending resumes.'
-        ).catch(() => {});
+        sb.setClientStatusMessage(clientId, reconnectMsg).catch(() => {});
       } else if (!sendResult.ok && sendResult.reason === 'proxy_tunnel_failed') {
         // Safety: do NOT auto-rotate the proxy for an existing Instagram session.
         // Swapping exit IPs under the same cookies/session_data is a high-risk pattern for IG checkpoints.
