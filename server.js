@@ -397,6 +397,18 @@ app.use('/api', (req, res, next) => {
 
 // --- API: admin maintenance (fixed actions only; no arbitrary command execution) ---
 app.post('/api/admin/update', (req, res) => {
+  const remoteUpdateEnabled =
+    process.env.COLD_DM_ALLOW_REMOTE_UPDATE === '1' ||
+    process.env.COLD_DM_ALLOW_REMOTE_UPDATE === 'true';
+  if (!remoteUpdateEnabled) {
+    logger.warn('[admin:update] rejected: remote update disabled (set COLD_DM_ALLOW_REMOTE_UPDATE=1 to enable)');
+    return res.status(403).json({
+      ok: false,
+      error: 'Remote worker update is disabled on this VPS. SSH in and deploy manually.',
+      code: 'remote_update_disabled',
+    });
+  }
+
   // Safe "pull + restart" endpoint for per-client droplets so Edge can deploy updates without SSH.
   // Protected by the same Bearer COLD_DM_API_KEY middleware above.
   const branch = String(process.env.COLD_DM_WORKER_BRANCH || process.env.GIT_BRANCH || 'main')
