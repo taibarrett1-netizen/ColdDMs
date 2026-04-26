@@ -846,39 +846,12 @@ async function ensureClientWorkerStack(clientId) {
   try {
     await startClientProcessIfMissing(sendName, SEND_WORKER_ENTRY, mergedEnv, sendOut, sendErr);
     await startClientProcessIfMissing(scrapeName, SCRAPE_WORKER_ENTRY, mergedEnv, scrapeOut, scrapeErr);
-    const legacyCleanup = await stopLegacySharedSendWorkerIfPerClientMode('ensure_client_stack');
-    return { ok: true, sendName, scrapeName, legacyCleanup };
+    return { ok: true, sendName, scrapeName };
   } catch (e) {
     return { ok: false, error: e?.message || String(e) };
   } finally {
     pm2DisconnectSafe();
   }
-}
-
-async function stopLegacySharedSendWorkerIfPerClientMode(reason) {
-  if (!PER_CLIENT_PM2_WORKERS_ENABLED) {
-    return { ok: true, action: 'disabled' };
-  }
-  let list;
-  try {
-    list = await listPm2Processes();
-  } catch (e) {
-    return { ok: false, action: 'list_failed', error: e?.message || String(e) };
-  }
-  const names = list.map((proc) => String(proc?.name || ''));
-  const hasPerClientSendWorker = names.some((name) => name.startsWith(SEND_PM2_PREFIX));
-  const hasLegacySendWorker = names.includes(BOT_PM2_NAME);
-  if (!hasPerClientSendWorker || !hasLegacySendWorker) {
-    return { ok: true, action: 'noop' };
-  }
-
-  const deleted = await execPm2(`pm2 delete ${BOT_PM2_NAME}`);
-  if (!deleted.ok && !/not found|does not exist|process or namespace not found/i.test(deleted.out)) {
-    return { ok: false, action: 'delete_failed', error: deleted.out || deleted.err?.message || 'pm2 delete failed' };
-  }
-  await execPm2('pm2 save');
-  console.log(`[pm2:auto-ensure] deleted legacy shared ${BOT_PM2_NAME} after per-client worker start reason=${reason}`);
-  return { ok: true, action: 'deleted_legacy_shared_send_worker' };
 }
 
 async function detectLocalPublicIp() {
