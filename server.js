@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ quiet: true });
 const express = require('express');
 const cookieParser = require('cookie-parser');
 const path = require('path');
@@ -71,6 +71,24 @@ const voiceNotesDir = path.join(projectRoot, 'voice-notes');
 const followUpScreenshotsDir = path.join(projectRoot, 'follow-up-screenshots');
 const loginDebugScreenshotsDir = path.join(projectRoot, 'logs', 'login-debug');
 const PROCESS_BOOT_ID = crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex');
+
+process.on('exit', (code) => {
+  console.log(`[dashboard] process exiting bootId=${PROCESS_BOOT_ID} pid=${process.pid} code=${code}`);
+});
+process.on('SIGINT', () => {
+  console.warn(`[dashboard] SIGINT received bootId=${PROCESS_BOOT_ID} pid=${process.pid}`);
+});
+process.on('SIGTERM', () => {
+  console.warn(`[dashboard] SIGTERM received bootId=${PROCESS_BOOT_ID} pid=${process.pid}`);
+});
+process.on('uncaughtException', (err) => {
+  console.error(`[dashboard] uncaughtException bootId=${PROCESS_BOOT_ID} pid=${process.pid}`, err);
+  process.exitCode = 1;
+});
+process.on('unhandledRejection', (reason) => {
+  console.error(`[dashboard] unhandledRejection bootId=${PROCESS_BOOT_ID} pid=${process.pid}`, reason);
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
@@ -479,8 +497,8 @@ const SEND_SCRAPE_COOLDOWN_MS = Math.max(
   parseInt(process.env.SEND_SCRAPE_COOLDOWN_MS || String(5 * 60 * 1000), 10) || 5 * 60 * 1000
 );
 const PROCESS_SCHEDULED_RESPONSES_FALLBACK_ENABLED =
-  process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK !== '0' &&
-  process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK !== 'false';
+  process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK === '1' ||
+  process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK === 'true';
 const PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS = Math.max(
   30 * 1000,
   parseInt(process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK_INTERVAL_MS || '60000', 10) || 60000
