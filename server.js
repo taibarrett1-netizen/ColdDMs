@@ -486,8 +486,14 @@ const PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS = Math.max(
   30 * 1000,
   parseInt(process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK_TIMEOUT_MS || '300000', 10) || 300000
 );
+const PROCESS_SCHEDULED_RESPONSES_FALLBACK_WARN_EVERY_MS = Math.max(
+  60 * 1000,
+  parseInt(process.env.PROCESS_SCHEDULED_RESPONSES_FALLBACK_WARN_EVERY_MS || String(15 * 60 * 1000), 10) ||
+    15 * 60 * 1000
+);
 
 let processScheduledResponsesFallbackInFlight = false;
+let processScheduledResponsesFallbackLastWarn = null;
 
 function formatDurationShort(ms) {
   const safeMs = Math.max(0, Number(ms) || 0);
@@ -542,6 +548,17 @@ function getProcessScheduledResponsesBearer() {
   return (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
 }
 
+function warnProcessScheduledResponsesFallbackOnce(signature, message) {
+  const now = Date.now();
+  const shouldWarn =
+    !processScheduledResponsesFallbackLastWarn ||
+    processScheduledResponsesFallbackLastWarn.signature !== signature ||
+    now - processScheduledResponsesFallbackLastWarn.at >= PROCESS_SCHEDULED_RESPONSES_FALLBACK_WARN_EVERY_MS;
+  if (!shouldWarn) return;
+  processScheduledResponsesFallbackLastWarn = { signature, at: now };
+  logger.warn(message);
+}
+
 async function triggerProcessScheduledResponsesFallback(reason = 'interval') {
   if (processScheduledResponsesFallbackInFlight) {
     logger.log(`[process-scheduled-responses:fallback] skip overlapping tick reason=${reason}`);
@@ -576,7 +593,8 @@ async function triggerProcessScheduledResponsesFallback(reason = 'interval') {
     const text = await res.text().catch(() => '');
     const snippet = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 400);
     if (!res.ok) {
-      logger.warn(
+      warnProcessScheduledResponsesFallbackOnce(
+        `status:${res.status}:${snippet}`,
         `[process-scheduled-responses:fallback] tick failed status=${res.status} reason=${reason} body=${snippet || 'n/a'}`
       );
       return;
@@ -590,7 +608,8 @@ async function triggerProcessScheduledResponsesFallback(reason = 'interval') {
       );
       return;
     }
-    logger.warn(
+    warnProcessScheduledResponsesFallbackOnce(
+      `exception:${e?.message || e}`,
       `[process-scheduled-responses:fallback] tick exception reason=${reason} error=${e?.message || e}`
     );
   } finally {
