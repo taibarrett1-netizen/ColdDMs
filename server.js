@@ -1144,8 +1144,6 @@ async function startClientProcessIfMissing(processName, script, env, outFile, er
         'YYYY-MM-DD HH:mm:ss Z',
         '--max-restarts',
         '20',
-        '--min-uptime',
-        '5000',
         '--update-env',
       ];
   const auditCommand = status.exists
