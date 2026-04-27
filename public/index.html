@@ -166,6 +166,19 @@
     </div>
   </div>
 
+  <div id="modal-email-code" class="modal-overlay" aria-hidden="true">
+    <div class="modal">
+      <h3>Email verification required</h3>
+      <p id="email-code-help">Enter the verification code sent to your email.</p>
+      <label>Email code</label>
+      <input type="text" id="email-code" inputmode="numeric" maxlength="12" placeholder="Enter code" autocomplete="one-time-code">
+      <div class="modal-actions">
+        <button id="btn-email-code-submit" class="success">Submit</button>
+        <button id="btn-email-code-cancel" class="danger">Cancel</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     let connectPending = null;
     const CLIENT_ID_STORAGE_KEY = 'coldDmClientId';
@@ -216,6 +229,10 @@
       return apiFetch('/api/instagram/connect/2fa', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pending2FAId, twoFactorCode, clientId }) }).then(r => r.json());
     }
 
+    function submitEmailCode(pendingEmailId, emailCode, clientId) {
+      return apiFetch('/api/instagram/connect/email-code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pendingEmailId, emailCode, clientId }) }).then(r => r.json());
+    }
+
     function open2FAModal() {
       document.getElementById('twofa-code').value = '';
       document.getElementById('modal-2fa').classList.add('show');
@@ -226,6 +243,23 @@
     function close2FAModal() {
       document.getElementById('modal-2fa').classList.remove('show');
       document.getElementById('modal-2fa').setAttribute('aria-hidden', 'true');
+      connectPending = null;
+    }
+
+    function openEmailCodeModal(maskedEmail) {
+      document.getElementById('email-code').value = '';
+      const help = document.getElementById('email-code-help');
+      help.textContent = maskedEmail
+        ? ('Enter the verification code sent to ' + maskedEmail + '.')
+        : 'Enter the verification code sent to your email.';
+      document.getElementById('modal-email-code').classList.add('show');
+      document.getElementById('modal-email-code').setAttribute('aria-hidden', 'false');
+      document.getElementById('email-code').focus();
+    }
+
+    function closeEmailCodeModal() {
+      document.getElementById('modal-email-code').classList.remove('show');
+      document.getElementById('modal-email-code').setAttribute('aria-hidden', 'true');
       connectPending = null;
     }
     document.querySelectorAll('.nav-link').forEach(a => {
@@ -435,6 +469,14 @@
           connectPending = { clientId, pending2FAId: data.pending2FAId };
           open2FAModal();
           showConnectMsg('Enter the 6-digit code below (same session, no new code sent).', false);
+        } else if (data.code === 'email_verification_required' && data.pendingEmailId) {
+          connectPending = {
+            clientId,
+            pendingEmailId: data.pendingEmailId,
+            maskedEmail: data.maskedEmail || null
+          };
+          openEmailCodeModal(data.maskedEmail || null);
+          showConnectMsg(data.message || 'Enter the verification code from your email.', false);
         } else {
           showConnectMsg(data.error || data.message || 'Connect failed.', false);
         }
@@ -460,6 +502,26 @@
     });
 
     document.getElementById('btn-twofa-cancel').addEventListener('click', () => close2FAModal());
+
+    document.getElementById('btn-email-code-submit').addEventListener('click', () => {
+      if (!connectPending || !connectPending.pendingEmailId) return;
+      const code = document.getElementById('email-code').value.trim();
+      if (!code) return;
+      const btn = document.getElementById('btn-email-code-submit');
+      btn.disabled = true;
+      submitEmailCode(connectPending.pendingEmailId, code, connectPending.clientId).then((data) => {
+        if (data.ok) {
+          showConnectMsg('Connected. Password and code were not stored.', true);
+          document.getElementById('connect-password').value = '';
+          document.getElementById('email-code').value = '';
+          closeEmailCodeModal();
+        } else {
+          showConnectMsg(data.error || data.message || 'Code may be wrong or expired. Try again.', false);
+        }
+      }).catch(() => showConnectMsg('Request failed.', false)).finally(() => { btn.disabled = false; });
+    });
+
+    document.getElementById('btn-email-code-cancel').addEventListener('click', () => closeEmailCodeModal());
 
     document.getElementById('connect-client-id').value = localStorage.getItem(CLIENT_ID_STORAGE_KEY) || '';
     document.getElementById('connect-client-id').addEventListener('change', persistClientId);

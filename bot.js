@@ -2542,6 +2542,7 @@ async function login(page, credentials) {
   const emailCheckpoint = await detectInstagramEmailVerificationState(page);
   const currentLoginUrl = page.url().toLowerCase();
   if (emailCheckpoint.required || currentLoginUrl.includes('/auth_platform/codeentry')) {
+    await delay(2000);
     await saveLoginDebugScreenshot(page, 'email_checkpoint');
     page.off('response', respHandler);
     const err = new Error(
@@ -2590,6 +2591,7 @@ async function login(page, credentials) {
     throw err;
   }
   if (interactiveChallengeAfterRetry.required && interactiveChallengeAfterRetry.kind === 'email') {
+    await delay(2000);
     await saveLoginDebugScreenshot(page, 'email_checkpoint_after_retry');
     page.off('response', respHandler);
     const err = new Error(
@@ -2604,6 +2606,7 @@ async function login(page, credentials) {
   const emailCheckpointAfterRetry = await detectInstagramEmailVerificationState(page);
   const retryLoginUrl = page.url().toLowerCase();
   if (emailCheckpointAfterRetry.required || retryLoginUrl.includes('/auth_platform/codeentry')) {
+    await delay(2000);
     await saveLoginDebugScreenshot(page, 'email_checkpoint_after_retry');
     page.off('response', respHandler);
     const err = new Error(
