@@ -2460,6 +2460,8 @@ async function login(page, credentials) {
 
   const interactiveChallenge = await detectInstagramInteractiveChallengeState(page);
   if (interactiveChallenge.required && interactiveChallenge.kind === 'two_factor') {
+    await delay(2000);
+    await saveLoginDebugScreenshot(page, 'two_factor_checkpoint').catch(() => {});
     page.off('response', respHandler);
     const err = new Error('Two-factor authentication required. Enter the 6-digit code from your authenticator app or WhatsApp.');
     err.code = 'TWO_FACTOR_REQUIRED';
@@ -2467,6 +2469,7 @@ async function login(page, credentials) {
     throw err;
   }
   if (interactiveChallenge.required && interactiveChallenge.kind === 'email') {
+    await delay(2000);
     await saveLoginDebugScreenshot(page, 'email_checkpoint');
     page.off('response', respHandler);
     const err = new Error(
