@@ -972,11 +972,14 @@ async function getPm2AppStatusByName(appName) {
   try {
     const list = JSON.parse(res.stdout || '[]');
     const proc = Array.isArray(list) ? list.find((p) => p?.name === appName) : null;
-    const status = proc?.pm2_env?.status || null;
+    const env = proc?.pm2_env || {};
+    const status = env?.status || null;
     return {
       exists: !!proc,
       online: status === 'online',
       status,
+      watch: !!env?.watch,
+      autorestart: env?.autorestart,
       error: null,
     };
   } catch (e) {
@@ -1195,13 +1198,28 @@ function cleanEnvForPm2Child(extra = {}) {
 
 async function startClientProcessIfMissing(processName, script, env, outFile, errorFile) {
   const status = await getPm2AppStatusByName(processName);
-  if (!status.error && status.online) {
+  const hasConfigDrift = status.exists && (status.watch === true || status.autorestart !== false);
+  if (!status.error && status.online && !hasConfigDrift) {
     appendDashboardAudit('pm2_child_start_skipped_existing_online', {
       processName,
       script,
       statusBeforeStart: status,
     });
     return { ok: true, action: 'noop_online' };
+  }
+  if (hasConfigDrift) {
+    appendDashboardAudit('pm2_child_config_drift_detected', {
+      processName,
+      statusBeforeStart: status,
+      desired: { watch: false, autorestart: false },
+    });
+    const drop = await execPm2(`pm2 delete ${processName}`);
+    if (!drop.ok && !/not found|doesn.?t exist|unknown app/i.test(drop.out || drop.stderr || '')) {
+      throw drop.err || new Error(drop.stderr || drop.out || `pm2 delete failed for ${processName}`);
+    }
+    status.exists = false;
+    status.online = false;
+    status.status = null;
   }
   // Avoid restart churn: if PM2 reports a transient state, let it settle.
   if (
@@ -2565,8 +2583,10 @@ app.post('/api/control/start', async (req, res) => {
         return res.status(400).json({ ok: false, error: errorMessage, problems: delayProblems });
       }
       const sessionsForCampaign = await getSessionsForCampaign(clientId, campaignId).catch(() => []);
-      const staleSessions = (sessionsForCampaign || []).filter((s) => s?.web_session_needs_refresh === true);
-      if (staleSessions.length > 0) {
+      const usableOutboundSessions = (sessionsForCampaign || []).filter(
+        (s) => s?.web_session_needs_refresh !== true && !!s?.session_data
+      );
+      if ((sessionsForCampaign || []).length > 0 && usableOutboundSessions.length === 0) {
         const reconnectMessage =
           'Please reconnect your account in Settings > Integrations > Automation session (outbound).';
         await setClientStatusMessage(clientId, reconnectMessage).catch(() => {});

@@ -1139,7 +1139,10 @@ async function getWaitingInstagramSessionReason(clientId, campaignId) {
   if (!sessions?.length) return null;
   const settings = await getSettings(clientId).catch(() => null);
   const timezone = settings?.timezone || null;
-  if (sessions.some((s) => s?.web_session_needs_refresh === true)) {
+  const hasUsableSession = sessions.some(
+    (s) => s?.web_session_needs_refresh !== true && !!s?.session_data
+  );
+  if (!hasUsableSession) {
     return 'Please reconnect your account in Settings > Integrations > Automation session (outbound).';
   }
   const usageStates = await Promise.all(
