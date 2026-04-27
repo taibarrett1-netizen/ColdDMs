@@ -1439,6 +1439,7 @@ async function saveSession(clientId, sessionData, instagramUsername, proxyOpts =
     client_id: clientId,
     session_data: sessionData,
     instagram_username: username || null,
+    web_session_needs_refresh: false,
     updated_at: new Date().toISOString(),
   };
   if (proxyOpts.proxyUrl) row.proxy_url = proxyOpts.proxyUrl;

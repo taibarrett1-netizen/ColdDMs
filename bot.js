@@ -2283,6 +2283,9 @@ async function login(page, credentials) {
     throw new Error('Login form fields not found. Instagram may be loading a different shell or security interstitial.');
   }
 
+  // Cookie modal can re-appear after field detection — dismiss it again before typing.
+  await dismissInstagramCookieConsent(page).catch(() => {});
+
   const inputs = await page.$$('input');
   const getFieldMeta = async (el) =>
     el.evaluate((node) => ({
@@ -2365,6 +2368,13 @@ async function login(page, credentials) {
   logger.log('Login form found, entering credentials...');
   await clickElementNaturally(page, userEl, { totalDurationMs: randomDelay(220, 420) }).catch(() => {});
   await organicPause('micro');
+  // Select-all + Backspace to clear any pre-filled value before typing.
+  await page.keyboard.down('Control').catch(() => page.keyboard.down('Meta').catch(() => {}));
+  await page.keyboard.press('KeyA').catch(() => {});
+  await page.keyboard.up('Control').catch(() => page.keyboard.up('Meta').catch(() => {}));
+  await delay(randomDelay(40, 100));
+  await page.keyboard.press('Backspace').catch(() => {});
+  await delay(randomDelay(60, 140));
   await typeTextNaturally(page, username, {
     minKeyDelay: 45,
     maxKeyDelay: 120,
@@ -2376,6 +2386,13 @@ async function login(page, credentials) {
   await organicPause('between_actions', 0.7);
   await clickElementNaturally(page, passEl, { totalDurationMs: randomDelay(220, 420) }).catch(() => {});
   await organicPause('micro');
+  // Clear password field too in case of autofill.
+  await page.keyboard.down('Control').catch(() => page.keyboard.down('Meta').catch(() => {}));
+  await page.keyboard.press('KeyA').catch(() => {});
+  await page.keyboard.up('Control').catch(() => page.keyboard.up('Meta').catch(() => {}));
+  await delay(randomDelay(40, 100));
+  await page.keyboard.press('Backspace').catch(() => {});
+  await delay(randomDelay(60, 140));
   await typeTextNaturally(page, password, {
     minKeyDelay: 50,
     maxKeyDelay: 135,
@@ -2443,6 +2460,8 @@ async function login(page, credentials) {
 
   const interactiveChallenge = await detectInstagramInteractiveChallengeState(page);
   if (interactiveChallenge.required && interactiveChallenge.kind === 'two_factor') {
+    await delay(2000);
+    await saveLoginDebugScreenshot(page, 'two_factor_checkpoint').catch(() => {});
     page.off('response', respHandler);
     const err = new Error('Two-factor authentication required. Enter the 6-digit code from your authenticator app or WhatsApp.');
     err.code = 'TWO_FACTOR_REQUIRED';
@@ -2450,6 +2469,7 @@ async function login(page, credentials) {
     throw err;
   }
   if (interactiveChallenge.required && interactiveChallenge.kind === 'email') {
+    await delay(2000);
     await saveLoginDebugScreenshot(page, 'email_checkpoint');
     page.off('response', respHandler);
     const err = new Error(
@@ -2522,6 +2542,7 @@ async function login(page, credentials) {
   const emailCheckpoint = await detectInstagramEmailVerificationState(page);
   const currentLoginUrl = page.url().toLowerCase();
   if (emailCheckpoint.required || currentLoginUrl.includes('/auth_platform/codeentry')) {
+    await delay(2000);
     await saveLoginDebugScreenshot(page, 'email_checkpoint');
     page.off('response', respHandler);
     const err = new Error(
@@ -2570,6 +2591,7 @@ async function login(page, credentials) {
     throw err;
   }
   if (interactiveChallengeAfterRetry.required && interactiveChallengeAfterRetry.kind === 'email') {
+    await delay(2000);
     await saveLoginDebugScreenshot(page, 'email_checkpoint_after_retry');
     page.off('response', respHandler);
     const err = new Error(
@@ -2584,6 +2606,7 @@ async function login(page, credentials) {
   const emailCheckpointAfterRetry = await detectInstagramEmailVerificationState(page);
   const retryLoginUrl = page.url().toLowerCase();
   if (emailCheckpointAfterRetry.required || retryLoginUrl.includes('/auth_platform/codeentry')) {
+    await delay(2000);
     await saveLoginDebugScreenshot(page, 'email_checkpoint_after_retry');
     page.off('response', respHandler);
     const err = new Error(

@@ -1235,8 +1235,7 @@ async function startClientProcessIfMissing(processName, script, env, outFile, er
         errorFile,
         '--log-date-format',
         'YYYY-MM-DD HH:mm:ss Z',
-        '--max-restarts',
-        '20',
+        '--no-autorestart',
         '--update-env',
       ];
   const auditCommand = status.exists
@@ -2340,15 +2339,32 @@ app.post('/api/instagram/connect', connectLimiter, async (req, res) => {
       });
     }
     if (result.emailVerificationRequired) {
-      if (result.browser) result.browser.close().catch(() => {});
+      cleanupExpiredEmailVerify();
+      const pendingEmailId = require('crypto').randomBytes(16).toString('hex');
+      pendingEmailVerifyMap.set(pendingEmailId, {
+        page: result.page,
+        browser: result.browser,
+        username: result.username,
+        clientId,
+        createdAt: Date.now(),
+        proxyUrl: proxyMeta.proxyUrl,
+        proxyAssignmentId: proxyMeta.proxyAssignmentId,
+      });
       console.log(
-        `[API] instagram_connect:email_verification_required id=${reqId} afterMs=${Date.now() - startedAt}`
+        `[API] instagram_connect:email_verification_required id=${reqId} afterMs=${Date.now() - startedAt} pendingEmailId=${pendingEmailId.slice(
+          0,
+          8
+        )}`
       );
-      return res.status(400).json({
+      return res.status(200).json({
         ok: false,
-        code: 'two_factor_required_for_connect',
-        error:
-          'Two-factor authentication is required for connect. This account prompted email verification instead of app/WhatsApp 2FA. Enable 2FA in Instagram Security settings, then reconnect.',
+        code: 'email_verification_required',
+        message:
+          result.maskedEmail
+            ? `Email verification required. Enter the code sent to ${result.maskedEmail}.`
+            : 'Email verification required. Enter the code sent to your email.',
+        pendingEmailId,
+        maskedEmail: result.maskedEmail || null,
       });
     }
     // Connect succeeded without requiring a challenge (e.g. valid existing browser session/cookies).
