@@ -621,8 +621,37 @@ function formatQueueWaitDeferMessage(availableAtIso, clientTimezone, jobMeta = n
 }
 
 function normalizeUsername(username) {
-  const u = String(username).trim();
-  return u.startsWith('@') ? u.slice(1) : u;
+  let u = String(username || '').trim();
+  if (!u) return '';
+  if (u.startsWith('@')) u = u.slice(1).trim();
+
+  // Some lead sources store a full profile URL (or a partial instagram.com/...).
+  // Normalize these back to the actual username for DM search/sending.
+  const lower = u.toLowerCase();
+  if (lower.includes('instagram.com')) {
+    try {
+      const candidate = u.includes('://')
+        ? u
+        : u.startsWith('instagram.com')
+          ? `https://${u}`
+          : u.startsWith('www.instagram.com')
+            ? `https://${u}`
+            : `https://www.instagram.com${u.startsWith('/') ? '' : '/'}${u}`;
+      const parsed = new URL(candidate);
+      const path = parsed.pathname.replace(/^\/+|\/+$/g, '');
+      const first = decodeURIComponent((path.split('/')[0] || '').trim()).replace(/^@/, '');
+      const reserved = new Set(['direct', 'p', 'reel', 'reels', 'stories', 'explore', 'accounts', 'legal', 'api', 'tv']);
+      if (first && !reserved.has(first.toLowerCase())) {
+        return first;
+      }
+    } catch {
+      // Fall through to plain normalization
+    }
+  }
+
+  // Strip accidental leading/trailing slashes from plain handles.
+  u = u.replace(/^\/+|\/+$/g, '').trim();
+  return u;
 }
 
 function normalizeTimezoneInput(timezone) {
