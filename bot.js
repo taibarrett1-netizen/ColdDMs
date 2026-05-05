@@ -35,6 +35,7 @@ const {
   detectInstagramPasswordReauthScreen,
 } = require('./utils/instagram-modals');
 const {
+  getLastVisibleThreadMessageDirection,
   navigateToDmThread,
   sendPlainTextInThread,
   typeInstagramDmPlainTextInComposer,
@@ -1823,23 +1824,59 @@ async function deferColdFollowUpQueueRowForSessionDailyCap(supabase, clientId, r
   return preciseResume.resumeAtIso;
 }
 
+async function resolveColdDmClientIdAliases(supabase, clientId) {
+  const ids = [];
+  const push = (value) => {
+    const normalized = String(value || '').trim();
+    if (normalized && !ids.includes(normalized)) ids.push(normalized);
+  };
+  push(clientId);
+  if (!supabase || !clientId) return ids;
+
+  try {
+    const { data: userRow } = await supabase.from('users').select('id, user_id').eq('id', clientId).maybeSingle();
+    const authUid = userRow?.user_id || null;
+    if (authUid) {
+      const [{ data: legacyRow }, { data: userAliasRow }] = await Promise.all([
+        supabase.from('clients').select('id').eq('user_id', authUid).maybeSingle(),
+        supabase.from('users').select('id').eq('user_id', authUid).maybeSingle(),
+      ]);
+      push(legacyRow?.id);
+      push(userAliasRow?.id);
+    } else {
+      const { data: legacyClientRow } = await supabase.from('clients').select('user_id').eq('id', clientId).maybeSingle();
+      const legacyAuthUid = legacyClientRow?.user_id || null;
+      if (legacyAuthUid) {
+        const { data: mappedUserRow } = await supabase.from('users').select('id').eq('user_id', legacyAuthUid).maybeSingle();
+        push(mappedUserRow?.id);
+      }
+    }
+  } catch {
+    /* best effort */
+  }
+
+  return ids;
+}
+
 /**
  * Best-effort guard: if the recipient has already replied since the source cold DM,
  * skip/cancel queued follow-ups to avoid messaging someone after inbound engagement.
  */
 async function hasInboundAfterColdFollowUpSource(supabase, row) {
   if (!supabase || !row?.client_id) return false;
+  const clientIds = await resolveColdDmClientIdAliases(supabase, row.client_id).catch(() => [row.client_id]);
   let conversationId = null;
 
   const threadId = typeof row.instagram_thread_id === 'string' ? row.instagram_thread_id.trim() : '';
   if (threadId) {
     const { data: byThread } = await supabase
       .from('conversations')
-      .select('id')
-      .eq('client_id', row.client_id)
+      .select('id, created_at')
+      .in('client_id', clientIds)
       .eq('instagram_thread_id', threadId)
-      .maybeSingle();
-    conversationId = byThread?.id || null;
+      .order('created_at', { ascending: false })
+      .limit(5);
+    conversationId = Array.isArray(byThread) ? byThread[0]?.id || null : null;
   }
 
   if (!conversationId) {
@@ -1848,12 +1885,11 @@ async function hasInboundAfterColdFollowUpSource(supabase, row) {
     const { data: byUsername } = await supabase
       .from('conversations')
       .select('id, created_at')
-      .eq('client_id', row.client_id)
+      .in('client_id', clientIds)
       .ilike('participant_username', normalized)
       .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
-    conversationId = byUsername?.id || null;
+      .limit(5);
+    conversationId = Array.isArray(byUsername) ? byUsername[0]?.id || null : null;
   }
 
   if (!conversationId) return false;
@@ -1976,6 +2012,15 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
     const dueMs = new Date(nextPending.scheduled_for).getTime();
     const slackMs = 500;
     const msLeft = dueMs - Date.now() - slackMs;
+    const nextColdSendDueAtMs = Number(options.nextColdSendDueAtMs);
+    const nextColdSendDueFirst = Number.isFinite(nextColdSendDueAtMs) && nextColdSendDueAtMs <= dueMs;
+    if (nextColdSendDueFirst) {
+      logger.log(
+        `[follow-up-interleave] next cold send is due before queued follow-up for @${nextPending.username || '?'} ` +
+          `(cold send at ${new Date(nextColdSendDueAtMs).toISOString()}, follow-up at ${nextPending.scheduled_for}).`
+      );
+      return { processed: false };
+    }
     if (msLeft > 0 && msLeft <= followUpWaitCapMs) {
       const shouldAbort = typeof options.forceExit === 'function' ? options.forceExit : () => false;
       await sleepUntilDue(dueMs, nextPending.username || '', shouldAbort);
@@ -2124,6 +2169,24 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
     );
     const nav = await navigateToDmThread(page, uname);
     if (!nav.ok) throw new Error(nav.reason || 'follow_up_nav_failed');
+    const liveThreadState = await getLastVisibleThreadMessageDirection(page).catch(() => ({ direction: 'unknown' }));
+    if (liveThreadState?.direction === 'them') {
+      await supabase
+        .from('cold_dm_follow_up_queue')
+        .update({
+          status: 'cancelled',
+          cancel_reason: 'inbound_reply_detected',
+          cancelled_at: new Date().toISOString(),
+          error_message: 'live_thread_latest_message_is_inbound',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', row.id)
+        .eq('status', 'processing');
+      logger.log(
+        `[follow-up-interleave] cancelled row ${row.id} for @${uname} (live thread shows latest visible message from recipient)`
+      );
+      return { processed: false, cancelledDueToInboundReply: true };
+    }
     const sent = await sendPlainTextInThread(page, textOut);
     if (!sent.ok) throw new Error(sent.reason || 'follow_up_send_failed');
     await supabase
@@ -4981,6 +5044,8 @@ async function sendFollowUp(body) {
   const clientId = (body.clientId || '').trim();
   const instagramSessionId = (body.instagramSessionId || '').trim();
   const recipientUsername = (body.recipientUsername || '').trim().replace(/^@/, '');
+  const sourceSentAt = body.sourceSentAt != null ? String(body.sourceSentAt).trim() : '';
+  const instagramThreadId = body.instagramThreadId != null ? String(body.instagramThreadId).trim() : '';
   const fail = (error, statusCode, extra) =>
     logFollowUpFailure(clientId, instagramSessionId, recipientUsername, error, statusCode, correlationId, extra);
   if (!clientId || !instagramSessionId || !recipientUsername) {
@@ -5137,6 +5202,25 @@ async function sendFollowUp(body) {
       return fail(errMsg, 400);
     }
     logger.log(`[follow-up] DM thread ready for @${u}${cLog}`);
+    const inboundFromDb = await hasInboundAfterColdFollowUpSource(sb.getSupabase(), {
+      client_id: clientId,
+      username: u,
+      instagram_thread_id: instagramThreadId || getInstagramThreadIdFromUrl(page.url()) || null,
+      source_sent_at: sourceSentAt || new Date(Date.now() - 365 * 24 * 60 * 60 * 1000).toISOString(),
+    }).catch(() => false);
+    if (inboundFromDb) {
+      return fail('Inbound reply detected; queued follow-up should be cancelled', 409, {
+        code: 'inbound_reply_detected',
+        retryable: false,
+      });
+    }
+    const liveThreadState = await getLastVisibleThreadMessageDirection(page).catch(() => ({ direction: 'unknown' }));
+    if (liveThreadState?.direction === 'them') {
+      return fail('Inbound reply detected in live thread; queued follow-up should be cancelled', 409, {
+        code: 'inbound_reply_detected',
+        retryable: false,
+      });
+    }
     if (hasAudio) await grantMicrophoneForInstagram(page, logger);
 
     if (textSingle) {
@@ -6801,6 +6885,7 @@ async function drainSleep(ms, label) {
             clientId,
             lookAheadMs: 0,
             pendingColdCompleting: 1,
+            nextColdSendDueAtMs: cooldownWindowStart + delayMs,
             forceExit: () => sendWorkerForceExit,
           }).catch((e) => {
             logger.warn(`[follow-up-interleave] check failed: ${e?.message || e}`);

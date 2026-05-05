@@ -296,7 +296,79 @@ async function sendPlainTextInThread(page, text, options = {}) {
   return out;
 }
 
+/**
+ * Best-effort heuristic: inspect the lowest visible text bubble above the composer and
+ * classify it by horizontal position. Instagram inbound bubbles render on the left; our
+ * outbound bubbles render on the right.
+ */
+async function getLastVisibleThreadMessageDirection(page) {
+  return await page.evaluate(() => {
+    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const isVisible = (el) => {
+      if (!el || typeof el.getBoundingClientRect !== 'function') return false;
+      const style = window.getComputedStyle(el);
+      if (!style || style.visibility === 'hidden' || style.display === 'none') return false;
+      const rect = el.getBoundingClientRect();
+      return rect.width >= 16 && rect.height >= 10 && rect.bottom > 0 && rect.right > 0;
+    };
+    const composer =
+      Array.from(document.querySelectorAll('textarea, input, [contenteditable="true"], [role="textbox"]')).find((el) => {
+        if (!isVisible(el)) return false;
+        const hint = normalize(
+          (el.getAttribute && `${el.getAttribute('placeholder') || ''} ${el.getAttribute('aria-label') || ''}`) || ''
+        ).toLowerCase();
+        return hint.includes('message') || hint.includes('add a message') || hint.includes('write a message');
+      }) || null;
+    const composerTop = composer && typeof composer.getBoundingClientRect === 'function'
+      ? composer.getBoundingClientRect().top
+      : window.innerHeight;
+    const banned = [
+      /^seen\b/i,
+      /^sent\b/i,
+      /^delivered\b/i,
+      /^message\b/i,
+      /^write a message\b/i,
+      /^add a message\b/i,
+      /^active\b/i,
+      /^typing\b/i,
+      /^\d{1,2}:\d{2}\b/,
+    ];
+
+    const candidates = [];
+    const nodes = document.querySelectorAll('main div, main span, main p, main li');
+    for (const el of nodes) {
+      if (!isVisible(el)) continue;
+      if (composer && composer.contains(el)) continue;
+      if (el.closest('button, a, textarea, input, [contenteditable="true"], [role="textbox"]')) continue;
+      const rect = el.getBoundingClientRect();
+      if (rect.bottom > composerTop - 8) continue;
+      if (rect.top < 40) continue;
+      if (rect.width > window.innerWidth * 0.92 || rect.height > 220) continue;
+      const text = normalize(el.textContent || el.innerText || '');
+      if (!text || text.length > 280) continue;
+      if (banned.some((rx) => rx.test(text))) continue;
+      candidates.push({
+        text,
+        top: rect.top,
+        bottom: rect.bottom,
+        left: rect.left,
+        right: rect.right,
+        centerX: rect.left + rect.width / 2,
+      });
+    }
+
+    if (!candidates.length) return { direction: 'unknown', text: '', confidence: 'none' };
+    candidates.sort((a, b) => (b.bottom - a.bottom) || (b.top - a.top) || (b.centerX - a.centerX));
+    const last = candidates[0];
+    const xRatio = last.centerX / Math.max(1, window.innerWidth);
+    const direction = xRatio >= 0.58 ? 'us' : xRatio <= 0.42 ? 'them' : 'unknown';
+    const confidence = direction === 'unknown' ? 'low' : 'medium';
+    return { direction, text: last.text, confidence, xRatio };
+  });
+}
+
 module.exports = {
+  getLastVisibleThreadMessageDirection,
   navigateToDmThread,
   sendPlainTextInThread,
   typeInstagramDmPlainTextInComposer,
