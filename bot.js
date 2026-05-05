@@ -35,7 +35,6 @@ const {
   detectInstagramPasswordReauthScreen,
 } = require('./utils/instagram-modals');
 const {
-  getLastVisibleThreadMessageDirection,
   navigateToDmThread,
   sendPlainTextInThread,
   typeInstagramDmPlainTextInComposer,
@@ -2169,24 +2168,6 @@ async function maybeRunQueuedColdFollowUpForSession(page, session, options = {})
     );
     const nav = await navigateToDmThread(page, uname);
     if (!nav.ok) throw new Error(nav.reason || 'follow_up_nav_failed');
-    const liveThreadState = await getLastVisibleThreadMessageDirection(page).catch(() => ({ direction: 'unknown' }));
-    if (liveThreadState?.direction === 'them') {
-      await supabase
-        .from('cold_dm_follow_up_queue')
-        .update({
-          status: 'cancelled',
-          cancel_reason: 'inbound_reply_detected',
-          cancelled_at: new Date().toISOString(),
-          error_message: 'live_thread_latest_message_is_inbound',
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', row.id)
-        .eq('status', 'processing');
-      logger.log(
-        `[follow-up-interleave] cancelled row ${row.id} for @${uname} (live thread shows latest visible message from recipient)`
-      );
-      return { processed: false, cancelledDueToInboundReply: true };
-    }
     const sent = await sendPlainTextInThread(page, textOut);
     if (!sent.ok) throw new Error(sent.reason || 'follow_up_send_failed');
     await supabase
@@ -5210,13 +5191,6 @@ async function sendFollowUp(body) {
     }).catch(() => false);
     if (inboundFromDb) {
       return fail('Inbound reply detected; queued follow-up should be cancelled', 409, {
-        code: 'inbound_reply_detected',
-        retryable: false,
-      });
-    }
-    const liveThreadState = await getLastVisibleThreadMessageDirection(page).catch(() => ({ direction: 'unknown' }));
-    if (liveThreadState?.direction === 'them') {
-      return fail('Inbound reply detected in live thread; queued follow-up should be cancelled', 409, {
         code: 'inbound_reply_detected',
         retryable: false,
       });
